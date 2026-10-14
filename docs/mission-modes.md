@@ -98,8 +98,10 @@ Finding {
 - 代码审计 = Assessment 的一个**目标类型**（工具面换为读码/静态查询，产物同为 Finding）——后置。
 
 ## 9. 落地顺序（review 通过后）
-1. 黑板 + Fact/Finding/Sub-Goal 工具 + Step 循环；**先在 Capture 模式跑通，保证 CTF 不回归**。
-2. Assessment policy（无 oracle 终止、非竞速、Finding 累积）。
-3. engagement 配置 work-source + scope 强制。
-4. report 渲染（JSON + MD/HTML）。
-5. 代码审计目标类型（后续迭代）。
+1. ✅ 黑板 + Fact/Finding/Sub-Goal 工具 + Step 循环；**先在 Capture 模式跑通，保证 CTF 不回归**。（`backend/blackboard.py`；solver 5 个中性工具 + 黑板注入；swarm 每题一块共享黑板；flag 记为 verified Finding）
+2. ✅ Assessment policy（无 oracle 终止、非竞速、Finding 累积）。（`blackboard.progress_marker()`；swarm 递减收益终止 = 连续 N 轮无新 Fact/Finding 且无未决 Sub-Goal；无 flag 即天然非竞速 + 累积；`ASSESSMENT_MAX_BUMPS` / `ASSESSMENT_NO_PROGRESS_CYCLES`）
+3. ✅ engagement 配置 work-source + scope 强制。（`backend/scope.py` 统一 host+CIDR 匹配，三个工具同一判定；`backend/engagement.py` 配置 + **空 scope 的 assessment 直接拒绝运行**；`--engagement` CLI；assessment 专用中性提示词）
+4. ✅ report 渲染（JSON + MD/HTML）。（`backend/report.py`；engagement 结束写 `<state_dir>/reports/<name>/report.{json,md,html}`）
+5. ⏳ 代码审计目标类型（后续迭代）—— Assessment 的一个目标类型，工具面换为读码/静态查询，产物同为 Finding。
+
+> 落地说明：步骤 1–4 均为**增量、Capture 不回归**（`mission_mode` 默认 `capture`，CTF 路径逐字不变；CIDR 仅在 engagement 出现）。校验手段：`ruff` + `compileall` + Scope/黑板/report 单元往返 + run_python 子进程 scope 守卫实测（CIDR 内放行、CIDR 外与域名越界拦截）+ engagement 空 scope 三类拒绝。环境缺 `pydantic_ai`/`genai_prices`，故未做整图 import 运行。

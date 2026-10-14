@@ -6,9 +6,25 @@
 
 当前主攻 [TSecBench](https://tsecbench.zc.tencent.com/)（腾讯云鼎实验室智能攻防 Agent 评测平台）跑分。`Tsecbench v1` 题集共 63 题、23000 分、总时限 360 分钟，覆盖六大能力域：Web 漏洞挖掘、二进制漏洞挖掘、漏洞利用、多阶段渗透、云攻击、对抗规避。多 flag 题按 flag 部分给分，查看 hint 按比例扣分。
 
+同一内核也能跑**真实授权评估**（不止 CTF）：见下文「两种 Mission 模式」与 `--engagement`。无论 CTF、渗透测试还是代码审计，都被统一建模为**搜索过程**，内核只换 policy，不改。
+
 ## 任务模型：一切都是搜索
 
 Agent 的核心循环被建模为「**搜索 + 随手捕获每一个产物**」，而不是「追逐那一个终极 flag」。`submit_flag` 只是"捕获一个恰好等于可验证终极目标的产物"的特例；多 flag 题与多阶段渗透题本就是"搜索产出多个中间产物、Goal 弥散（要集齐）"的结构，所以发现一个 flag 就立即提交、继续搜索，直到集齐或预算耗尽。
+
+用四个概念描述这个搜索（设计基线见 [`docs/mission-modes.md`](docs/mission-modes.md)）：**Fact**（已确认的世界状态）、**Goal / Sub-Goal**（搜索的终止条件，可动态增删）、**Step**（从已有 Fact 产生新 Fact 的一步）、**Finding**（搜索途中的产物；漏洞类任务里就是安全漏洞）。这些状态显式记录在一块 **Blackboard（黑板）** 上——跨 Step、跨同题 solver 共享、落盘持久化，让长程搜索的记忆不受上下文窗口限制。黑板是**领域中立的认知结构**（如何表示状态/目标/发现），不是攻击方法论，与「0 Skill / 无预设流程」的极简信念不冲突。
+
+### 两种 Mission 模式（同一内核，只换 policy）
+
+| | **Capture（CTF，默认）** | **Assessment（渗透 / 攻防 / 代审）** |
+|---|---|---|
+| Goal / 终止 | 目标 Finding（flag）到手即终止 | 无 oracle：覆盖 / 边际收益递减 / 预算耗尽 |
+| oracle | 有（`submit_flag` 判真） | 无 |
+| 产物 | flag（= 终止目标） | Finding 持续累积，不终止 |
+| swarm | 竞速，先得者取消其余 | 协作覆盖，发现汇聚，互不取消 |
+| 工作来源 | TSecBench 平台（多个单目标 mission） | engagement 配置（一片 scope = 一个多目标 mission） |
+
+Assessment 的**递减收益终止** = 连续 N 轮（`ASSESSMENT_NO_PROGRESS_CYCLES`）无新 Fact/Finding 且无未决 Sub-Goal。无 flag oracle，所以天然非竞速、发现天然累积。
 
 ## 执行形态
 
@@ -90,6 +106,18 @@ uv run ctf-solve -i
 uv run ctf-solve --challenge <题目目录、题名或 unique_code>
 ```
 
+### 真实授权评估（Assessment 模式）
+
+```bash
+uv run ctf-solve --engagement examples/engagement.example.yaml
+```
+
+用一份 engagement 配置（YAML/JSON）定义一次**授权评估**：弥散目标 + 授权 scope + 交战规则（RoE）。模板见 [`examples/engagement.example.yaml`](examples/engagement.example.yaml)。要点：
+
+- **scope 是强制授权边界，非可选**：assessment 必须声明非空、可解析的 scope（`scope.targets`：主机 / IP / CIDR），否则**开跑前直接拒绝**。agent 自身出网（`http_request` / `tcp_send` / `run_python` 的 socket）被结构性锁死在 scope 内，无旁路——这是法律/职业底线，也让工具始终处于"仅授权范围"。
+- 无 flag oracle：产物是 **Finding**（候选 → 验证 → 已验证 / 已否决），全部累积在该 mission 的黑板上。
+- 结束后在 `<state_dir>/reports/<name>/` 生成 `report.json` + `report.md` + `report.html`。
+
 ### 只读自检
 
 ```bash
@@ -142,7 +170,11 @@ uv run ctf-solve --web --web-port 9000
 | `task_status` | flag 进度 x/y + 剩余时间 |
 | `check_findings` / `notify_coordinator` | 同题兄弟发现共享 / 向调度器汇报 |
 
-系统提示是一份**纯契约**：目标（在授权目标上搜索并捕获 flag）、工具契约、提交格式、硬约束（范围锁定、不许编造 flag、本地磁盘不可信）。**不含任何攻击方法论或题型 playbook**。目标锁定（Target Lock）是纯结构性的：solver 自身的出网一律限制在题目 connection_info 声明的主机内，无任何绕过。
+Assessment 模式下 solver 另有一组**黑板工具**（同样中性，是"认知结构"而非方法论）：`add_fact` / `add_finding`（可记未验证候选）/ `verify_finding`（候选 → 已验证 / 已否决）/ `add_subgoal` / `resolve_subgoal`。
+
+系统提示是一份**纯契约**：目标、工具契约、提交格式、硬约束（范围锁定、不许编造 flag/Finding、本地磁盘不可信）。**不含任何攻击方法论或题型 playbook**。Capture 与 Assessment 各一份中性契约（后者讲弥散目标 + 记录 Finding，不提 flag）。
+
+**Scope Lock（范围锁定，原 Target Lock 的泛化）**是纯结构性的：solver 自身的出网一律限制在授权 scope 内——CTF 下是题目 `connection_info` 的主机，engagement 下是配置的主机 + 授权 CIDR 段。`http_request` / `tcp_send` / `run_python` 三处由同一个 `backend/scope.py` 判定（host 精确匹配 + CIDR 数值匹配），无任何绕过；scope 为空则 fail-loud 拒绝一切出网。
 
 ### 过程可追踪
 
@@ -156,6 +188,7 @@ uv run ctf-solve [OPTIONS]
 
 --models SPEC               模型规格，可多次（如 deepseek/deepseek-chat、qwen/qwen-plus）
 --challenge REF             单题模式（目录、题名或 unique_code）
+--engagement PATH           Assessment 模式：从 scope 配置（YAML/JSON）跑一次真实授权评估
 --max-challenges N          并发靶场窗口（1-3，默认 3，按存活容器数限流）
 --time-limit SECONDS        单题墙钟上限（默认 1800，超时关靶场换题）
 --total-budget-seconds N    全局总预算（默认关闭；设置后钳制单题时限 + 预算告急停止开新题）
@@ -171,11 +204,16 @@ uv run ctf-solve [OPTIONS]
 ## 目录结构
 
 - `backend/`：机械调度器、headless solver、TSecBench 平台适配器、中性工具
+- `backend/blackboard.py`：Fact/Finding/Sub-Goal 黑板（落盘持久化）
+- `backend/scope.py`：授权范围匹配（host + CIDR），三处出网工具的唯一判定
+- `backend/engagement.py`：engagement 配置加载 + 空 scope 拒绝 + 本地无 oracle 平台
+- `backend/report.py`：mission 报告渲染（JSON + Markdown + HTML）
 - `backend/web.py` + `backend/webui/`：Web 控制台（FastAPI 服务 + 单页前端）
+- `examples/engagement.example.yaml`：engagement 配置模板
 - `challenges/`：拉取后的题目元数据
 - `logs/`：trace 日志与运行记录
-- `.ctf-state/`：run_python 的 per-run 工作区
-- `docs/rewrite-plan.md`：设计基线与删/留取舍
+- `.ctf-state/`：run_python 工作区、黑板（`blackboards/`）、报告（`reports/`）
+- `docs/rewrite-plan.md`：极简重构基线；`docs/mission-modes.md`：Fact/Goal/Step/Finding 设计
 
 ## 运行环境要求
 
