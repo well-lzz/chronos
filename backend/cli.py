@@ -379,7 +379,6 @@ async def _run_engagement(
         settings=settings,
         model_specs=model_specs,
         no_submit=no_submit,
-        mission_mode="assessment",
     )
 
     limit = eng.time_budget_seconds or _time_limit_for_challenge(settings, meta)

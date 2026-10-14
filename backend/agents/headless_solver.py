@@ -425,7 +425,6 @@ class HeadlessSolver:
         time_budget_seconds: int = TASK_TIME_BUDGET_SECONDS,
         workdir: str = "",
         blackboard=None,
-        mission_mode: str = "capture",
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -461,7 +460,6 @@ class HeadlessSolver:
             allowed_cidrs=tuple(scope.cidr_strings()),
             scenario=_guess_scenario(meta),
             blackboard=blackboard,
-            mission_mode=mission_mode,
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(meta.name, self.model_id)
@@ -484,7 +482,6 @@ class HeadlessSolver:
             self.meta,
             remaining_seconds=remaining,
             allow_exec=self.allow_exec,
-            mission_mode=self.deps.mission_mode,
         )
         if _deps_scope(self.deps).is_empty:
             # Degraded scope lock: no target hosts/ranges could be parsed from

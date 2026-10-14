@@ -58,11 +58,8 @@ class HeadlessDeps:
     allowed_cidrs: tuple[str, ...] = ()
     scenario: str = ""
     # Mission blackboard (shared across executors on the same mission): the
-    # explicit Fact / Finding / Sub-Goal store. None = not wired (pure legacy).
+    # explicit Fact / Finding / Sub-Goal store. None = not wired.
     blackboard: Blackboard | None = None
-    # "capture" (CTF: flag is the goal) | "assessment" (diffuse goal, findings
-    # accumulate). Step 1 only exercises capture; assessment policy is step 2.
-    mission_mode: str = "capture"
 
 
 @dataclass

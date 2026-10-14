@@ -2,6 +2,8 @@
 
 > 本文是"从 CTF 专用 → 通用攻防/代审"重构的**设计基线**。开工前先 review；代码与本文冲突时以本文为准（或先改本文）。承接 [`rewrite-plan.md`](rewrite-plan.md) §0「任务=搜索」。
 
+> **更新（决策，取代下文 §1.4 / §2 的双模式设计）**：Capture/Assessment **两种模式已合并为一种行为**——不再有 `mission_mode` 开关。全系统只按 Assessment 式语义运行：executor 协作（不竞速、互不取消）、产物累积到黑板；`submit_flag` 降为"目标恰好带 flag 时把它记成已验证 Finding"的可选能力（flag_count≥1 才在提示词出现），不再驱动竞速或终止。**终止条件改为用户自定义**，见 `backend/termination.py:should_terminate`（默认永不提前终止，只受 `MAX_BUMPS` 与墙钟预算兜底）；原 §1.4 的递减收益终止已移除。TSecBench 平台 / 机械调度器 / Web **作为机械外壳保留**；CTF 的"平台判真即停"由调度器 poller 的 `challenge_solved` 外部 kill 完成，不在 swarm 内部。下文 §1.4、§2 的表格保留为历史设计记录。
+
 ## 0. 核心抽象
 
 一切任务都是**搜索过程**。用四个概念描述：
@@ -99,7 +101,7 @@ Finding {
 
 ## 9. 落地顺序（review 通过后）
 1. ✅ 黑板 + Fact/Finding/Sub-Goal 工具 + Step 循环；**先在 Capture 模式跑通，保证 CTF 不回归**。（`backend/blackboard.py`；solver 5 个中性工具 + 黑板注入；swarm 每题一块共享黑板；flag 记为 verified Finding）
-2. ✅ Assessment policy（无 oracle 终止、非竞速、Finding 累积）。（`blackboard.progress_marker()`；swarm 递减收益终止 = 连续 N 轮无新 Fact/Finding 且无未决 Sub-Goal；无 flag 即天然非竞速 + 累积；`ASSESSMENT_MAX_BUMPS` / `ASSESSMENT_NO_PROGRESS_CYCLES`）
+2. ✅ Assessment policy（无 oracle 终止、非竞速、Finding 累积）。**后续按用户决策进一步简化**：两模式合并为一种行为（删 `mission_mode`）；移除内置递减收益终止，改为 `backend/termination.py:should_terminate` 用户钩子（默认永不提前停，`MAX_BUMPS` + 墙钟兜底）；swarm 一律协作不竞速；`submit_flag` 降为可选能力。
 3. ✅ engagement 配置 work-source + scope 强制。（`backend/scope.py` 统一 host+CIDR 匹配，三个工具同一判定；`backend/engagement.py` 配置 + **空 scope 的 assessment 直接拒绝运行**；`--engagement` CLI；assessment 专用中性提示词）
 4. ✅ report 渲染（JSON + MD/HTML）。（`backend/report.py`；engagement 结束写 `<state_dir>/reports/<name>/report.{json,md,html}`）
 5. ⏳ 代码审计目标类型（后续迭代）—— Assessment 的一个目标类型，工具面换为读码/静态查询，产物同为 Finding。

@@ -105,9 +105,7 @@ class ChallengeSwarm:
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
     # One mission = one challenge = one shared blackboard (Fact/Finding/Sub-Goal).
     # Every executor on this challenge reads/writes the same board; persisted so a
-    # long run survives restart. Created lazily (see _get_blackboard). Capture
-    # mode only for now — assessment policy is step 2.
-    mission_mode: str = "capture"
+    # long run survives restart. Created lazily (see _get_blackboard).
     _blackboard: Blackboard | None = None  # lazily created; see _get_blackboard
 
     def _workdir_for(self, model_spec: str) -> str:
@@ -171,7 +169,6 @@ class ChallengeSwarm:
             time_budget_seconds=time_budget,
             workdir=self._workdir_for(model_spec),
             blackboard=self._get_blackboard(),
-            mission_mode=self.mission_mode,
         )
 
     def _make_notify_fn(self, model_spec: str):
@@ -336,18 +333,22 @@ class ChallengeSwarm:
                 raise
 
     async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
-        """Inner loop: start → run → bump → run → ..."""
+        """Inner loop: start → run → bump → run → ...
+
+        Collaborative, not a race: a confirmed flag is recorded (as a verified
+        Finding) and ends THIS executor, but never cancels its siblings. The only
+        built-in stops are the termination hook (backend/termination.py, which
+        you define), a hard bump ceiling, and the externally-enforced wall-clock
+        budget. CTF "stop on platform-confirmed solve" is handled by the
+        coordinator's poller, not here.
+        """
+        from backend.termination import CycleState, should_terminate
+
         bump_count = 0
         consecutive_errors = 0
-        assessment = self.mission_mode == "assessment"
-        # Capture: 5 bumps is plenty for a single flag. Assessment has no flag
-        # oracle, so an executor keeps covering until diminishing returns or
-        # budget — a higher ceiling, the real stop being the no-progress check.
-        max_bumps = (
-            int(getattr(self.settings, "assessment_max_bumps", 20))
-            if assessment else 5
-        )
-        no_progress_cycles = 0  # assessment only: consecutive cycles with no new discovery
+        cycles = 0
+        started = time.monotonic()
+        max_bumps = int(getattr(self.settings, "max_bumps", 20))
         result = SolverResult(
             flag=None, status=CANCELLED, findings_summary="",
             step_count=0, cost_usd=0.0, log_path="",
@@ -357,8 +358,10 @@ class ChallengeSwarm:
         while not self.cancel_event.is_set():
             while self.pause_event.is_set() and not self.cancel_event.is_set():
                 await asyncio.sleep(0.5)
-            marker_before = self._get_blackboard().progress_marker() if assessment else 0
+            bb = self._get_blackboard()
+            marker_before = bb.progress_marker()
             result = await solver.run_until_done_or_gave_up()
+            cycles += 1
 
             # Only broadcast useful findings — skip errors and broken solvers
             if (result.status != ERROR
@@ -369,14 +372,27 @@ class ChallengeSwarm:
                 await self.message_bus.post(model_spec, result.findings_summary[:500])
 
             if result.status == FLAG_FOUND:
-                self.cancel_event.cancel_with_reason("sibling_win")
+                # Recorded as a verified Finding by the solver. No racing: this
+                # executor is done, siblings keep searching (multi-flag / wider
+                # coverage).
                 self.winner = result
-                logger.info(
-                    f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}"
-                )
-                return result, solver
+                logger.info(f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}")
+                break
 
             if result.status == CANCELLED:
+                break
+
+            # User-defined termination: stop this executor when your policy says so.
+            state = CycleState(
+                step_count=result.step_count,
+                bump_count=bump_count,
+                cycles=cycles,
+                progress_marker=bb.progress_marker(),
+                prev_progress_marker=marker_before,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            if should_terminate(bb, state):
+                logger.info("[%s/%s] termination hook requested stop", self.meta.name, model_spec)
                 break
 
             if result.status in (GAVE_UP, ERROR):
@@ -396,24 +412,6 @@ class ChallengeSwarm:
                         break
                 else:
                     consecutive_errors = 0
-
-                # Assessment termination: no flag to race for, so stop when the
-                # search stops producing knowledge. A GAVE_UP cycle that added no
-                # new Fact/Finding counts toward diminishing returns; once that
-                # has held for N cycles AND nothing is left on the coverage
-                # checklist (open sub-goals), this executor has converged.
-                if assessment and result.status == GAVE_UP:
-                    bb = self._get_blackboard()
-                    progressed = bb.progress_marker() > marker_before
-                    no_progress_cycles = 0 if progressed else no_progress_cycles + 1
-                    need = int(getattr(self.settings, "assessment_no_progress_cycles", 2))
-                    if no_progress_cycles >= need and not bb.open_subgoals():
-                        logger.info(
-                            "[%s/%s] Assessment coverage reached — %d cycles with no "
-                            "new Fact/Finding and no open sub-goals; executor stopping",
-                            self.meta.name, model_spec, no_progress_cycles,
-                        )
-                        break
 
                 bump_count += 1
                 if bump_count > max_bumps:
@@ -476,7 +474,11 @@ class ChallengeSwarm:
                 return
 
     async def run(self) -> SolverResult | None:
-        """Run all solvers in parallel. Returns the winner's result or None."""
+        """Run all executors in parallel until each finishes (collaborative, not
+        a race). Findings accumulate on the shared blackboard; a flag found by
+        one executor is recorded but does NOT cancel the others. Returns the
+        flag-bearing result if any executor found one, else None — in both cases
+        the blackboard holds the full product."""
         tasks = [
             asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
             for spec in self._effective_model_specs()
@@ -491,23 +493,11 @@ class ChallengeSwarm:
             )
 
         try:
-            while tasks:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-                for task in done:
-                    try:
-                        result = task.result()
-                    except Exception:
-                        continue
-                    if result and result.status == FLAG_FOUND:
-                        self.cancel_event.cancel_with_reason("sibling_win")
-                        for p in pending:
-                            p.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
-                        return result
-
-                tasks = list(pending)
-
+            # Let every executor run to its own completion; collect results.
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, SolverResult) and r.status == FLAG_FOUND:
+                    self.winner = r
             self.cancel_event.cancel_with_reason("swarm_complete")
             return self.winner
         except asyncio.CancelledError:
