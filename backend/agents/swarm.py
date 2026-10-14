@@ -339,7 +339,15 @@ class ChallengeSwarm:
         """Inner loop: start → run → bump → run → ..."""
         bump_count = 0
         consecutive_errors = 0
-        max_bumps = 5  # Don't loop forever on the same challenge
+        assessment = self.mission_mode == "assessment"
+        # Capture: 5 bumps is plenty for a single flag. Assessment has no flag
+        # oracle, so an executor keeps covering until diminishing returns or
+        # budget — a higher ceiling, the real stop being the no-progress check.
+        max_bumps = (
+            int(getattr(self.settings, "assessment_max_bumps", 20))
+            if assessment else 5
+        )
+        no_progress_cycles = 0  # assessment only: consecutive cycles with no new discovery
         result = SolverResult(
             flag=None, status=CANCELLED, findings_summary="",
             step_count=0, cost_usd=0.0, log_path="",
@@ -349,6 +357,7 @@ class ChallengeSwarm:
         while not self.cancel_event.is_set():
             while self.pause_event.is_set() and not self.cancel_event.is_set():
                 await asyncio.sleep(0.5)
+            marker_before = self._get_blackboard().progress_marker() if assessment else 0
             result = await solver.run_until_done_or_gave_up()
 
             # Only broadcast useful findings — skip errors and broken solvers
@@ -387,6 +396,24 @@ class ChallengeSwarm:
                         break
                 else:
                     consecutive_errors = 0
+
+                # Assessment termination: no flag to race for, so stop when the
+                # search stops producing knowledge. A GAVE_UP cycle that added no
+                # new Fact/Finding counts toward diminishing returns; once that
+                # has held for N cycles AND nothing is left on the coverage
+                # checklist (open sub-goals), this executor has converged.
+                if assessment and result.status == GAVE_UP:
+                    bb = self._get_blackboard()
+                    progressed = bb.progress_marker() > marker_before
+                    no_progress_cycles = 0 if progressed else no_progress_cycles + 1
+                    need = int(getattr(self.settings, "assessment_no_progress_cycles", 2))
+                    if no_progress_cycles >= need and not bb.open_subgoals():
+                        logger.info(
+                            "[%s/%s] Assessment coverage reached — %d cycles with no "
+                            "new Fact/Finding and no open sub-goals; executor stopping",
+                            self.meta.name, model_spec, no_progress_cycles,
+                        )
+                        break
 
                 bump_count += 1
                 if bump_count > max_bumps:

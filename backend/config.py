@@ -117,6 +117,18 @@ class Settings(BaseSettings):
     partial_stall_seconds: int = Field(
         default=600, validation_alias=AliasChoices("PARTIAL_STALL_SECONDS"),
     )
+    # Assessment mode (diffuse-goal pentest/audit): there is no flag oracle, so
+    # an executor keeps covering until coverage is reached or the budget runs
+    # out. It gets a higher bump ceiling than Capture's 5...
+    assessment_max_bumps: int = Field(
+        default=20, validation_alias=AliasChoices("ASSESSMENT_MAX_BUMPS"),
+    )
+    # ...and "coverage reached" = this many consecutive executor cycles that
+    # produced no new Fact/Finding AND left no open Sub-Goal (diminishing
+    # returns). Capture mode ignores both of these.
+    assessment_no_progress_cycles: int = Field(
+        default=2, validation_alias=AliasChoices("ASSESSMENT_NO_PROGRESS_CYCLES"),
+    )
     # Per solver-run scratch dir root (run_python workspaces, trace logs live under logs/).
     state_dir: str = Field(
         default=".ctf-state", validation_alias=AliasChoices("CTF_STATE_DIR", "TSECBENCH_STATE_DIR"),

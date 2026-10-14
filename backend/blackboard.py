@@ -163,6 +163,20 @@ class Blackboard:
     def verified_findings(self) -> list[Finding]:
         return [f for f in self.findings.values() if f.status == VERIFIED]
 
+    def progress_marker(self) -> int:
+        """A monotone discovery counter for the diminishing-returns signal.
+
+        Rises on every new Fact, new Finding, and candidate→verified promotion,
+        so two consecutive executor cycles with an unchanged marker means the
+        search produced no new knowledge. Pure bookkeeping (sub-goal churn,
+        refutations) deliberately does not move it.
+        """
+        return (
+            len(self.facts)
+            + len(self.findings)
+            + sum(1 for f in self.findings.values() if f.status == VERIFIED)
+        )
+
     def counts(self) -> dict[str, int]:
         return {
             "facts": len(self.facts),
