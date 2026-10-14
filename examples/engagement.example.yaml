@@ -1,0 +1,39 @@
+# Example engagement config — a real, Assessment-mode mission.
+#
+#   ctf-solve --engagement examples/engagement.example.yaml
+#
+# Unlike a CTF range (one flag, an oracle, a race), an engagement has a diffuse
+# goal and no oracle: the agent explores the authorized scope and accumulates
+# FINDINGS on a shared, persisted blackboard until coverage/budget is reached.
+#
+# The scope is the HARD authorization boundary. It is NOT optional: an
+# assessment with an empty or unparseable scope is refused before any model
+# runs. The agent's egress (http_request / tcp_send / run_python sockets) is
+# locked to exactly these targets, with no bypass. Only list assets you are
+# authorized to test.
+
+name: acme-staging-external
+
+mode: assessment
+
+goal: |
+  Authorized security assessment of ACME's staging web perimeter. Identify and
+  verify vulnerabilities reachable from the listed hosts: authentication flaws,
+  injection, access-control gaps, and exposed sensitive functionality. Record
+  each issue as a finding with evidence and reproduction steps.
+
+scope:
+  # Authorized targets: hostnames, IPs, and/or CIDR ranges. These are the ONLY
+  # systems the agent may touch.
+  targets:
+    - staging.acme.test
+    - 10.10.5.0/24
+    - 198.51.100.7
+  rules_of_engagement: |
+    Testing window: business hours only. No denial-of-service or load testing.
+    No social engineering. No changes to production data. Stop and report if you
+    reach anything that looks like real customer PII.
+
+# Optional: wall-clock budget for the whole engagement (seconds). Falls back to
+# the configured per-mission time limit when omitted.
+# time_budget_seconds: 7200

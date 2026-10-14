@@ -9,6 +9,7 @@ local security toolchain — the model's own reasoning is the primary capability
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import re
 import time
@@ -36,6 +37,7 @@ from backend.prompts import (
     _guess_scenario,
     build_headless_prompt,
 )
+from backend.scope import Scope
 from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, SolverResult
 from backend.tools.local_exec import do_run_python
 from backend.tools.net_tools import do_raw_http, do_tcp_send
@@ -84,18 +86,13 @@ def _is_rejected_variant(candidate: str, rejected: list[str]) -> bool:
     return False
 
 
-def _parse_allowed_hosts(connection_info: str) -> frozenset[str]:
-    """Extract the assigned target hosts from connection_info ("ip:port, ip:port")."""
-    hosts: set[str] = set()
-    for part in re.split(r"[,\s]+", connection_info or ""):
-        part = part.strip()
-        if not part:
-            continue
-        part = re.sub(r"^https?://", "", part).strip("[]").split("/")[0]
-        host = part.rsplit(":", 1)[0] if ":" in part else part
-        if host:
-            hosts.add(host.lower())
-    return frozenset(hosts)
+def _deps_scope(deps: HeadlessDeps) -> Scope:
+    """The effective authorization scope for this run (hosts + CIDRs)."""
+    return Scope(
+        hosts=deps.allowed_hosts,
+        networks=tuple(ipaddress.ip_network(c, strict=False) for c in deps.allowed_cidrs),
+        raw=tuple(sorted(deps.allowed_hosts)) + tuple(deps.allowed_cidrs),
+    )
 
 
 def _target_lock_block(deps: HeadlessDeps, host: str) -> str | None:
@@ -112,25 +109,26 @@ def _target_lock_block(deps: HeadlessDeps, host: str) -> str | None:
     other teams' instances). With no known target, ALL egress is refused and
     the model is told how to obtain/confirm the target.
     """
-    if not deps.allowed_hosts:
+    scope = _deps_scope(deps)
+    if scope.is_empty:
         return (
-            "BLOCKED (target lock — NO TARGET KNOWN): this task's connection info "
-            "was empty or unparsable, so ALL outbound network access is locked. "
-            "The VPN carries OTHER teams' instances — probing them wastes budget "
-            "and any flag found there is invalid for this task. Obtain/confirm "
-            "THIS task's target first: re-read the task description, check "
-            "task_status, or report the missing target via notify_coordinator. "
+            "BLOCKED (scope lock — NO TARGET KNOWN): this mission's scope was "
+            "empty or unparsable, so ALL outbound network access is locked. "
+            "The network may carry OTHER instances/assets — probing them is "
+            "out of scope and any result found there is invalid. Obtain/confirm "
+            "THIS mission's authorized target first: re-read the task/engagement, "
+            "check task_status, or report the missing scope via notify_coordinator. "
             "run_python still works for local computation (localhost only)."
         )
     h = (host or "").strip().lower()
-    if not h or h in deps.allowed_hosts:
+    if not h or scope.allows(h):
         return None
-    targets = ", ".join(sorted(deps.allowed_hosts))
     return (
-        f"BLOCKED (target lock): '{h}' is not one of your assigned targets ({targets}). "
-        "Other IPs on this VPN belong to OTHER tasks — hitting them wastes your budget "
-        "and any flag found there is invalid for this task. Return to your assigned "
-        "target. Switch only if YOUR target's own output explicitly points there."
+        f"BLOCKED (scope lock): '{h}' is not within your authorized scope "
+        f"({scope.describe()}). Hosts outside the engagement scope are off-limits — "
+        "touching them is unauthorized and any result found there is invalid. "
+        "Return to an in-scope target. Pivot only within scope, and only when "
+        "an in-scope target's own output points there."
     )
 
 
@@ -161,7 +159,7 @@ def _build_toolset(
         if block:
             tracer.event(
                 "target_lock_block", tool="http_request", host=host,
-                degraded=not ctx.deps.allowed_hosts,
+                degraded=_deps_scope(ctx.deps).is_empty,
             )
             return block
         return await do_raw_http(url, method=method, headers=headers, body=body, timeout=timeout)
@@ -184,7 +182,7 @@ def _build_toolset(
         if block:
             tracer.event(
                 "target_lock_block", tool="tcp_send", host=host,
-                degraded=not ctx.deps.allowed_hosts,
+                degraded=_deps_scope(ctx.deps).is_empty,
             )
             return block
         return await do_tcp_send(host, port, payload=payload, payload_hex=payload_hex, read_timeout=read_timeout)
@@ -203,13 +201,15 @@ def _build_toolset(
         """
         if not ctx.deps.allow_exec:
             return "run_python is disabled for this run (--no-exec)."
-        # Always pass the allowed-hosts set (even when empty): do_run_python
-        # treats an empty set as the degraded no-target-known lock (localhost
-        # only). The solver's own sockets are always restricted to scope.
+        # Always pass the scope (even when empty): do_run_python treats an empty
+        # scope as the degraded no-target-known lock (localhost only). The
+        # solver's own sockets are always restricted to the engagement scope —
+        # literal hosts AND authorized CIDR ranges.
         return await do_run_python(
             code,
             timeout=timeout,
             allowed_hosts=ctx.deps.allowed_hosts,
+            allowed_cidrs=ctx.deps.allowed_cidrs,
             workdir=ctx.deps.workdir or None,
         )
 
@@ -439,7 +439,9 @@ class HeadlessSolver:
         self.time_budget_seconds = time_budget_seconds
 
         self.use_vision = supports_vision(model_spec)
-        parsed_hosts = _parse_allowed_hosts(meta.connection_info)
+        # The engagement scope: for a CTF range it is the task's connection_info
+        # (literal hosts); a real engagement puts hosts + authorized CIDRs here.
+        scope = Scope.parse(meta.connection_info)
         self.deps = HeadlessDeps(
             platform=platform,
             challenge_name=meta.name,
@@ -455,7 +457,8 @@ class HeadlessSolver:
             flags_total=max(1, meta.flag_count),
             flags_accepted=meta.correct_flag_count,
             deadline_monotonic=time.monotonic() + time_budget_seconds,
-            allowed_hosts=parsed_hosts,
+            allowed_hosts=scope.hosts,
+            allowed_cidrs=tuple(scope.cidr_strings()),
             scenario=_guess_scenario(meta),
             blackboard=blackboard,
             mission_mode=mission_mode,
@@ -481,9 +484,10 @@ class HeadlessSolver:
             self.meta,
             remaining_seconds=remaining,
             allow_exec=self.allow_exec,
+            mission_mode=self.deps.mission_mode,
         )
-        if not self.deps.allowed_hosts:
-            # Degraded target lock: no target hosts could be parsed from
+        if _deps_scope(self.deps).is_empty:
+            # Degraded scope lock: no target hosts/ranges could be parsed from
             # connection_info, so the lock refuses ALL egress instead of
             # silently running unlocked. Make it loud in both trace and prompt.
             logger.warning(

@@ -90,13 +90,20 @@ def build_headless_prompt(
     *,
     remaining_seconds: int | None = None,
     allow_exec: bool = True,
+    mission_mode: str = "capture",
 ) -> str:
     """Build the solver's system prompt: a neutral task contract.
 
     Objective + tool contract + submission format + hard constraints. No attack
     methodology, no per-scenario playbook, no procedure — how to search is left
-    entirely to the model.
+    entirely to the model. In assessment mode the contract describes a diffuse
+    goal and a Finding-recording loop instead of a flag; see
+    `_build_assessment_prompt`. The capture (CTF) text below is unchanged.
     """
+    if mission_mode == "assessment":
+        return _build_assessment_prompt(
+            meta, remaining_seconds=remaining_seconds, allow_exec=allow_exec
+        )
     addrs = [a.strip() for a in re.split(r"[,\s]+", meta.connection_info) if a.strip()]
 
     lines: list[str] = [
@@ -172,6 +179,95 @@ def build_headless_prompt(
         "- Treat task_status as ground truth after each submit_flag: if the accepted count did not",
         "  rise, the flag was not accepted regardless of how the acknowledgement read.",
         "- Stay within the authorized scope above.",
+    ]
+
+    return "\n".join(lines)
+
+
+def _build_assessment_prompt(
+    meta: ChallengeMeta,
+    *,
+    remaining_seconds: int | None = None,
+    allow_exec: bool = True,
+) -> str:
+    """Assessment-mode contract: a diffuse goal, no flag oracle, findings as the
+    product. Still a neutral contract — it describes the search loop and the
+    product, never how to attack.
+    """
+    addrs = [a.strip() for a in re.split(r"[,\s]+", meta.connection_info) if a.strip()]
+
+    lines: list[str] = [
+        "You are an autonomous security AI running one authorized assessment.",
+        "You have no local toolchain beyond the tools listed below; your strengths are",
+        "reasoning, protocol comprehension, and precise payload construction.",
+        "",
+        "## Objective",
+        "This engagement is a SEARCH with no single flag. Your product is FINDINGS —",
+        "things worth reporting (for a security assessment, vulnerabilities). Explore the",
+        "authorized scope, build up the shared working record, and record every finding as",
+        "you go. There is no oracle to tell you when you are done: keep covering new ground",
+        "until the scope is exhausted or your time budget runs out.",
+        "",
+        "## Engagement",
+        f"**Name**       : {meta.name}",
+    ]
+    if meta.category:
+        lines.append(f"**Type**       : {meta.category}")
+    if remaining_seconds is not None:
+        lines.append(f"**Time budget**: ~{max(0, remaining_seconds) // 60} minutes left.")
+    lines += ["", meta.description or "_No goal description provided._", ""]
+
+    lines += ["## Authorized scope"]
+    if addrs:
+        lines += [
+            f"In scope: {', '.join(addrs)}",
+            "These hosts/ranges are the ONLY authorized targets. A scope lock is enforced:",
+            "http_request, tcp_send, and run_python socket connections to anything outside",
+            "this scope are blocked, with no bypass. Touching out-of-scope systems is",
+            "unauthorized — stay strictly within scope, and honor the rules of engagement.",
+        ]
+    else:
+        lines += [
+            "No scope was provided. Without an authorized target you cannot proceed — report",
+            "the missing scope via notify_coordinator and do not probe anything.",
+        ]
+
+    lines += [
+        "",
+        "## Working record (shared blackboard)",
+        "Maintain an explicit record as you search — it is shared with other executors and",
+        "survives beyond your context window:",
+        "- `add_fact(statement, evidence)`: a confirmed fact about the target (service,",
+        "  version, endpoint, credential, access gained).",
+        "- `add_finding(title, severity, target, category, evidence, reproduction, verified)`:",
+        "  record a finding. Record CANDIDATES too (verified=false) — an unverified lead is",
+        "  still a product of the search.",
+        "- `verify_finding(finding_id, verified, evidence)`: after you reproduce/confirm a",
+        "  candidate, promote it (verified=true); if it did not hold up, mark it refuted",
+        "  (verified=false). Attach the confirming or refuting evidence.",
+        "- `add_subgoal(description)` / `resolve_subgoal(id, outcome)`: keep your own live",
+        "  coverage checklist of what is still worth investigating.",
+        "",
+        "## Tools",
+        "- `http_request(url, method, headers, body)`: full-control HTTP within scope.",
+        "- `tcp_send(host, port, payload, payload_hex)`: one raw TCP exchange (line or binary).",
+    ]
+    if allow_exec:
+        lines.append(
+            "- `run_python(code)`: local CPython scratchpad (stdlib plus installed libraries). "
+            "print() what you need. Its sockets are scope-locked too."
+        )
+    lines += [
+        "- `task_status()` / `check_findings()` / `notify_coordinator(msg)`: time left, read",
+        "  sibling findings, report upward.",
+        "",
+        "## Constraints",
+        "- Act ONLY within the authorized scope and the rules of engagement above.",
+        "- Record findings from what you actually observed; never fabricate or infer a finding",
+        "  you could not reproduce. Distinguish candidates from verified findings honestly.",
+        "- Do not chase out-of-scope systems even if an in-scope target points at them, unless",
+        "  that pivot is itself inside the authorized scope.",
+        "- There is no flag here; do not call submit_flag — record findings instead.",
     ]
 
     return "\n".join(lines)

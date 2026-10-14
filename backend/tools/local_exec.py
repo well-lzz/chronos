@@ -28,13 +28,18 @@ async def do_run_python(
     code: str,
     timeout: float = DEFAULT_TIMEOUT,
     allowed_hosts: frozenset[str] | None = None,
+    allowed_cidrs: tuple[str, ...] | None = None,
     workdir: str | None = None,
 ) -> str:
     """Execute a Python snippet on the host and return stdout/stderr.
 
     allowed_hosts: when not None, outbound socket connections from the snippet
-    are restricted to these hosts (target lock) plus localhost. An empty set
+    are restricted to these hosts (scope lock) plus localhost. An empty set
     means the lock is in its degraded no-target-known state: localhost only.
+
+    allowed_cidrs: additional authorized IP ranges (CIDR strings) for a real
+    engagement scope; a numeric peer IP inside any of them is allowed. Empty for
+    CTF, so the subprocess guard is byte-identical to before on that path.
 
     workdir: per solver-run working directory. The snippet file is written
     there, the child process runs with it as cwd, and TMP/TEMP/TMPDIR point
@@ -48,14 +53,27 @@ async def do_run_python(
 
     if allowed_hosts is not None:
         hosts = sorted(set(allowed_hosts) | {"127.0.0.1", "localhost", "::1"})
+        cidrs = sorted(set(allowed_cidrs or ()))
         preamble = (
             "import socket as _socket\n"
+            "import ipaddress as _ipaddress\n"
             f"_ALLOWED_HOSTS = frozenset({hosts!r})\n"
+            f"_ALLOWED_NETS = tuple(_ipaddress.ip_network(_c) for _c in {cidrs!r})\n"
+            "def _in_scope(host):\n"
+            "    if host in _ALLOWED_HOSTS:\n"
+            "        return True\n"
+            "    if _ALLOWED_NETS:\n"
+            "        try:\n"
+            "            _ip = _ipaddress.ip_address(host)\n"
+            "        except ValueError:\n"
+            "            return False\n"
+            "        return any(_ip in _n for _n in _ALLOWED_NETS)\n"
+            "    return False\n"
             "def _guard(address):\n"
             "    host = str(address[0] if isinstance(address, tuple) else address).strip('[]').lower()\n"
-            "    if host and host not in _ALLOWED_HOSTS:\n"
-            "        raise PermissionError(f\"target lock: '{host}' is not an assigned target; \"\n"
-            "                              f\"allowed: {sorted(_ALLOWED_HOSTS)}\")\n"
+            "    if host and not _in_scope(host):\n"
+            "        raise PermissionError(f\"scope lock: '{host}' is out of the authorized scope; \"\n"
+            "                              f\"allowed hosts: {sorted(_ALLOWED_HOSTS)} nets: {[str(_n) for _n in _ALLOWED_NETS]}\")\n"
             "_orig_connect = _socket.socket.connect\n"
             "def _connect(self, address):\n"
             "    _guard(address)\n"

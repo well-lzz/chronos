@@ -98,6 +98,13 @@ async def _check_benchmark_task(settings: Settings) -> bool:
 )
 @click.option("--models", multiple=True, help="Model specs (default: deepseek/deepseek-chat)")
 @click.option("--challenge", default=None, help="Solve a single challenge (directory, name, or unique_code)")
+@click.option(
+    "--engagement",
+    default=None,
+    help="Run an Assessment-mode engagement from a scope config (YAML/JSON): a real "
+    "authorized assessment with a diffuse goal, no flag oracle. Findings accumulate on "
+    "the mission blackboard. Requires an explicit non-empty scope.",
+)
 @click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
 @click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
 @click.option("--smoke-test", is_flag=True, help="Run a read-only TSecBench platform smoke test")
@@ -124,6 +131,7 @@ def main(
     total_budget_seconds: int | None,
     models: tuple[str, ...],
     challenge: str | None,
+    engagement: str | None,
     challenges_dir: str,
     no_submit: bool,
     smoke_test: bool,
@@ -203,6 +211,12 @@ def main(
 
     if model_smoke_test:
         asyncio.run(_run_model_smoke_test(settings, model_specs))
+        return
+
+    # An engagement targets the operator's own authorized scope, not the TSec
+    # VPN/benchmark — skip the TSec-specific reachability checks.
+    if engagement:
+        asyncio.run(_run_engagement(settings, engagement, model_specs, no_submit))
         return
 
     if not smoke_test and not asyncio.run(
@@ -320,6 +334,71 @@ async def _run_single(
         else:
             console.print("\n[bold red]No flag found.[/bold red]")
 
+        console.print("\n[bold]Cost Summary:[/bold]")
+        for agent_name in cost_tracker.by_agent:
+            console.print(f"  {agent_name}: {cost_tracker.format_usage(agent_name)}")
+        console.print(f"  [bold]Total: ${cost_tracker.total_cost_usd:.2f}[/bold]")
+    finally:
+        await platform.close()
+
+
+async def _run_engagement(
+    settings: Settings,
+    engagement_path: str,
+    model_specs: list[str],
+    no_submit: bool,
+) -> None:
+    """Run one Assessment-mode engagement: a single multi-target mission with a
+    shared, persisted blackboard. No flag oracle — findings are the product."""
+    from backend.agents.swarm import ChallengeSwarm, _time_limit_for_challenge
+    from backend.cost_tracker import CostTracker
+    from backend.engagement import Engagement, EngagementError, LocalEngagementPlatform
+
+    try:
+        eng = Engagement.load(engagement_path)
+    except EngagementError as e:
+        console.print(f"[red]Engagement refused:[/red] {e}")
+        sys.exit(1)
+
+    meta = eng.to_meta()
+    scope = eng.scope()
+    console.print(f"[bold]Engagement:[/bold] {eng.name}  (assessment, no flag oracle)")
+    console.print(f"  Authorized scope: {scope.describe()}")
+    console.print("  Egress is locked to this scope — out-of-scope hosts are blocked.\n")
+
+    platform = LocalEngagementPlatform(name=eng.name)
+    cost_tracker = CostTracker()
+    swarm = ChallengeSwarm(
+        challenge_dir=str(Path(settings.state_dir) / "engagements" / eng.name),
+        meta=meta,
+        platform=platform,
+        cost_tracker=cost_tracker,
+        settings=settings,
+        model_specs=model_specs,
+        no_submit=no_submit,
+        mission_mode="assessment",
+    )
+
+    limit = eng.time_budget_seconds or _time_limit_for_challenge(settings, meta)
+    try:
+        run_task = asyncio.create_task(swarm.run(), name=f"engagement-{eng.name}")
+        done, _ = await asyncio.wait({run_task}, timeout=limit)
+        if run_task not in done:
+            swarm.kill("wall_clock")
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+            console.print(f"\n[bold yellow]Time budget reached:[/bold yellow] {limit}s; stopped.")
+
+        bb = swarm._get_blackboard()
+        c = bb.counts()
+        console.print("\n[bold]Assessment complete[/bold]")
+        console.print(
+            f"  Findings: {c['findings']} "
+            f"(verified {c['findings_verified']}, candidate {c['findings_candidate']})"
+        )
+        console.print(f"  Facts: {c['facts']}   Sub-goals: {c['subgoals_total']}")
+        if bb.path:
+            console.print(f"  Blackboard persisted: {bb.path}")
         console.print("\n[bold]Cost Summary:[/bold]")
         for agent_name in cost_tracker.by_agent:
             console.print(f"  {agent_name}: {cost_tracker.format_usage(agent_name)}")
