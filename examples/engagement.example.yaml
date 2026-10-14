@@ -1,8 +1,8 @@
 # Example engagement config — a real, Assessment-mode mission.
 #
-#   ctf-solve --engagement examples/engagement.example.yaml
+#   chronos --engagement examples/engagement.example.yaml
 #
-# Unlike a CTF range (one flag, an oracle, a race), an engagement has a diffuse
+# Unlike a single-flag range (one flag, an oracle, a race), an engagement has a diffuse
 # goal and no oracle: the agent explores the authorized scope and accumulates
 # FINDINGS on a shared, persisted blackboard until coverage/budget is reached.
 #

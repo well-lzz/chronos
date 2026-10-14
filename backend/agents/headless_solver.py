@@ -45,7 +45,7 @@ from backend.tracing import SolverTracer
 
 logger = logging.getLogger(__name__)
 
-FLAG_TOKEN_RE = re.compile(r"(?i)(?:flag|CTF)\{[^{}\r\n]{1,256}\}")
+FLAG_TOKEN_RE = re.compile(r"(?i)flag\{[^{}\r\n]{1,256}\}")
 TOOL_MAX_RETRIES = 8
 TASK_TIME_BUDGET_SECONDS = 55 * 60  # platform hard limit is 60 min per task
 
@@ -68,7 +68,7 @@ def _norm_flag_text(value: str) -> str:
 def _flag_inner(value: str) -> str | None:
     """Normalized content between flag{ and } — catches decoys re-wrapped with
     a different prefix or casing."""
-    m = re.match(r"(?is)^\s*(?:flag|ctf)\{(.*)\}\s*$", value)
+    m = re.match(r"(?is)^\s*flag\{(.*)\}\s*$", value)
     return _norm_flag_text(m.group(1)) if m else None
 
 
@@ -438,8 +438,9 @@ class HeadlessSolver:
         self.time_budget_seconds = time_budget_seconds
 
         self.use_vision = supports_vision(model_spec)
-        # The engagement scope: for a CTF range it is the task's connection_info
-        # (literal hosts); a real engagement puts hosts + authorized CIDRs here.
+        # The engagement scope: for a platform range it is the task's
+        # connection_info (literal hosts); a real engagement puts hosts +
+        # authorized CIDRs here.
         scope = Scope.parse(meta.connection_info)
         self.deps = HeadlessDeps(
             platform=platform,

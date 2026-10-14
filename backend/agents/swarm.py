@@ -115,7 +115,7 @@ class ChallengeSwarm:
         a crashed task just reruns within its time budget). The dir is only a
         private workspace for run_python artifacts, kept for post-mortems.
         """
-        state_dir = getattr(self.settings, "state_dir", ".ctf-state")
+        state_dir = getattr(self.settings, "state_dir", ".chronos-state")
 
         def _slug(s: str) -> str:
             return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "x"
@@ -138,7 +138,7 @@ class ChallengeSwarm:
         if self._blackboard is None:
             from backend.blackboard import Blackboard
 
-            state_dir = getattr(self.settings, "state_dir", ".ctf-state")
+            state_dir = getattr(self.settings, "state_dir", ".chronos-state")
             self._blackboard = Blackboard.load_or_new(self.meta.name, state_dir)
         return self._blackboard
 
@@ -339,7 +339,7 @@ class ChallengeSwarm:
         Finding) and ends THIS executor, but never cancels its siblings. The only
         built-in stops are the termination hook (backend/termination.py, which
         you define), a hard bump ceiling, and the externally-enforced wall-clock
-        budget. CTF "stop on platform-confirmed solve" is handled by the
+        budget. Platform "stop on confirmed solve" is handled by the
         coordinator's poller, not here.
         """
         from backend.termination import CycleState, should_terminate

@@ -126,7 +126,7 @@ class Settings(BaseSettings):
     )
     # Per solver-run scratch dir root (run_python workspaces, trace logs live under logs/).
     state_dir: str = Field(
-        default=".ctf-state", validation_alias=AliasChoices("CTF_STATE_DIR", "TSECBENCH_STATE_DIR"),
+        default=".chronos-state", validation_alias=AliasChoices("CHRONOS_STATE_DIR", "STATE_DIR"),
     )
     # VPN-only health endpoint probed before a run starts. Override only if the
     # platform changes the address.

@@ -39,7 +39,7 @@ async def do_run_python(
 
     allowed_cidrs: additional authorized IP ranges (CIDR strings) for a real
     engagement scope; a numeric peer IP inside any of them is allowed. Empty for
-    CTF, so the subprocess guard is byte-identical to before on that path.
+    a plain host list, so the subprocess guard is byte-identical on that path.
 
     workdir: per solver-run working directory. The snippet file is written
     there, the child process runs with it as cwd, and TMP/TEMP/TMPDIR point

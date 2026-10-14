@@ -1,10 +1,10 @@
 """Engagement scope — the single, structural authorization boundary.
 
-Every mission (a CTF range or a real engagement) runs inside an explicit scope:
-the set of hosts and IP ranges the agent is authorized to touch. The solver's
-own egress (http_request / tcp_send / run_python sockets) is restricted to this
-set with no bypass — exactly the old CTF "target lock", generalized from a flat
-host list to host + CIDR so a real engagement's authorized ranges fit too.
+Every mission (a platform range or a real engagement) runs inside an explicit
+scope: the set of hosts and IP ranges the agent is authorized to touch. The
+solver's own egress (http_request / tcp_send / run_python sockets) is restricted
+to this set with no bypass — the structural "target lock", generalized from a
+flat host list to host + CIDR so a real engagement's authorized ranges fit too.
 
 This module is the ONE definition of "is this host in scope". Both the parent
 process (http_request/tcp_send) and the run_python subprocess guard derive their

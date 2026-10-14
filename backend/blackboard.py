@@ -232,7 +232,7 @@ class Blackboard:
             pass
 
     @classmethod
-    def load_or_new(cls, mission_id: str, state_dir: str = ".ctf-state") -> Blackboard:
+    def load_or_new(cls, mission_id: str, state_dir: str = ".chronos-state") -> Blackboard:
         path = str(Path(state_dir) / "blackboards" / f"{_slug(mission_id)}.json")
         bb = cls(mission_id=mission_id, path=path)
         try:

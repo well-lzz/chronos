@@ -1,8 +1,8 @@
 """Engagement — a real-world assessment mission defined by an authorized scope.
 
-An engagement is the Assessment-mode counterpart to a CTF range: instead of the
-platform handing out isolated flag challenges, the operator writes one config
-file describing
+An engagement is a real-world mission defined locally: instead of a platform
+handing out isolated flag challenges, the operator writes one config file
+describing
 
   - what the assessment is after (a diffuse goal, not a flag),
   - the authorized scope (hosts / IPs / CIDRs) — the HARD egress boundary, and
@@ -10,8 +10,8 @@ file describing
 
 The scope is not optional and not advisory: an assessment engagement with an
 empty scope fails to load (see `validate`). The agent's egress is then locked to
-that scope by the same structural mechanism the CTF target-lock uses — there is
-no separate "trust me" path (docs/mission-modes.md §3).
+that scope by the same structural mechanism the platform target-lock uses —
+there is no separate "trust me" path (docs/mission-modes.md §3).
 
 The config is read-only input the operator authored; it carries no instructions
 to the model beyond the goal/RoE text the operator wrote.
@@ -162,7 +162,7 @@ class LocalEngagementPlatform:
             status="not_applicable",
             message="assessment mode has no flag oracle",
             display=(
-                "NOT APPLICABLE — this is an assessment engagement, not a CTF. "
+                "NOT APPLICABLE — this is an assessment engagement with no flag oracle. "
                 "There is no flag to submit; record what you found with add_finding "
                 "(candidate → verify_finding) on the blackboard instead."
             ),

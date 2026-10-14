@@ -6,7 +6,7 @@
 
 当前主攻 [TSecBench](https://tsecbench.zc.tencent.com/)（腾讯云鼎实验室智能攻防 Agent 评测平台）跑分。`Tsecbench v1` 题集共 63 题、23000 分、总时限 360 分钟，覆盖六大能力域：Web 漏洞挖掘、二进制漏洞挖掘、漏洞利用、多阶段渗透、云攻击、对抗规避。多 flag 题按 flag 部分给分，查看 hint 按比例扣分。
 
-同一内核也能跑**真实授权评估**（不止 CTF）：见下文「单一行为」与 `--engagement`。无论 CTF、渗透测试还是代码审计，都被统一建模为**同一个搜索过程**，没有模式开关。
+同一内核也能跑**真实授权评估**（不止跑分靶场）：见下文「单一行为」与 `--engagement`。无论跑分题、渗透测试还是代码审计，都被统一建模为**同一个搜索过程**，没有模式开关。
 
 ## 任务模型：一切都是搜索
 
@@ -20,7 +20,7 @@ Agent 的核心循环被建模为「**搜索 + 随手捕获每一个产物**」�
 
 **终止条件由你定义**：见 [`backend/termination.py`](backend/termination.py) 的 `should_terminate(blackboard, state)` 钩子（默认永不提前终止，只受 `MAX_BUMPS` 步数兜底与墙钟预算约束）。在那里写你的策略——覆盖度、边际收益递减、发现数阈值、确认目标达成等。
 
-> 机械外壳保留：TSecBench 平台适配器、机械调度器、Web 控制台仍可作为"可选工作来源/观测"。CTF 下"平台判真即停"由调度器的 poller（检测到 `challenge_solved` 即 kill 该 swarm）在外部完成，不再由 swarm 内部竞速处理。
+> 机械外壳保留：TSecBench 平台适配器、机械调度器、Web 控制台仍可作为"可选工作来源/观测"。带 flag 的平台题下，"平台判真即停"由调度器的 poller（检测到 `challenge_solved` 即 kill 该 swarm）在外部完成，不再由 swarm 内部竞速处理。
 
 ## 执行形态
 
@@ -91,7 +91,7 @@ DEEPSEEK_API_KEY=your_deepseek_key
 ### 3. 启动
 
 ```bash
-uv run ctf-solve -i
+uv run chronos -i
 ```
 
 默认用 `deepseek/deepseek-chat` 单模型直连官方 API。如需禁用本机代码执行加 `--no-exec`；想跑多模型同题竞速，显式传多个 `--models`。
@@ -99,13 +99,13 @@ uv run ctf-solve -i
 ### 单题调试
 
 ```bash
-uv run ctf-solve --challenge <题目目录、题名或 unique_code>
+uv run chronos --challenge <题目目录、题名或 unique_code>
 ```
 
 ### 真实授权评估（engagement）
 
 ```bash
-uv run ctf-solve --engagement examples/engagement.example.yaml
+uv run chronos --engagement examples/engagement.example.yaml
 ```
 
 用一份 engagement 配置（YAML/JSON）定义一次**授权评估**：弥散目标 + 授权 scope + 交战规则（RoE）。模板见 [`examples/engagement.example.yaml`](examples/engagement.example.yaml)。要点：
@@ -117,15 +117,15 @@ uv run ctf-solve --engagement examples/engagement.example.yaml
 ### 只读自检
 
 ```bash
-uv run ctf-solve --smoke-test         # 平台连通性（题目列表 + 已解状态）
-uv run ctf-solve --model-smoke-test   # 大模型 API 连通性
+uv run chronos --smoke-test         # 平台连通性（题目列表 + 已解状态）
+uv run chronos --model-smoke-test   # 大模型 API 连通性
 ```
 
 ### Web 控制台（可视化 + 与 solver 对话）
 
 ```bash
-uv run ctf-solve --web                 # 默认 http://127.0.0.1:8000
-uv run ctf-solve --web --web-port 9000
+uv run chronos --web                 # 默认 http://127.0.0.1:8000
+uv run chronos --web --web-port 9000
 ```
 
 内嵌 FastAPI + WebSocket 服务,机械调度器在后台正常跑分,浏览器里实时看到:
@@ -170,7 +170,7 @@ solver 始终带一组**黑板工具**（中性，是"认知结构"而非方法�
 
 系统提示是**一份统一的纯契约**：目标（在授权 scope 内搜索、把产物记进黑板）、工具契约、硬约束（范围锁定、不许编造 Finding、本地磁盘不可信）。**不含任何攻击方法论或题型 playbook**。仅当目标带 flag 时，契约才额外出现 `submit_flag` 一行；否则连 flag 都不提。
 
-**Scope Lock（范围锁定，原 Target Lock 的泛化）**是纯结构性的：solver 自身的出网一律限制在授权 scope 内——CTF 下是题目 `connection_info` 的主机，engagement 下是配置的主机 + 授权 CIDR 段。`http_request` / `tcp_send` / `run_python` 三处由同一个 `backend/scope.py` 判定（host 精确匹配 + CIDR 数值匹配），无任何绕过；scope 为空则 fail-loud 拒绝一切出网。
+**Scope Lock（范围锁定，原 Target Lock 的泛化）**是纯结构性的：solver 自身的出网一律限制在授权 scope 内——平台题下是题目 `connection_info` 的主机，engagement 下是配置的主机 + 授权 CIDR 段。`http_request` / `tcp_send` / `run_python` 三处由同一个 `backend/scope.py` 判定（host 精确匹配 + CIDR 数值匹配），无任何绕过；scope 为空则 fail-loud 拒绝一切出网。
 
 ### 过程可追踪
 
@@ -180,7 +180,7 @@ solver 始终带一组**黑板工具**（中性，是"认知结构"而非方法�
 ## 命令行参考
 
 ```text
-uv run ctf-solve [OPTIONS]
+uv run chronos [OPTIONS]
 
 --models SPEC               模型规格，可多次（如 deepseek/deepseek-chat、qwen/qwen-plus）
 --challenge REF             单题模式（目录、题名或 unique_code）
@@ -208,7 +208,7 @@ uv run ctf-solve [OPTIONS]
 - `examples/engagement.example.yaml`：engagement 配置模板
 - `challenges/`：拉取后的题目元数据
 - `logs/`：trace 日志与运行记录
-- `.ctf-state/`：run_python 工作区、黑板（`blackboards/`）、报告（`reports/`）
+- `.chronos-state/`：run_python 工作区、黑板（`blackboards/`）、报告（`reports/`）
 - `docs/rewrite-plan.md`：极简重构基线；`docs/mission-modes.md`：Fact/Goal/Step/Finding 设计
 
 ## 运行环境要求

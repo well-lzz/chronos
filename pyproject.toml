@@ -1,7 +1,7 @@
 [project]
-name = "ctf-agent-two"
+name = "chronos"
 version = "0.1.0"
-description = "Agentic offensive security — TSecBench headless solver swarm"
+description = "Agentic offensive security — headless mission solver swarm"
 requires-python = ">=3.14"
 dependencies = [
     "pydantic-ai[openai]",
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ctf-solve = "backend.cli:main"
+chronos = "backend.cli:main"
 
 [build-system]
 requires = ["hatchling"]

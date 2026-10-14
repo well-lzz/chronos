@@ -53,8 +53,8 @@ class HeadlessDeps:
     # only). There is no bypass — purely structural.
     allowed_hosts: frozenset[str] = frozenset()
     # Authorized IP ranges (CIDR strings) for a real engagement scope. Empty for
-    # CTF (connection_info yields only literal hosts), so the CTF path is
-    # unchanged. Enforced together with allowed_hosts via backend.scope.Scope.
+    # a platform range (connection_info yields only literal hosts), so that path
+    # is unchanged. Enforced together with allowed_hosts via backend.scope.Scope.
     allowed_cidrs: tuple[str, ...] = ()
     scenario: str = ""
     # Mission blackboard (shared across executors on the same mission): the

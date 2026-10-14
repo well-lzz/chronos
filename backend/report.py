@@ -10,8 +10,8 @@ local artifacts (docs/mission-modes.md §5):
 
 Pure stdlib, no network. Findings are ordered by severity (critical first) then
 by status (verified before candidate), so the most important, confirmed issues
-read first. For a Capture (CTF) mission the same renderer produces a solved +
-flag + evidence report, because the flag is recorded as a verified Finding.
+read first. When a mission captured a flag, it appears as a verified Finding
+(category=flag) and renders like any other, with its evidence.
 """
 
 from __future__ import annotations

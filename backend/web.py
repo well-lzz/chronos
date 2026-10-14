@@ -6,7 +6,7 @@ swarms, cost); a watched solver's live reasoning is streamed by tailing its
 JSONL trace file; operator actions (pause/resume/kill, and "talk to the agent"
 via bump) go through the same operator_inbox the terminal REPL uses.
 
-Launch with `ctf-solve --web`. No LLM runs here — "talking to the agent" means
+Launch with `chronos --web`. No LLM runs here — "talking to the agent" means
 injecting a one-off guidance message into a specific running solver.
 """
 
