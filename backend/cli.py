@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -362,6 +363,8 @@ async def _run_engagement(
 
     meta = eng.to_meta()
     scope = eng.scope()
+    started = time.strftime("%Y-%m-%d %H:%M:%S")
+    started_monotonic = time.monotonic()
     console.print(f"[bold]Engagement:[/bold] {eng.name}  (assessment, no flag oracle)")
     console.print(f"  Authorized scope: {scope.describe()}")
     console.print("  Egress is locked to this scope — out-of-scope hosts are blocked.\n")
@@ -397,8 +400,30 @@ async def _run_engagement(
             f"(verified {c['findings_verified']}, candidate {c['findings_candidate']})"
         )
         console.print(f"  Facts: {c['facts']}   Sub-goals: {c['subgoals_total']}")
-        if bb.path:
-            console.print(f"  Blackboard persisted: {bb.path}")
+
+        # Render the local report (JSON + Markdown + HTML).
+        from backend.report import render_reports
+
+        duration = int(time.monotonic() - started_monotonic)
+        run_meta = {
+            "mode": "assessment",
+            "goal": eng.goal,
+            "scope": scope.describe(),
+            "rules_of_engagement": eng.rules_of_engagement,
+            "models": list(model_specs),
+            "started": started,
+            "ended": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_seconds": duration,
+            "cost_usd": round(cost_tracker.total_cost_usd, 4),
+        }
+        report_dir = Path(settings.state_dir) / "reports" / eng.name
+        paths = render_reports(bb, report_dir, run_meta)
+        console.print(f"  Blackboard: {bb.path}")
+        console.print(
+            f"  Report: {paths['md']}\n"
+            f"          {paths['json']}\n"
+            f"          {paths['html']}"
+        )
         console.print("\n[bold]Cost Summary:[/bold]")
         for agent_name in cost_tracker.by_agent:
             console.print(f"  {agent_name}: {cost_tracker.format_usage(agent_name)}")
