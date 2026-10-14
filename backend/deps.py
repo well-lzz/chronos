@@ -13,6 +13,7 @@ from backend.platforms import CompetitionPlatform
 from backend.prompts import ChallengeMeta
 
 if TYPE_CHECKING:
+    from backend.blackboard import Blackboard
     from backend.message_bus import ChallengeMessageBus
 
 # Type for the deduped submit callback: (flag) -> (display, is_confirmed)
@@ -52,6 +53,12 @@ class HeadlessDeps:
     # only). There is no bypass — purely structural.
     allowed_hosts: frozenset[str] = frozenset()
     scenario: str = ""
+    # Mission blackboard (shared across executors on the same mission): the
+    # explicit Fact / Finding / Sub-Goal store. None = not wired (pure legacy).
+    blackboard: Blackboard | None = None
+    # "capture" (CTF: flag is the goal) | "assessment" (diffuse goal, findings
+    # accumulate). Step 1 only exercises capture; assessment policy is step 2.
+    mission_mode: str = "capture"
 
 
 @dataclass

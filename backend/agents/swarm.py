@@ -25,6 +25,7 @@ from backend.solver_base import (
 )
 
 if TYPE_CHECKING:
+    from backend.blackboard import Blackboard
     from backend.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,12 @@ class ChallengeSwarm:
     _submit_locked: bool = False  # circuit breaker: too many wrong guesses
     _last_progress_monotonic: float = 0.0  # last accepted (partial or full) flag
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
+    # One mission = one challenge = one shared blackboard (Fact/Finding/Sub-Goal).
+    # Every executor on this challenge reads/writes the same board; persisted so a
+    # long run survives restart. Created lazily (see _get_blackboard). Capture
+    # mode only for now — assessment policy is step 2.
+    mission_mode: str = "capture"
+    _blackboard: Blackboard | None = None  # lazily created; see _get_blackboard
 
     def _workdir_for(self, model_spec: str) -> str:
         """Per solver-run scratch dir for run_python isolation.
@@ -122,6 +129,20 @@ class ChallengeSwarm:
     def _effective_model_specs(self) -> list[str]:
         """Runnable model specs. Headless-only now, so this is just the configured list."""
         return list(self.model_specs)
+
+    def _get_blackboard(self):
+        """The one shared mission blackboard for this challenge (lazy, persisted).
+
+        One per challenge so every executor on it sees the same Facts/Findings/
+        Sub-Goals. Loaded from / persisted to the state dir keyed by challenge
+        name, so a restart within the run recovers prior discoveries.
+        """
+        if self._blackboard is None:
+            from backend.blackboard import Blackboard
+
+            state_dir = getattr(self.settings, "state_dir", ".ctf-state")
+            self._blackboard = Blackboard.load_or_new(self.meta.name, state_dir)
+        return self._blackboard
 
     def _create_solver(self, model_spec: str):
         """Create a HeadlessSolver (the only solver type): one model, one live
@@ -149,6 +170,8 @@ class ChallengeSwarm:
             allow_exec=bool(getattr(self.settings, "allow_local_exec", True)),
             time_budget_seconds=time_budget,
             workdir=self._workdir_for(model_spec),
+            blackboard=self._get_blackboard(),
+            mission_mode=self.mission_mode,
         )
 
     def _make_notify_fn(self, model_spec: str):

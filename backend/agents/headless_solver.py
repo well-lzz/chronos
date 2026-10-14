@@ -239,6 +239,24 @@ def _build_toolset(
             ctx.deps.last_progress_step = step_counter[0] if step_counter else 0
         if confirmed:
             ctx.deps.confirmed_flag = flag
+            # Capture mode: the flag IS the verified terminal-goal Finding.
+            # Recorded on the shared blackboard so the mission's report and any
+            # sibling executors see it. Best-effort — never block a confirmed flag.
+            if ctx.deps.blackboard:
+                try:
+                    from backend.blackboard import VERIFIED
+
+                    await ctx.deps.blackboard.add_finding(
+                        f"flag: {flag}",
+                        target=ctx.deps.challenge_name,
+                        category="flag",
+                        severity="info",
+                        status=VERIFIED,
+                        evidence=display,
+                        found_by=ctx.deps.model_spec,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         else:
             # Track platform-rejected candidates and keep them visible: blind
             # resubmission of known-wrong flags feeds the swarm's circuit breaker.
@@ -308,6 +326,83 @@ def _build_toolset(
                 return f"Notification failed: {e}"
         return "No coordinator connected."
 
+    # ------------------------------------------------------------------ #
+    #  Blackboard tools — explicit Fact / Finding / Sub-Goal memory.
+    #  Neutral cognitive structure (what you know / seek / found), NOT
+    #  methodology. Shared across executors on the same mission.
+    # ------------------------------------------------------------------ #
+    @toolset.tool
+    async def add_fact(ctx: RunContext[HeadlessDeps], statement: str, evidence: str = "") -> str:
+        """Record a confirmed fact about the target (world state): a discovered
+        service/version, endpoint, credential, access gained, etc. Shared with
+        sibling executors and remembered across steps."""
+        bb = ctx.deps.blackboard
+        if not bb:
+            return "No blackboard on this run."
+        fid = await bb.add_fact(statement, evidence, found_by=ctx.deps.model_spec)
+        return f"fact {fid} recorded."
+
+    @toolset.tool
+    async def add_finding(
+        ctx: RunContext[HeadlessDeps], title: str, severity: str = "info",
+        target: str = "", category: str = "", evidence: str = "",
+        reproduction: str = "", verified: bool = False,
+    ) -> str:
+        """Record a finding — a product of the search (e.g. a vulnerability).
+        Record candidates too (verified=false); then verify them with further
+        steps and call verify_finding. severity: info|low|medium|high|critical."""
+        bb = ctx.deps.blackboard
+        if not bb:
+            return "No blackboard on this run."
+        from backend.blackboard import CANDIDATE, VERIFIED
+
+        vid = await bb.add_finding(
+            title, severity=severity, target=target or ctx.deps.challenge_name,
+            category=category, status=VERIFIED if verified else CANDIDATE,
+            evidence=evidence, reproduction=reproduction, found_by=ctx.deps.model_spec,
+        )
+        ctx.deps.last_progress_step = step_counter[0] if step_counter else 0
+        return f"finding {vid} recorded ({'verified' if verified else 'candidate — verify it next'})."
+
+    @toolset.tool
+    async def verify_finding(
+        ctx: RunContext[HeadlessDeps], finding_id: str, verified: bool,
+        evidence: str = "",
+    ) -> str:
+        """Promote a candidate finding to verified (verified=true) after you
+        reproduced/confirmed it, or mark it refuted (verified=false) if it did
+        not hold up. Attach the confirming/refuting evidence."""
+        bb = ctx.deps.blackboard
+        if not bb:
+            return "No blackboard on this run."
+        from backend.blackboard import REFUTED, VERIFIED
+
+        ok = await bb.update_finding(
+            finding_id, status=VERIFIED if verified else REFUTED,
+            evidence=evidence or None,
+        )
+        return f"finding {finding_id} -> {'verified' if verified else 'refuted'}." if ok else \
+            f"no finding {finding_id}."
+
+    @toolset.tool
+    async def add_subgoal(ctx: RunContext[HeadlessDeps], description: str) -> str:
+        """Add a sub-goal: something still worth investigating (your own live
+        coverage checklist). Resolve it with resolve_subgoal when done."""
+        bb = ctx.deps.blackboard
+        if not bb:
+            return "No blackboard on this run."
+        gid = await bb.add_subgoal(description, created_by=ctx.deps.model_spec)
+        return f"sub-goal {gid} added."
+
+    @toolset.tool
+    async def resolve_subgoal(ctx: RunContext[HeadlessDeps], subgoal_id: str, outcome: str = "") -> str:
+        """Mark a sub-goal resolved, with a one-line outcome."""
+        bb = ctx.deps.blackboard
+        if not bb:
+            return "No blackboard on this run."
+        ok = await bb.resolve_subgoal(subgoal_id, outcome)
+        return f"sub-goal {subgoal_id} resolved." if ok else f"no sub-goal {subgoal_id}."
+
     return toolset
 
 
@@ -329,6 +424,8 @@ class HeadlessSolver:
         allow_exec: bool = True,
         time_budget_seconds: int = TASK_TIME_BUDGET_SECONDS,
         workdir: str = "",
+        blackboard=None,
+        mission_mode: str = "capture",
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -360,6 +457,8 @@ class HeadlessSolver:
             deadline_monotonic=time.monotonic() + time_budget_seconds,
             allowed_hosts=parsed_hosts,
             scenario=_guess_scenario(meta),
+            blackboard=blackboard,
+            mission_mode=mission_mode,
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(meta.name, self.model_id)
@@ -447,8 +546,17 @@ class HeadlessSolver:
         try:
             from pydantic_ai.usage import UsageLimits
 
+            prompt = "Solve this task." if not self._messages else "Continue solving."
+            # Read the blackboard: inject the shared Fact/Finding/Sub-Goal state
+            # so the model's working memory survives the context window and is
+            # shared across executors on this mission.
+            if self.deps.blackboard:
+                summary = self.deps.blackboard.summary()
+                if summary:
+                    prompt = f"{summary}\n\n{prompt}"
+
             result = await self._agent.run(
-                "Solve this task." if not self._messages else "Continue solving.",
+                prompt,
                 deps=self.deps,
                 message_history=self._messages if self._messages else None,
                 usage_limits=UsageLimits(request_limit=None),
@@ -532,6 +640,21 @@ class HeadlessSolver:
             self.deps.last_progress_step = step
             self._confirmed = True
             self.tracer.event("flag_confirmed", tool="submit_flag", flag=candidate, step=step)
+            if self.deps.blackboard:
+                try:
+                    from backend.blackboard import VERIFIED
+
+                    await self.deps.blackboard.add_finding(
+                        f"flag: {candidate}",
+                        target=self.deps.challenge_name,
+                        category="flag",
+                        severity="info",
+                        status=VERIFIED,
+                        evidence=display,
+                        found_by=self.deps.model_spec,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         else:
             if display.startswith("INCORRECT") and candidate not in self.deps.rejected_flags:
                 self.deps.rejected_flags.append(candidate)
