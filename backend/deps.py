@@ -15,6 +15,7 @@ from backend.prompts import ChallengeMeta
 if TYPE_CHECKING:
     from backend.blackboard import Blackboard
     from backend.message_bus import ChallengeMessageBus
+    from backend.traffic import TrafficLog
 
 # Type for the deduped submit callback: (flag) -> (display, is_confirmed)
 SubmitFn = Callable[[str], Coroutine[Any, Any, tuple[str, bool]]]
@@ -60,6 +61,9 @@ class HeadlessDeps:
     # Mission blackboard (shared across executors on the same mission): the
     # explicit Fact / Finding / Sub-Goal store. None = not wired.
     blackboard: Blackboard | None = None
+    # Per-mission traffic log: every http_request / tcp_send exchange, so
+    # findings can cite real request/response pairs as evidence. None = not wired.
+    traffic: TrafficLog | None = None
 
 
 @dataclass

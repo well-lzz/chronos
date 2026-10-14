@@ -164,9 +164,14 @@ uv run chronos --web --web-port 9000
 | `submit_flag` | 提交 flag（去重 + 错误提交递增冷却 0/30/120/300/600s） |
 | `request_hint` | 平台提示（扣分，由模型自行决定是否使用） |
 | `task_status` | flag 进度 x/y + 剩余时间 |
+| `traffic_search` / `traffic_get` | 检索/读取**已抓取**的流量（找端点、回看响应、定位证据 ID），避免重复 curl 同一 URL |
 | `check_findings` / `notify_coordinator` | 同题兄弟发现共享 / 向调度器汇报 |
 
-solver 始终带一组**黑板工具**（中性，是"认知结构"而非方法论）：`add_fact` / `add_finding`（可记未验证候选）/ `verify_finding`（候选 → 已验证 / 已否决）/ `add_subgoal` / `resolve_subgoal`。
+solver 始终带一组**黑板工具**（中性，是"认知结构"而非方法论）：`add_fact` / `add_finding`（可记未验证候选）/ `verify_finding` / `add_subgoal` / `resolve_subgoal`。
+
+**证据即真实流量（借鉴 ARTEX）**：每次 `http_request`/`tcp_send` 的响应都带一个 `[traffic tN]` ID,全程记进 per-mission 的 traffic log(落盘 JSONL)。`add_finding` / `verify_finding` 用 `evidence_refs=[{ref, role}]` **引用真实的请求/响应对**作为证据(role: `baseline` 正常对照 / `proof` 漏洞证明 / `verification` 复验 / `supporting` 辅助),报告里直接带可复现报文,而非散文。
+
+**验证更诚实**:`verify_finding` 的判决词是 `reproduced`(→已验证)/ `refuted`(否决)/ `inconclusive`(确认不了,保留候选并写明阻塞原因)。验证是**追加**一条记录,Finding 的原始证据不可变。
 
 系统提示是**一份统一的纯契约**：目标（在授权 scope 内搜索、把产物记进黑板）、工具契约、硬约束（范围锁定、不许编造 Finding、本地磁盘不可信）。**不含任何攻击方法论或题型 playbook**。仅当目标带 flag 时，契约才额外出现 `submit_flag` 一行；否则连 flag 都不提。
 
@@ -203,12 +208,13 @@ uv run chronos [OPTIONS]
 - `backend/blackboard.py`：Fact/Finding/Sub-Goal 黑板（落盘持久化）
 - `backend/scope.py`：授权范围匹配（host + CIDR），三处出网工具的唯一判定
 - `backend/engagement.py`：engagement 配置加载 + 空 scope 拒绝 + 本地无 oracle 平台
-- `backend/report.py`：mission 报告渲染（JSON + Markdown + HTML）
+- `backend/traffic.py`：per-mission 流量日志（真实请求/响应对作 Finding 证据）
+- `backend/report.py`：mission 报告渲染（JSON + Markdown + HTML，含证据流量与验证历史）
 - `backend/web.py` + `backend/webui/`：Web 控制台（FastAPI 服务 + 单页前端）
 - `examples/engagement.example.yaml`：engagement 配置模板
 - `challenges/`：拉取后的题目元数据
 - `logs/`：trace 日志与运行记录
-- `.chronos-state/`：run_python 工作区、黑板（`blackboards/`）、报告（`reports/`）
+- `.chronos-state/`：run_python 工作区、黑板（`blackboards/`）、流量（`traffic/`）、报告（`reports/`）
 - `docs/rewrite-plan.md`：极简重构基线；`docs/mission-modes.md`：Fact/Goal/Step/Finding 设计
 
 ## 运行环境要求

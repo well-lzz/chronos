@@ -27,6 +27,7 @@ from backend.solver_base import (
 if TYPE_CHECKING:
     from backend.blackboard import Blackboard
     from backend.config import Settings
+    from backend.traffic import TrafficLog
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,7 @@ class ChallengeSwarm:
     # Every executor on this challenge reads/writes the same board; persisted so a
     # long run survives restart. Created lazily (see _get_blackboard).
     _blackboard: Blackboard | None = None  # lazily created; see _get_blackboard
+    _traffic: TrafficLog | None = None  # lazily created; see _get_traffic
 
     def _workdir_for(self, model_spec: str) -> str:
         """Per solver-run scratch dir for run_python isolation.
@@ -142,6 +144,17 @@ class ChallengeSwarm:
             self._blackboard = Blackboard.load_or_new(self.meta.name, state_dir)
         return self._blackboard
 
+    def _get_traffic(self):
+        """The one shared mission traffic log (lazy, persisted JSONL). Every
+        executor records its http/tcp exchanges here so findings can cite real
+        request/response pairs as evidence."""
+        if self._traffic is None:
+            from backend.traffic import TrafficLog
+
+            state_dir = getattr(self.settings, "state_dir", ".chronos-state")
+            self._traffic = TrafficLog.load_or_new(self.meta.name, state_dir)
+        return self._traffic
+
     def _create_solver(self, model_spec: str):
         """Create a HeadlessSolver (the only solver type): one model, one live
         target, no container — model reasoning plus the neutral http/tcp/python
@@ -169,6 +182,7 @@ class ChallengeSwarm:
             time_budget_seconds=time_budget,
             workdir=self._workdir_for(model_spec),
             blackboard=self._get_blackboard(),
+            traffic=self._get_traffic(),
         )
 
     def _make_notify_fn(self, model_spec: str):

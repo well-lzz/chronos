@@ -162,7 +162,16 @@ def _build_toolset(
                 degraded=_deps_scope(ctx.deps).is_empty,
             )
             return block
-        return await do_raw_http(url, method=method, headers=headers, body=body, timeout=timeout)
+        display = await do_raw_http(url, method=method, headers=headers, body=body, timeout=timeout)
+        if ctx.deps.traffic:
+            try:
+                tid = await ctx.deps.traffic.record_http(
+                    method, url, headers, body, display, found_by=ctx.deps.model_spec
+                )
+                display += f"\n[traffic {tid} — cite as evidence with add_finding/verify_finding]"
+            except Exception:  # noqa: BLE001 — recording is best-effort
+                pass
+        return display
 
     @toolset.tool
     async def tcp_send(
@@ -185,7 +194,16 @@ def _build_toolset(
                 degraded=_deps_scope(ctx.deps).is_empty,
             )
             return block
-        return await do_tcp_send(host, port, payload=payload, payload_hex=payload_hex, read_timeout=read_timeout)
+        display = await do_tcp_send(host, port, payload=payload, payload_hex=payload_hex, read_timeout=read_timeout)
+        if ctx.deps.traffic:
+            try:
+                tid = await ctx.deps.traffic.record_tcp(
+                    host, port, payload, payload_hex, display, found_by=ctx.deps.model_spec
+                )
+                display += f"\n[traffic {tid} — cite as evidence with add_finding/verify_finding]"
+            except Exception:  # noqa: BLE001 — recording is best-effort
+                pass
+        return display
 
     @toolset.tool
     async def run_python(
@@ -331,6 +349,29 @@ def _build_toolset(
     #  Neutral cognitive structure (what you know / seek / found), NOT
     #  methodology. Shared across executors on the same mission.
     # ------------------------------------------------------------------ #
+    def _normalize_refs(refs: list[dict] | None) -> tuple[list[dict], list[str]]:
+        """Validate evidence refs against the mission traffic log. Returns
+        (valid_refs, warnings). Each ref -> {ref, role, note}; role in ROLES."""
+        from backend.traffic import DEFAULT_ROLE, ROLES
+
+        valid: list[dict] = []
+        warns: list[str] = []
+        tlog = deps.traffic
+        for r in refs or []:
+            if not isinstance(r, dict):
+                continue
+            tid = str(r.get("ref") or r.get("id") or r.get("traffic_id") or "").strip()
+            if not tid:
+                continue
+            if tlog is not None and not tlog.exists(tid):
+                warns.append(f"{tid} (no such traffic — dropped)")
+                continue
+            role = str(r.get("role") or DEFAULT_ROLE).strip().lower()
+            if role not in ROLES:
+                role = DEFAULT_ROLE
+            valid.append({"ref": tid, "role": role, "note": str(r.get("note") or "")[:300]})
+        return valid, warns
+
     @toolset.tool
     async def add_fact(ctx: RunContext[HeadlessDeps], statement: str, evidence: str = "") -> str:
         """Record a confirmed fact about the target (world state): a discovered
@@ -347,42 +388,105 @@ def _build_toolset(
         ctx: RunContext[HeadlessDeps], title: str, severity: str = "info",
         target: str = "", category: str = "", evidence: str = "",
         reproduction: str = "", verified: bool = False,
+        evidence_refs: list[dict] | None = None,
     ) -> str:
         """Record a finding — a product of the search (e.g. a vulnerability).
         Record candidates too (verified=false); then verify them with further
-        steps and call verify_finding. severity: info|low|medium|high|critical."""
+        steps and call verify_finding. severity: info|low|medium|high|critical.
+
+        evidence_refs cites REAL captured traffic as proof, e.g.
+        [{"ref":"t5","role":"proof","note":"payload fired"}]. role is one of
+        baseline|proof|verification|supporting. Use traffic_search/traffic_get to
+        find the ids. Prefer a real traffic ref over prose where you have one."""
         bb = ctx.deps.blackboard
         if not bb:
             return "No blackboard on this run."
         from backend.blackboard import CANDIDATE, VERIFIED
 
+        refs, warns = _normalize_refs(evidence_refs)
         vid = await bb.add_finding(
             title, severity=severity, target=target or ctx.deps.challenge_name,
             category=category, status=VERIFIED if verified else CANDIDATE,
             evidence=evidence, reproduction=reproduction, found_by=ctx.deps.model_spec,
+            evidence_refs=refs,
         )
         ctx.deps.last_progress_step = step_counter[0] if step_counter else 0
-        return f"finding {vid} recorded ({'verified' if verified else 'candidate — verify it next'})."
+        msg = f"finding {vid} recorded ({'verified' if verified else 'candidate — verify it next'})."
+        if refs:
+            msg += f" evidence: {', '.join(r['ref'] for r in refs)}."
+        if warns:
+            msg += " dropped refs: " + "; ".join(warns)
+        return msg
 
     @toolset.tool
     async def verify_finding(
-        ctx: RunContext[HeadlessDeps], finding_id: str, verified: bool,
-        evidence: str = "",
+        ctx: RunContext[HeadlessDeps], finding_id: str, verdict: str,
+        summary: str = "", evidence: str = "", evidence_refs: list[dict] | None = None,
     ) -> str:
-        """Promote a candidate finding to verified (verified=true) after you
-        reproduced/confirmed it, or mark it refuted (verified=false) if it did
-        not hold up. Attach the confirming/refuting evidence."""
+        """Record a verification attempt for a candidate finding. verdict is one of:
+        reproduced (confirmed — becomes verified), refuted (did not hold up), or
+        inconclusive (could not confirm — stays open, say why in evidence).
+
+        This APPENDS a verification record; the finding's original evidence is not
+        overwritten. Put your actual steps/observations (or the blocker reason) in
+        `evidence`, and cite the proof exchange in evidence_refs with role
+        "verification" or "proof" (use traffic_search/traffic_get for ids)."""
         bb = ctx.deps.blackboard
         if not bb:
             return "No blackboard on this run."
-        from backend.blackboard import REFUTED, VERIFIED
+        from backend.blackboard import INCONCLUSIVE, REFUTED, VERIFIED
 
-        ok = await bb.update_finding(
-            finding_id, status=VERIFIED if verified else REFUTED,
-            evidence=evidence or None,
+        verdict_map = {"reproduced": VERIFIED, "verified": VERIFIED,
+                       "refuted": REFUTED, "inconclusive": INCONCLUSIVE}
+        status = verdict_map.get(verdict.strip().lower())
+        if status is None:
+            return "verdict must be one of: reproduced, refuted, inconclusive."
+        refs, warns = _normalize_refs(evidence_refs)
+        ok = await bb.verify_finding(
+            finding_id, status, summary=summary, evidence=evidence,
+            evidence_refs=refs, by=ctx.deps.model_spec,
         )
-        return f"finding {finding_id} -> {'verified' if verified else 'refuted'}." if ok else \
-            f"no finding {finding_id}."
+        if not ok:
+            return f"no finding {finding_id}."
+        if status == VERIFIED:
+            ctx.deps.last_progress_step = step_counter[0] if step_counter else 0
+        msg = f"finding {finding_id} -> {status}."
+        if warns:
+            msg += " dropped refs: " + "; ".join(warns)
+        return msg
+
+    @toolset.tool
+    async def traffic_search(
+        ctx: RunContext[HeadlessDeps], host: str = "", url_contains: str = "",
+        body_contains: str = "", page: int = 0,
+    ) -> str:
+        """Search traffic you ALREADY captured (http_request/tcp_send) instead of
+        re-fetching. body_contains does a full-text search over captured request
+        and response text (>=3 chars). Returns a light index (id/method/target/
+        status/resp_len), newest-agnostic; read a full exchange with traffic_get."""
+        tlog = ctx.deps.traffic
+        if not tlog:
+            return "No traffic log on this run."
+        import json as _json
+
+        return _json.dumps(tlog.search(host=host, url_contains=url_contains,
+                                       body_contains=body_contains, page=page),
+                           ensure_ascii=False)
+
+    @toolset.tool
+    async def traffic_get(
+        ctx: RunContext[HeadlessDeps], traffic_id: str, side: str = "both",
+        offset: int = 0, length: int = 8192,
+    ) -> str:
+        """Read one captured exchange's request/response text by id (e.g. "t5").
+        side: request|response|both. Read in <=8192-byte slices with offset/length."""
+        tlog = ctx.deps.traffic
+        if not tlog:
+            return "No traffic log on this run."
+        import json as _json
+
+        return _json.dumps(tlog.get(traffic_id, side=side, offset=offset, length=length),
+                           ensure_ascii=False)
 
     @toolset.tool
     async def add_subgoal(ctx: RunContext[HeadlessDeps], description: str) -> str:
@@ -425,6 +529,7 @@ class HeadlessSolver:
         time_budget_seconds: int = TASK_TIME_BUDGET_SECONDS,
         workdir: str = "",
         blackboard=None,
+        traffic=None,
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -461,6 +566,7 @@ class HeadlessSolver:
             allowed_cidrs=tuple(scope.cidr_strings()),
             scenario=_guess_scenario(meta),
             blackboard=blackboard,
+            traffic=traffic,
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(meta.name, self.model_id)

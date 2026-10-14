@@ -19,10 +19,13 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-# Finding lifecycle
+# Finding lifecycle: candidate (recorded, not yet confirmed) → verified |
+# refuted | inconclusive (tried to verify, could not confirm — keep investigating).
 CANDIDATE = "candidate"
 VERIFIED = "verified"
 REFUTED = "refuted"
+INCONCLUSIVE = "inconclusive"
+STATUSES = (CANDIDATE, VERIFIED, REFUTED, INCONCLUSIVE)
 
 SEVERITIES = ("info", "low", "medium", "high", "critical")
 
@@ -52,13 +55,20 @@ class Finding:
     target: str = ""
     category: str = ""
     severity: str = "info"
-    status: str = CANDIDATE  # candidate | verified | refuted
-    evidence: str = ""
+    status: str = CANDIDATE  # candidate | verified | refuted | inconclusive
+    evidence: str = ""        # the original report evidence — IMMUTABLE after add
     reproduction: str = ""
     remediation: str = ""
     found_by: str = ""
     ts: float = field(default_factory=_now)
     verified_ts: float | None = None
+    # Real traffic cited as evidence: [{ref, role, note}] — role in
+    # backend.traffic.ROLES (baseline/proof/verification/supporting).
+    evidence_refs: list[dict] = field(default_factory=list)
+    # Append-only verification history; each: {verdict, summary, evidence,
+    # evidence_refs, by, ts}. The top-level status reflects the latest verdict,
+    # but the original `evidence` is never overwritten.
+    verifications: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -101,35 +111,73 @@ class Blackboard:
 
     async def add_finding(self, title: str, *, target: str = "", category: str = "",
                           severity: str = "info", status: str = CANDIDATE, evidence: str = "",
-                          reproduction: str = "", remediation: str = "", found_by: str = "") -> str:
+                          reproduction: str = "", remediation: str = "", found_by: str = "",
+                          evidence_refs: list[dict] | None = None) -> str:
         async with self._lock:
             sev = severity if severity in SEVERITIES else "info"
-            st = status if status in (CANDIDATE, VERIFIED, REFUTED) else CANDIDATE
+            st = status if status in STATUSES else CANDIDATE
             vid = self._next_id("v")
             self.findings[vid] = Finding(
                 id=vid, title=title[:300], target=target[:300], category=category[:80],
                 severity=sev, status=st, evidence=evidence[:4000],
                 reproduction=reproduction[:4000], remediation=remediation[:2000],
                 found_by=found_by, verified_ts=_now() if st == VERIFIED else None,
+                evidence_refs=list(evidence_refs or []),
             )
             self._persist()
             return vid
 
-    async def update_finding(self, finding_id: str, *, status: str | None = None,
-                             evidence: str | None = None, severity: str | None = None,
+    async def add_evidence_refs(self, finding_id: str, refs: list[dict]) -> bool:
+        """Attach real-traffic evidence refs to a finding (dedup by (ref, role))."""
+        async with self._lock:
+            f = self.findings.get(finding_id)
+            if not f or not refs:
+                return False
+            seen = {(r.get("ref"), r.get("role")) for r in f.evidence_refs}
+            for r in refs:
+                key = (r.get("ref"), r.get("role"))
+                if r.get("ref") and key not in seen:
+                    f.evidence_refs.append(r)
+                    seen.add(key)
+            self._persist()
+            return True
+
+    async def verify_finding(self, finding_id: str, verdict: str, *, summary: str = "",
+                             evidence: str = "", evidence_refs: list[dict] | None = None,
+                             by: str = "") -> bool:
+        """Append an immutable verification record and update status to the latest
+        verdict. The finding's ORIGINAL evidence is never overwritten — the attempt
+        (steps, observations, or blocker reason) lives in the appended record."""
+        async with self._lock:
+            f = self.findings.get(finding_id)
+            if not f or verdict not in STATUSES:
+                return False
+            refs = list(evidence_refs or [])
+            f.verifications.append({
+                "verdict": verdict, "summary": summary[:1000], "evidence": evidence[:4000],
+                "evidence_refs": refs, "by": by, "ts": _now(),
+            })
+            f.status = verdict
+            if verdict == VERIFIED:
+                f.verified_ts = _now()
+            # Verification-produced proof traffic is promoted onto the finding too.
+            seen = {(r.get("ref"), r.get("role")) for r in f.evidence_refs}
+            for r in refs:
+                if r.get("ref") and (r.get("ref"), r.get("role")) not in seen:
+                    f.evidence_refs.append(r)
+            self._persist()
+            return True
+
+    async def update_finding(self, finding_id: str, *, severity: str | None = None,
                              reproduction: str | None = None, remediation: str | None = None) -> bool:
+        """Non-verification edits (severity / reproduction / remediation). Status
+        changes go through verify_finding; original evidence stays immutable."""
         async with self._lock:
             f = self.findings.get(finding_id)
             if not f:
                 return False
-            if status in (CANDIDATE, VERIFIED, REFUTED):
-                f.status = status
-                if status == VERIFIED:
-                    f.verified_ts = _now()
             if severity in SEVERITIES:
                 f.severity = severity
-            if evidence is not None:
-                f.evidence = evidence[:4000]
             if reproduction is not None:
                 f.reproduction = reproduction[:4000]
             if remediation is not None:
@@ -183,6 +231,8 @@ class Blackboard:
             "findings": len(self.findings),
             "findings_verified": sum(1 for f in self.findings.values() if f.status == VERIFIED),
             "findings_candidate": sum(1 for f in self.findings.values() if f.status == CANDIDATE),
+            "findings_inconclusive": sum(1 for f in self.findings.values() if f.status == INCONCLUSIVE),
+            "findings_refuted": sum(1 for f in self.findings.values() if f.status == REFUTED),
             "subgoals_open": len(self.open_subgoals()),
             "subgoals_total": len(self.subgoals),
         }
@@ -199,8 +249,9 @@ class Blackboard:
         if self.findings:
             lines.append("Findings:")
             for f in list(self.findings.values())[-max_findings:]:
+                refs = f" evidence:{len(f.evidence_refs)}" if f.evidence_refs else ""
                 lines.append(f"- [{f.id}] ({f.status}/{f.severity}) {f.title}"
-                             + (f" @ {f.target}" if f.target else ""))
+                             + (f" @ {f.target}" if f.target else "") + refs)
         if self.facts:
             recent = list(self.facts.values())[-max_facts:]
             lines.append("已确认 Facts:")

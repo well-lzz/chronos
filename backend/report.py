@@ -82,8 +82,9 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines = _md_meta(m)
     lines += [
         "## Summary",
-        f"- Findings: **{s['findings']}** "
-        f"(verified {s['findings_verified']}, candidate {s['findings_candidate']})",
+        f"- Findings: **{s['findings']}** (verified {s['findings_verified']}, "
+        f"candidate {s['findings_candidate']}, inconclusive {s.get('findings_inconclusive', 0)}, "
+        f"refuted {s.get('findings_refuted', 0)})",
         f"- Facts established: {s['facts']}",
         f"- Sub-goals: {s['subgoals_total']} ({s['subgoals_open']} open)",
         "",
@@ -106,6 +107,22 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines += ["- **Reproduction**:", "", *[f"  {ln}" for ln in str(f['reproduction']).splitlines()]]
         if f.get("remediation"):
             lines.append(f"- **Remediation**: {f['remediation']}")
+        refs = f.get("evidence_refs") or []
+        if refs:
+            lines.append("- **Evidence traffic**: "
+                         + ", ".join(f"`{r.get('ref')}` ({r.get('role','supporting')}"
+                                     + (f": {r['note']}" if r.get('note') else "") + ")"
+                                     for r in refs))
+        vers = f.get("verifications") or []
+        if vers:
+            lines.append("- **Verification history**:")
+            for v in vers:
+                vr = ", ".join(r.get("ref", "") for r in (v.get("evidence_refs") or []))
+                lines.append(f"  - _{v.get('verdict','')}_"
+                             + (f" — {v['summary']}" if v.get("summary") else "")
+                             + (f" (traffic: {vr})" if vr else ""))
+                if v.get("evidence"):
+                    lines += ["", *[f"    {ln}" for ln in str(v['evidence']).splitlines()]]
         lines.append("")
     # Facts and sub-goals as context appendices.
     if report["facts"]:
@@ -167,7 +184,8 @@ def render_html(report: dict[str, Any]) -> str:
         "</ul>",
         "<h2>Summary</h2><ul>",
         f"<li>Findings: <b>{s['findings']}</b> (verified {s['findings_verified']}, "
-        f"candidate {s['findings_candidate']})</li>",
+        f"candidate {s['findings_candidate']}, inconclusive {s.get('findings_inconclusive', 0)}, "
+        f"refuted {s.get('findings_refuted', 0)})</li>",
         f"<li>Facts: {s['facts']}</li>",
         f"<li>Sub-goals: {s['subgoals_total']} ({s['subgoals_open']} open)</li>",
         "</ul>",
@@ -194,6 +212,27 @@ def render_html(report: dict[str, Any]) -> str:
             parts.append(f"<p><b>Reproduction:</b></p><pre>{_h(f['reproduction'])}</pre>")
         if f.get("remediation"):
             parts.append(f"<p><b>Remediation:</b> {_h(f['remediation'])}</p>")
+        refs = f.get("evidence_refs") or []
+        if refs:
+            items = ", ".join(
+                f"<code>{_h(r.get('ref'))}</code> ({_h(r.get('role', 'supporting'))}"
+                + (f": {_h(r['note'])}" if r.get('note') else "") + ")"
+                for r in refs
+            )
+            parts.append(f"<p><b>Evidence traffic:</b> {items}</p>")
+        vers = f.get("verifications") or []
+        if vers:
+            parts.append("<p><b>Verification history:</b></p><ul>")
+            for v in vers:
+                vr = ", ".join(r.get("ref", "") for r in (v.get("evidence_refs") or []))
+                head = f"<em>{_h(v.get('verdict',''))}</em>"
+                if v.get("summary"):
+                    head += f" — {_h(v['summary'])}"
+                if vr:
+                    head += f" (traffic: {_h(vr)})"
+                body = f"<pre>{_h(v['evidence'])}</pre>" if v.get("evidence") else ""
+                parts.append(f"<li>{head}{body}</li>")
+            parts.append("</ul>")
         parts.append("</div>")
     if report["facts"]:
         parts.append("<h2>Established facts</h2><ul>")
