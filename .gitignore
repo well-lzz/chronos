@@ -56,3 +56,12 @@ codex-schema-*/
 /HSM.class
 /f2*_validator
 /f207.py
+
+# Go
+/chronos
+*.test
+/vendor/
+
+# Runtime state (blackboards, traffic, reports, workspaces)
+.chronos-state/
+.ctf-state/

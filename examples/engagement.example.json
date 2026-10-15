@@ -1,0 +1,13 @@
+{
+  "name": "acme-staging-external",
+  "mode": "assessment",
+  "goal": "Authorized security assessment of ACME's staging web perimeter. Identify and verify vulnerabilities reachable from the listed hosts: authentication flaws, injection, access-control gaps, and exposed sensitive functionality. Record each issue as a finding with evidence and reproduction steps.",
+  "scope": {
+    "targets": [
+      "staging.acme.test",
+      "10.10.5.0/24",
+      "198.51.100.7"
+    ],
+    "rules_of_engagement": "Testing window: business hours only. No denial-of-service or load testing. No social engineering. No changes to production data. Stop and report if you reach anything that looks like real customer PII."
+  }
+}
