@@ -60,6 +60,7 @@ type Swarm struct {
 	solvers  map[string]*solver.Solver
 	activity map[string][]ActEvent
 	status   map[string]string
+	lastErr  map[string]string // last surfaced error per spec (dedup consecutive)
 	paused   atomic.Bool
 	evSeq    int64 // monotonic activity cursor (atomic)
 
@@ -77,6 +78,7 @@ func (s *Swarm) init() {
 	s.solvers = map[string]*solver.Solver{}
 	s.activity = map[string][]ActEvent{}
 	s.status = map[string]string{}
+	s.lastErr = map[string]string{}
 	s.submitted = map[string]bool{}
 	s.submitCount = map[string]int{}
 	s.lastSubmit = map[string]time.Time{}
@@ -100,6 +102,7 @@ func (s *Swarm) Run(ctx context.Context) string {
 		if err != nil {
 			log.Printf("[%s/%s] cannot start: %v", s.Meta.Name, spec, err)
 			s.setStatus(spec, "error")
+			s.emit(spec, 0, "error", "", "cannot start executor: "+err.Error())
 			continue
 		}
 		var submitFn solver.SubmitFn
@@ -173,10 +176,21 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 			return ""
 		}
 
+		if res.Status == solver.StatusError && res.Findings != "" {
+			// Surface the failure so the console shows WHY nothing is coming back
+			// (bad key, unreachable endpoint, …) instead of "waiting for activity".
+			s.emitErrorOnce(spec, res.StepCount, res.Findings)
+		} else {
+			s.mu.Lock()
+			delete(s.lastErr, spec)
+			s.mu.Unlock()
+		}
+
 		if res.Status == solver.StatusGaveUp || res.Status == solver.StatusError {
 			bumps++
 			if bumps > maxBumps {
 				log.Printf("[%s/%s] max bumps (%d) reached", s.Meta.Name, spec, maxBumps)
+				s.emit(spec, res.StepCount, "text", "", "Executor stopped: retry ceiling reached after repeated failures.")
 				s.setStatus(spec, "finished")
 				return ""
 			}
@@ -269,6 +283,19 @@ func (s *Swarm) emit(spec string, step int, kind, tool, text string) {
 	}
 	s.activity[spec] = buf
 	s.mu.Unlock()
+}
+
+// emitErrorOnce surfaces an executor error to the console, collapsing a run of
+// identical errors (e.g. a repeating 401) into a single visible line.
+func (s *Swarm) emitErrorOnce(spec string, step int, text string) {
+	s.mu.Lock()
+	same := s.lastErr[spec] == text
+	s.lastErr[spec] = text
+	s.mu.Unlock()
+	if same {
+		return
+	}
+	s.emit(spec, step, "error", "", text)
 }
 
 func (s *Swarm) setStatus(spec, st string) {

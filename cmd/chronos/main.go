@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -57,6 +58,14 @@ func main() {
 	flag.IntVar(&maxCh, "max-challenges", 0, "concurrent challenge window (default from config, hard cap 3)")
 	flag.Parse()
 
+	// Convenience: load KEY=VALUE pairs from a .env in the working directory (and
+	// next to the binary) before reading config, so the operator doesn't have to
+	// export the API key by hand. Real environment variables always win.
+	loadDotEnv(".env")
+	if exe, err := os.Executable(); err == nil {
+		loadDotEnv(filepath.Join(filepath.Dir(exe), ".env"))
+	}
+
 	cfg := config.Load()
 	if noExec {
 		cfg.AllowLocalExec = false
@@ -87,6 +96,39 @@ func main() {
 
 	// Otherwise run the mechanical scheduler against the TSec platform.
 	runScheduler(cfg, specs, webUI, webHost, webPort)
+}
+
+// loadDotEnv reads simple KEY=VALUE lines from path and sets any that are not
+// already present in the environment. Missing file is fine. Supports # comments,
+// optional "export " prefixes, and single/double-quoted values.
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		if len(val) >= 2 && (val[0] == '"' && val[len(val)-1] == '"' || val[0] == '\'' && val[len(val)-1] == '\'') {
+			val = val[1 : len(val)-1]
+		}
+		if key != "" {
+			if _, ok := os.LookupEnv(key); !ok {
+				_ = os.Setenv(key, val)
+			}
+		}
+	}
 }
 
 func runScheduler(cfg config.Settings, specs []string, webUI bool, webHost string, webPort int) {

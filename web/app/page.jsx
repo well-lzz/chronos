@@ -9,7 +9,7 @@ const EMPTY = {
 
 const VERDICT_LABEL = { confirmed: "确认", suspected: "疑似", failed: "失败" };
 const KIND_LABEL = {
-  operator: "操作员", text: "推理", tool_call: "调用", tool_result: "结果",
+  operator: "操作员", text: "推理", tool_call: "调用", tool_result: "结果", error: "错误",
 };
 
 // flatten swarms{name:{agents:{spec:{...}}}} → [{challenge,model,status,steps,paused}]
@@ -244,7 +244,7 @@ export default function Console() {
                     {e.tool && <span className={s.toolTag}>{e.tool}</span>}
                     {op ? <span className={s.who}>你</span> : <span className={s.who}>{watch.m}</span>}
                   </div>
-                  <div className={s.bubble}>{e.text}</div>
+                  <div className={`${s.bubble} ${e.kind === "error" ? s.errBubble : ""}`}>{e.text}</div>
                 </div>
               );
             })}
