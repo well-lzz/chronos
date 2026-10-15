@@ -109,7 +109,7 @@ chronos [flags]
 | `platform` | 竞赛平台接口 + TSecBench REST 适配器 |
 | `poller` | 后台轮询，发 new/solved 事件 |
 | `scheduler` | 机械调度器（无 LLM）：填窗口 / reap / 滚动重试 / 预算 / 死锁自愈 / 算子命令 |
-| `web` | 内嵌控制台（net/http + SSE，无 websocket 依赖） |
+| `web` | 内嵌控制台后端（net/http + SSE，无 websocket 依赖）；前端是 `web/` 的 Next.js 应用，静态导出后嵌入二进制 |
 
 运行态目录（默认 `.chronos-state/`）：`blackboards/`、`traffic/`、`reports/`。
 

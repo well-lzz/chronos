@@ -6,9 +6,10 @@
 package web
 
 import (
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"strconv"
@@ -17,22 +18,23 @@ import (
 	"github.com/well-lzz/chronos/internal/scheduler"
 )
 
-//go:embed index.html
-var indexHTML []byte
+// The console front-end is a Next.js app, statically exported to dist/ (built
+// with `npm run build` under web/, then copied here) and embedded so the single
+// binary still serves the whole UI. `all:` is required to include _next/.
+//
+//go:embed all:dist
+var distFS embed.FS
 
 // Serve starts the console HTTP server. It returns when ctx-independent: the
 // caller runs it in a goroutine and cancels the scheduler to stop the process.
 func Serve(sch *scheduler.Scheduler, host string, port int) error {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(indexHTML)
-	})
+	sub, err := fs.Sub(distFS, "dist")
+	if err != nil {
+		return err
+	}
+	mux.Handle("/", http.FileServerFS(sub))
 
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, sch.Snapshot())

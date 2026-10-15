@@ -70,7 +70,21 @@ chronos --engagement <config.json>    # 一次真实授权评估（无平台/调
 - `platform` — 竞赛平台接口 + TSecBench REST 适配器（challenges/start/submit/hint/close，pull→meta）。直连、不走代理。
 - `poller` — 后台轮询，发 new/solved 事件。
 - `scheduler` — 机械调度器（无 LLM）：填窗口/reap/滚动重试/预算/死锁自愈/算子命令；平台判真即 kill。
-- `web` — 内嵌控制台（net/http + **SSE**，无 websocket 依赖）：`/`、`/api/state`、`/api/stream`、`/api/activity`、`POST /api/command`。前端用 EventSource。
+- `web` — 内嵌控制台后端（net/http + **SSE**，无 websocket 依赖）：`/api/state`、`/api/stream`、`/api/activity`、`POST /api/command`；`/` 及静态资源由 `go:embed all:dist` 提供（见下）。
+
+## 前端（Next.js 静态导出）
+
+控制台前端是 `web/` 下的 **Next.js（App Router，React 19）** 应用，`output: 'export'` 静态导出后**嵌进 Go 二进制**，单二进制部署不变。
+
+```bash
+cd web && npm ci && npm run build        # 产出 web/out/
+rm -rf ../internal/web/dist && cp -r out ../internal/web/dist
+cd .. && go build -o chronos ./cmd/chronos
+```
+
+- `internal/web/dist`（构建产物）已随仓库提交，所以**无需 Node 也能 `go build` 跑起来**；改前端后按上面重建并替换 `dist`。
+- 开发：`cd web && npm run dev`（:3000），`next.config.mjs` 的 rewrites 把 `/api/*` 代理到 `chronos --web`（:8000）；静态导出时同源,无需代理。
+- UI 同 SSE 实时快照 + `/api/activity` 轮询活动流 + `POST /api/command` 下发算子操作（pause/resume/kill/bump），暗色/亮色自适应。
 
 ## 与 Python 版的等价性
 

@@ -17,3 +17,9 @@ logs/
 # Python bytecode (defensive)
 __pycache__/
 *.pyc
+
+# Next.js front-end build artifacts (web/). The built static export is committed
+# at internal/web/dist (embedded into the binary); the raw build dirs are not.
+web/node_modules/
+web/.next/
+web/out/
