@@ -13,3 +13,7 @@ logs/
 
 # Runtime state (blackboards, traffic, reports, workspaces)
 .chronos-state/
+
+# Python bytecode (defensive)
+__pycache__/
+*.pyc
