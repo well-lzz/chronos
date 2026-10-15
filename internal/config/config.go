@@ -14,7 +14,9 @@ type Settings struct {
 	SolverRetryDelayS   float64
 	AllowLocalExec      bool
 
-	// Platform + scheduler (mechanical shell).
+	// Platform + scheduler (mechanical shell). The platform is a pluggable work
+	// source; TSecBench is one adapter (PlatformMode="tsec"), not a hard binding.
+	PlatformMode         string
 	PlatformURL          string
 	BenchmarkURL         string
 	BenchmarkToken       string
@@ -90,6 +92,7 @@ func Load() Settings {
 		GLMBaseURL:      getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
 		GLMModelID:      getenv("GLM_MODEL_ID", "glm-4-plus"),
 
+		PlatformMode:         getenv("PLATFORM_MODE", "tsec"),
 		PlatformURL:          getenv("PLATFORM_URL", ""),
 		BenchmarkURL:         getenv("BENCHMARK_BASE_URL", "https://tsecbench.zc.tencent.com"),
 		BenchmarkToken:       os.Getenv("BENCHMARK_TOKEN"),

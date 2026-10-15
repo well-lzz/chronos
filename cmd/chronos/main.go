@@ -90,14 +90,18 @@ func main() {
 }
 
 func runScheduler(cfg config.Settings, specs []string, webUI bool, webHost string, webPort int) {
-	pf := platform.NewTSec(cfg.PlatformBase(), cfg.BenchmarkToken)
+	pf, err := platform.New(cfg.PlatformMode, cfg.PlatformBase(), cfg.BenchmarkToken)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 	sch := scheduler.New(pf, cfg, specs)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Printf("chronos scheduler — platform %s, models %s, window %d\n",
-		cfg.PlatformBase(), strings.Join(specs, ", "), cfg.MaxConcurrent)
+	fmt.Printf("chronos scheduler — platform adapter %q (%s), models %s, window %d\n",
+		cfg.PlatformMode, cfg.PlatformBase(), strings.Join(specs, ", "), cfg.MaxConcurrent)
 	if webUI {
 		fmt.Printf("Web console → http://%s:%d (Ctrl+C to stop)\n", webHost, webPort)
 		go func() {

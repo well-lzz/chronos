@@ -5,7 +5,25 @@
 // finding, not a separate mode.
 package platform
 
-import "github.com/well-lzz/chronos/internal/mission"
+import (
+	"fmt"
+
+	"github.com/well-lzz/chronos/internal/mission"
+)
+
+// New selects a platform adapter by mode. TSecBench is just ONE adapter — the
+// agent is not bound to it. To support another evaluation platform or work
+// source, implement the Platform interface and register it here; the scheduler,
+// swarm and console are platform-agnostic. (Real engagements use no platform at
+// all — see the engagement path.)
+func New(mode, baseURL, token string) (Platform, error) {
+	switch mode {
+	case "", "tsec", "tsecbench", "benchmark":
+		return NewTSec(baseURL, token), nil
+	default:
+		return nil, fmt.Errorf("unknown platform mode %q — register an adapter in platform.New", mode)
+	}
+}
 
 // Challenge is the normalized view of one platform challenge.
 type Challenge struct {

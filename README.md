@@ -43,7 +43,7 @@ go build -o chronos ./cmd/chronos
 ## 运行
 
 ```bash
-# 1) 对 TSecBench 平台跑机械调度器（默认）
+# 1) 对一个平台工作源跑机械调度器（默认；内置 TSecBench 适配器，可换）
 chronos
 
 # 2) 机械调度器 + Web 控制台（默认 http://127.0.0.1:8000）
@@ -59,8 +59,10 @@ chronos --engagement examples/engagement.example.json --web
 
 两条运行主链路共用同一内核（scope / 黑板 / traffic / solver / swarm）：
 
-- **调度器模式（默认）**：`platform`(TSec) → `poller`(轮询 new/solved 事件) → `scheduler`(按分值→难度→题名填满并发窗口、deferred 滚动重试、全局预算、死锁自愈、**平台判真即 kill 该 swarm**) → 每题一个协作 `swarm`。`submit_flag` 经 swarm 去重 + 递增冷却 + 猜测熔断打到平台。
-- **engagement 模式**：`--engagement` 跑单个多目标 mission，无 oracle，产物累积进黑板 + 本地报告（`<state_dir>/reports/<name>/report.{json,md,html}`）。scope 为空的 engagement **开跑前直接拒绝**。
+- **调度器模式（默认）**：`platform`(**可插拔工作源**，内置 TSecBench 适配器) → `poller`(轮询事件) → `scheduler`(按分值→难度填满并发窗口、滚动重试、全局预算、死锁自愈、**平台判真即 kill 该 swarm**) → 每个目标一个协作 `swarm`。`submit_flag` 经 swarm 去重 + 递增冷却 + 猜测熔断打到平台。
+- **engagement 模式**：`--engagement` 跑单个多目标 mission，**不依赖任何平台**，无 oracle，产物累积进黑板 + 本地报告（`<state_dir>/reports/<name>/report.{json,md,html}`）。scope 为空的 engagement **开跑前直接拒绝**。
+
+> **Agent 不绑定 TSecBench**：TSecBench 只是 `internal/platform` 里**内置的一个评测平台适配器**（`PLATFORM_MODE=tsec`）。调度器 / swarm / 控制台都与平台无关——换平台只需实现 `platform.Platform` 接口并在 `platform.New` 注册;真实业务(engagement)根本不需要平台。
 
 ### CLI
 
@@ -83,7 +85,8 @@ chronos [flags]
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | |
 | `QWEN_API_KEY` / `QWEN_BASE_URL` | — / dashscope 兼容端点 | |
 | `GLM_API_KEY` / `GLM_BASE_URL` / `GLM_MODEL_ID` | — / bigmodel v4 / `glm-4-plus` | |
-| `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN` | TSecBench / — | 平台地址与令牌 |
+| `PLATFORM_MODE` | `tsec` | 平台适配器(内置仅 TSecBench;可自行扩展) |
+| `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN` | TSecBench / — | TSecBench 适配器的地址与令牌 |
 | `CHRONOS_STATE_DIR` | `.chronos-state` | 黑板 / 流量 / 报告 / 工作区根目录 |
 | `MAX_CONCURRENT_CHALLENGES` | `3` | 并发窗口（硬上限 3） |
 | `CHALLENGE_TIME_LIMIT_SECONDS` | `1800` | 默认单任务墙钟预算 |
@@ -110,7 +113,7 @@ chronos [flags]
 | `llm` | 模型规格 → go-openai 客户端 + 模型 id（DeepSeek/Qwen/GLM） |
 | `solver` | 单 executor 的工具循环（function calling）：http/tcp/run_python + 黑板/流量工具 |
 | `swarm` | 并行协作 executor（不竞速、互不取消）；平台模式下 submit 去重/冷却/熔断 |
-| `platform` | 竞赛平台接口 + TSecBench REST 适配器 |
+| `platform` | 可插拔平台工作源接口 + `New(mode,…)` 工厂；内置 TSecBench REST 适配器(其一) |
 | `poller` | 后台轮询，发 new/solved 事件 |
 | `scheduler` | 机械调度器（无 LLM）：填窗口 / reap / 滚动重试 / 预算 / 死锁自愈 / 算子命令 |
 | `console` | 控制台数据契约（Source 接口 + 发现排序）；scheduler 与 engagement 都实现它 |
