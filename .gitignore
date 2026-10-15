@@ -23,3 +23,8 @@ __pycache__/
 web/node_modules/
 web/.next/
 web/out/
+
+# built binaries (reproducible via go build)
+chronos-macos
+chronos-linux
+/chronos

@@ -37,3 +37,22 @@ func SortFindings(rows []map[string]any) {
 		return sevRank[str(rows[i], "severity")] < sevRank[str(rows[j], "severity")]
 	})
 }
+
+// TailTraffic sorts captured exchanges newest-last by timestamp and keeps the
+// most recent n for the console's live traffic table.
+func TailTraffic(rows []map[string]any, n int) []map[string]any {
+	sort.SliceStable(rows, func(i, j int) bool {
+		return ts(rows[i]) < ts(rows[j])
+	})
+	if n > 0 && len(rows) > n {
+		rows = rows[len(rows)-n:]
+	}
+	return rows
+}
+
+func ts(m map[string]any) float64 {
+	if v, ok := m["ts"].(float64); ok {
+		return v
+	}
+	return 0
+}

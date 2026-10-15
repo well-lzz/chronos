@@ -178,6 +178,26 @@ func (l *Log) Search(host, urlContains, bodyContains string, page int) map[strin
 	return map[string]any{"total": len(hits), "page": page, "per_page": perPage, "items": hits[start:end]}
 }
 
+// RecentRows returns up to limit most-recent exchanges as light rows (no bodies)
+// for the console's live traffic table.
+func (l *Log) RecentRows(limit int) []map[string]any {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ids := l.order
+	if limit > 0 && len(ids) > limit {
+		ids = ids[len(ids)-limit:]
+	}
+	out := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		ex := l.byID[id]
+		out = append(out, map[string]any{
+			"id": ex.ID, "kind": ex.Kind, "method": ex.Method, "target": ex.Target,
+			"status": ex.Status, "resp_len": ex.RespLen, "by": ex.FoundBy, "ts": ex.TS,
+		})
+	}
+	return out
+}
+
 // Get returns one exchange's request/response text, bounded.
 func (l *Log) Get(id, side string, offset, length int) map[string]any {
 	l.mu.Lock()

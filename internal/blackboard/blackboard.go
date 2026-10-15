@@ -442,6 +442,37 @@ func (b *Blackboard) SubgoalsOrdered() []SubGoal {
 	return out
 }
 
+// SubgoalRow is the console view of one sub-goal (the live coverage checklist).
+type SubgoalRow struct {
+	ID          string `json:"id"`
+	Description string `json:"description"`
+	Status      string `json:"status"` // open | resolved
+	Outcome     string `json:"outcome,omitempty"`
+	Done        bool   `json:"done"`
+}
+
+// SubgoalsPublic returns the coverage checklist as light rows for a snapshot:
+// resolved goals first (so progress reads top-down), then open ones, each in
+// creation order.
+func (b *Blackboard) SubgoalsPublic() []SubgoalRow {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var done, open []SubgoalRow
+	for _, id := range b.goalOrd {
+		g := b.subgoals[id]
+		if g == nil {
+			continue
+		}
+		row := SubgoalRow{ID: g.ID, Description: g.Description, Status: g.Status, Outcome: g.Outcome, Done: g.Status == "resolved"}
+		if row.Done {
+			done = append(done, row)
+		} else {
+			open = append(open, row)
+		}
+	}
+	return append(done, open...)
+}
+
 // ---------------------------- persistence -----------------------------------
 
 type diskModel struct {

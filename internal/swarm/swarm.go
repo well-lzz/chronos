@@ -28,10 +28,13 @@ import (
 	"github.com/well-lzz/chronos/internal/traffic"
 )
 
-// ActEvent is one observable step of an executor (for the web console).
+// ActEvent is one observable step of an executor (for the web console). Seq is
+// a per-swarm monotonic cursor (covers operator messages too, which have no
+// solver step), so the chat/stream orders human and agent messages together.
 type ActEvent struct {
+	Seq  int64  `json:"seq"`
 	Step int    `json:"step"`
-	Kind string `json:"kind"` // tool_call | tool_result | text
+	Kind string `json:"kind"` // tool_call | tool_result | text | operator
 	Tool string `json:"tool,omitempty"`
 	Text string `json:"text"`
 }
@@ -58,6 +61,7 @@ type Swarm struct {
 	activity map[string][]ActEvent
 	status   map[string]string
 	paused   atomic.Bool
+	evSeq    int64 // monotonic activity cursor (atomic)
 
 	// submit state (shared across executors)
 	subMu        sync.Mutex
@@ -248,17 +252,23 @@ func (s *Swarm) trySubmit(flag, spec string) (string, bool, bool) {
 
 func (s *Swarm) recorder(spec string) func(step int, kind, tool, text string) {
 	return func(step int, kind, tool, text string) {
-		if len(text) > 4000 {
-			text = text[:4000]
-		}
-		s.mu.Lock()
-		buf := append(s.activity[spec], ActEvent{Step: step, Kind: kind, Tool: tool, Text: text})
-		if len(buf) > activityRing {
-			buf = buf[len(buf)-activityRing:]
-		}
-		s.activity[spec] = buf
-		s.mu.Unlock()
+		s.emit(spec, step, kind, tool, text)
 	}
+}
+
+// emit appends an event to an executor's ring with a monotonic Seq.
+func (s *Swarm) emit(spec string, step int, kind, tool, text string) {
+	if len(text) > 4000 {
+		text = text[:4000]
+	}
+	seq := atomic.AddInt64(&s.evSeq, 1)
+	s.mu.Lock()
+	buf := append(s.activity[spec], ActEvent{Seq: seq, Step: step, Kind: kind, Tool: tool, Text: text})
+	if len(buf) > activityRing {
+		buf = buf[len(buf)-activityRing:]
+	}
+	s.activity[spec] = buf
+	s.mu.Unlock()
 }
 
 func (s *Swarm) setStatus(spec, st string) {
@@ -267,13 +277,13 @@ func (s *Swarm) setStatus(spec, st string) {
 	s.mu.Unlock()
 }
 
-// Activity returns this executor's events with Step > after.
+// Activity returns this executor's events with Seq > after (the chat/stream cursor).
 func (s *Swarm) Activity(spec string, after int) []ActEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []ActEvent
 	for _, e := range s.activity[spec] {
-		if e.Step > after {
+		if e.Seq > int64(after) {
 			out = append(out, e)
 		}
 	}
@@ -298,7 +308,8 @@ func (s *Swarm) Status() map[string]any {
 func (s *Swarm) Pause()  { s.paused.Store(true) }
 func (s *Swarm) Resume() { s.paused.Store(false) }
 
-// Bump injects operator guidance into one running executor.
+// Bump injects operator guidance into one running executor and records it in the
+// activity stream so the console chat shows the human's message in order.
 func (s *Swarm) Bump(spec, message string) bool {
 	s.mu.Lock()
 	sv := s.solvers[spec]
@@ -306,6 +317,7 @@ func (s *Swarm) Bump(spec, message string) bool {
 	if sv == nil {
 		return false
 	}
+	s.emit(spec, 0, "operator", "", message)
 	sv.Bump("[Operator guidance] " + message)
 	return true
 }
