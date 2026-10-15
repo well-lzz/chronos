@@ -7,11 +7,9 @@
   --mut: #6b7280;
   --accent: #2563eb;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --solved: #2e7d32;
-  --active: #1565c0;
-  --preparing: #b8860b;
-  --deferred: #b00020;
-  --unsolved: #8a8f98;
+  --confirmed: #2e7d32;
+  --suspected: #b8860b;
+  --failed: #8a8f98;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -21,11 +19,9 @@
     --bd: #262a32;
     --mut: #8a8f98;
     --accent: #5b8cff;
-    --solved: #4caf50;
-    --active: #4f9dff;
-    --preparing: #d2a53a;
-    --deferred: #ef5362;
-    --unsolved: #6b7280;
+    --confirmed: #4caf50;
+    --suspected: #d2a53a;
+    --failed: #6b7280;
   }
 }
 * { box-sizing: border-box; }

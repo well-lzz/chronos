@@ -371,6 +371,57 @@ func (b *Blackboard) FindingsSorted() []Finding {
 	return out
 }
 
+// Verdict maps the internal finding status to the real-business presentation
+// vocabulary: confirmed (确认) / suspected (疑似) / failed (失败). A real
+// assessment has no "solved/unsolved/deferred" — only these finding verdicts.
+func Verdict(status string) string {
+	switch status {
+	case Verified:
+		return "confirmed"
+	case Refuted:
+		return "failed"
+	default: // candidate, inconclusive
+		return "suspected"
+	}
+}
+
+// FindingRow is the presentation view of one finding for a console snapshot.
+type FindingRow struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Severity string `json:"severity"`
+	Status   string `json:"status"`
+	Verdict  string `json:"verdict"`
+	Target   string `json:"target,omitempty"`
+	Category string `json:"category,omitempty"`
+	Evidence int    `json:"evidence"`
+}
+
+// FindingsPublic returns findings as presentation rows (verdict-labeled, sorted).
+func (b *Blackboard) FindingsPublic() []FindingRow {
+	fs := b.FindingsSorted()
+	out := make([]FindingRow, 0, len(fs))
+	for _, f := range fs {
+		out = append(out, FindingRow{
+			ID: f.ID, Title: f.Title, Severity: f.Severity, Status: f.Status,
+			Verdict: Verdict(f.Status), Target: f.Target, Category: f.Category,
+			Evidence: len(f.EvidenceRefs),
+		})
+	}
+	return out
+}
+
+// VerdictCounts buckets findings into confirmed / suspected / failed (+ total).
+func (b *Blackboard) VerdictCounts() map[string]int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	c := map[string]int{"confirmed": 0, "suspected": 0, "failed": 0, "total": len(b.findings)}
+	for _, f := range b.findings {
+		c[Verdict(f.Status)]++
+	}
+	return c
+}
+
 func (b *Blackboard) FactsOrdered() []Fact {
 	b.mu.Lock()
 	defer b.mu.Unlock()

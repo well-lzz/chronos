@@ -49,9 +49,13 @@ chronos
 # 2) 机械调度器 + Web 控制台（默认 http://127.0.0.1:8000）
 chronos --web
 
-# 3) 一次真实授权评估（无平台/调度器）
-chronos --engagement examples/engagement.example.json
+# 3) 一次真实授权评估（无平台/调度器；可加 --web 看实时发现）
+chronos --engagement examples/engagement.example.json --web
 ```
+
+### 控制台：以「发现」为中心
+
+控制台不讲「题目解没解」——真实业务(渗透/漏挖/代审)没有 solved/unsolved/deferred，只有**发现的判定**：**确认 confirmed / 疑似 suspected / 失败 failed**(= 内核 verified / candidate+inconclusive / refuted 的呈现归并)。页面顶部是三类判定计数 + 发现总数 + facts + tokens;主体是发现列表(严重度 + 判定徽章 + 证据数);右侧是 executor 列表,点进去可实时看它的推理流并 pause/resume/kill/发指令。两种模式(scheduler / engagement)都用这套发现视图。
 
 两条运行主链路共用同一内核（scope / 黑板 / traffic / solver / swarm）：
 
@@ -109,7 +113,9 @@ chronos [flags]
 | `platform` | 竞赛平台接口 + TSecBench REST 适配器 |
 | `poller` | 后台轮询，发 new/solved 事件 |
 | `scheduler` | 机械调度器（无 LLM）：填窗口 / reap / 滚动重试 / 预算 / 死锁自愈 / 算子命令 |
-| `web` | 内嵌控制台后端（net/http + SSE，无 websocket 依赖）；前端是 `web/` 的 Next.js 应用，静态导出后嵌入二进制 |
+| `console` | 控制台数据契约（Source 接口 + 发现排序）；scheduler 与 engagement 都实现它 |
+| `engrun` | 让 engagement 模式也能开 `--web`（单 mission 的发现视图 + 算子操作） |
+| `web` | 内嵌控制台后端（net/http + SSE，无 websocket 依赖）；前端是 `web/` 的 Next.js 应用，静态导出后嵌入二进制；UI 以发现判定(确认/疑似/失败)为中心 |
 
 运行态目录（默认 `.chronos-state/`）：`blackboards/`、`traffic/`、`reports/`。
 

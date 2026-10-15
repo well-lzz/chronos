@@ -1,61 +1,72 @@
 package scheduler
 
-import "github.com/well-lzz/chronos/internal/swarm"
+import (
+	"github.com/well-lzz/chronos/internal/blackboard"
+	"github.com/well-lzz/chronos/internal/console"
+	"github.com/well-lzz/chronos/internal/swarm"
+)
 
-// Snapshot is a JSON-serializable view of the whole run for the web console.
+// Snapshot is a findings-centric view of the run for the console. A real
+// assessment is measured by findings (confirmed / suspected / failed), not by
+// "solved/unsolved/deferred" challenges — so the console presents verdicts and
+// the live executors, aggregated across every active mission.
 func (s *Scheduler) Snapshot() map[string]any {
-	solved := s.poll.KnownSolved()
-	known := s.poll.KnownChallenges()
-	stubs := s.poll.KnownStubs()
-
 	s.mu.Lock()
-	challenges := make([]map[string]any, 0, len(known))
-	for name := range known {
-		st := "unsolved"
-		switch {
-		case solved[name]:
-			st = "solved"
-		case s.runs[name] != nil:
-			st = "active"
-		case s.pending[name]:
-			st = "preparing"
-		case s.deferred[name] != "":
-			st = "deferred"
-		}
-		c := stubs[name]
-		challenges = append(challenges, map[string]any{
-			"name": name, "value": c.Value, "level": c.Level, "category": c.Category,
-			"flag_count": c.FlagCount, "correct_flag_count": c.CorrectFlagCount, "status": st,
-		})
-	}
-	swarms := map[string]any{}
-	var totalTokens int
-	for name, r := range s.runs {
-		swarms[name] = r.sw.Status()
-		totalTokens += r.sw.TotalTokens()
+	runs := make([]*run, 0, len(s.runs))
+	for _, r := range s.runs {
+		runs = append(runs, r)
 	}
 	active := len(s.runs)
 	preparing := len(s.pending)
-	deferredN := len(s.deferred)
-	deferredCopy := map[string]string{}
-	for k, v := range s.deferred {
-		deferredCopy[k] = v
-	}
 	s.mu.Unlock()
+
+	confirmed, suspected, failed, facts, tokens := 0, 0, 0, 0, 0
+	var findings []map[string]any
+	swarms := map[string]any{}
+	for _, r := range runs {
+		if r.sw == nil {
+			continue
+		}
+		swarms[r.meta.Name] = r.sw.Status()
+		tokens += r.sw.TotalTokens()
+		if bb := r.sw.BB; bb != nil {
+			vc := bb.VerdictCounts()
+			confirmed += vc["confirmed"]
+			suspected += vc["suspected"]
+			failed += vc["failed"]
+			facts += bb.Counts()["facts"]
+			for _, f := range bb.FindingsPublic() {
+				findings = append(findings, findingRow(r.meta.Name, f))
+			}
+		}
+	}
+	console.SortFindings(findings)
 
 	budget := -1
 	if rg := s.remainingGlobal(); rg >= 0 {
 		budget = int(rg) / 60
 	}
 	return map[string]any{
+		"mode": "scheduler",
 		"summary": map[string]any{
-			"solved": len(solved), "unsolved": len(known) - len(solved), "total": len(known),
-			"active": active, "preparing": preparing, "deferred": deferredN,
-			"total_tokens": totalTokens, "budget_left_min": budget,
+			"confirmed": confirmed, "suspected": suspected, "failed": failed,
+			"findings": confirmed + suspected + failed, "facts": facts,
+			"active": active, "preparing": preparing, "tokens": tokens, "budget_left_min": budget,
 		},
-		"challenges": challenges,
-		"swarms":     swarms,
-		"deferred":   deferredCopy,
+		"findings": findings,
+		"swarms":   swarms,
+	}
+}
+
+func findingRow(mission string, f blackboard.FindingRow) map[string]any {
+	target := f.Target
+	if target == "" {
+		target = mission
+	}
+	return map[string]any{
+		"id": mission + "/" + f.ID, "title": f.Title, "severity": f.Severity,
+		"verdict": f.Verdict, "target": target, "category": f.Category,
+		"evidence": f.Evidence, "mission": mission,
 	}
 }
 
@@ -68,4 +79,9 @@ func (s *Scheduler) Activity(challenge, model string, after int) []swarm.ActEven
 		return nil
 	}
 	return r.sw.Activity(model, after)
+}
+
+// Command adapts the console's action tuple to the operator queue.
+func (s *Scheduler) Command(action, challenge, model, message string) {
+	s.Enqueue(Command{Action: action, Challenge: challenge, Model: model, Message: message})
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/well-lzz/chronos/internal/blackboard"
 	"github.com/well-lzz/chronos/internal/config"
 	"github.com/well-lzz/chronos/internal/engagement"
+	"github.com/well-lzz/chronos/internal/engrun"
 	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/report"
 	"github.com/well-lzz/chronos/internal/scheduler"
@@ -77,7 +78,7 @@ func main() {
 
 	// Engagement mode: one authorized assessment, no platform/scheduler.
 	if engPath != "" {
-		if err := runEngagement(cfg, engPath, specs); err != nil {
+		if err := runEngagement(cfg, engPath, specs, webUI, webHost, webPort); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -108,7 +109,7 @@ func runScheduler(cfg config.Settings, specs []string, webUI bool, webHost strin
 	sch.Run(ctx)
 }
 
-func runEngagement(cfg config.Settings, path string, specs []string) error {
+func runEngagement(cfg config.Settings, path string, specs []string, webUI bool, webHost string, webPort int) error {
 	eng, err := engagement.Load(path)
 	if err != nil {
 		return fmt.Errorf("engagement refused: %w", err)
@@ -129,11 +130,23 @@ func runEngagement(cfg config.Settings, path string, specs []string) error {
 		budget = cfg.ChallengeTimeLimitS
 	}
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(budget)*time.Second)
+	base, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	deadline := started.Add(time.Duration(budget) * time.Second)
+	ctx, cancel := context.WithDeadline(base, deadline)
 	defer cancel()
 
 	sw := &swarm.Swarm{
 		Meta: meta, Scope: sc, ModelSpecs: specs, Settings: cfg, BB: bb, TL: tl,
+	}
+	if webUI {
+		runner := engrun.New(sw, bb, meta, cancel, deadline)
+		fmt.Printf("Web console → http://%s:%d (findings: confirmed/suspected/failed)\n\n", webHost, webPort)
+		go func() {
+			if err := web.Serve(runner, webHost, webPort); err != nil {
+				fmt.Fprintln(os.Stderr, "web console error:", err)
+			}
+		}()
 	}
 	sw.Run(ctx)
 

@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/well-lzz/chronos/internal/scheduler"
+	"github.com/well-lzz/chronos/internal/console"
 )
 
 // The console front-end is a Next.js app, statically exported to dist/ (built
@@ -25,9 +25,9 @@ import (
 //go:embed all:dist
 var distFS embed.FS
 
-// Serve starts the console HTTP server. It returns when ctx-independent: the
-// caller runs it in a goroutine and cancels the scheduler to stop the process.
-func Serve(sch *scheduler.Scheduler, host string, port int) error {
+// Serve starts the console HTTP server over any console.Source (the scheduler
+// or a single engagement). The caller runs it in a goroutine.
+func Serve(src console.Source, host string, port int) error {
 	mux := http.NewServeMux()
 
 	sub, err := fs.Sub(distFS, "dist")
@@ -37,12 +37,12 @@ func Serve(sch *scheduler.Scheduler, host string, port int) error {
 	mux.Handle("/", http.FileServerFS(sub))
 
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, sch.Snapshot())
+		writeJSON(w, src.Snapshot())
 	})
 
 	mux.HandleFunc("/api/activity", func(w http.ResponseWriter, r *http.Request) {
 		after, _ := strconv.Atoi(r.URL.Query().Get("after"))
-		ev := sch.Activity(r.URL.Query().Get("challenge"), r.URL.Query().Get("model"), after)
+		ev := src.Activity(r.URL.Query().Get("challenge"), r.URL.Query().Get("model"), after)
 		writeJSON(w, map[string]any{"events": ev})
 	})
 
@@ -58,7 +58,7 @@ func Serve(sch *scheduler.Scheduler, host string, port int) error {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for {
-			data, _ := json.Marshal(sch.Snapshot())
+			data, _ := json.Marshal(src.Snapshot())
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			fl.Flush()
 			select {
@@ -74,12 +74,17 @@ func Serve(sch *scheduler.Scheduler, host string, port int) error {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		var c scheduler.Command
+		var c struct {
+			Action    string `json:"action"`
+			Challenge string `json:"challenge"`
+			Model     string `json:"model"`
+			Message   string `json:"message"`
+		}
 		if json.NewDecoder(r.Body).Decode(&c) != nil {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		sch.Enqueue(c)
+		src.Command(c.Action, c.Challenge, c.Model, c.Message)
 		writeJSON(w, map[string]any{"ok": true})
 	})
 
