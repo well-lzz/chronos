@@ -21,6 +21,7 @@ import (
 	"github.com/well-lzz/chronos/internal/config"
 	"github.com/well-lzz/chronos/internal/engagement"
 	"github.com/well-lzz/chronos/internal/engrun"
+	"github.com/well-lzz/chronos/internal/llmconfig"
 	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/report"
 	"github.com/well-lzz/chronos/internal/scheduler"
@@ -80,14 +81,23 @@ func main() {
 		cfg.MaxConcurrent = 3
 	}
 
+	// Operator-editable model profile (configured from the console, persisted to
+	// the state dir). When set and no --model flag was given, it drives the run;
+	// any OpenAI-compatible provider works.
+	llmStore := llmconfig.Load(cfg.StateDir)
+
 	specs := []string(models)
 	if len(specs) == 0 {
-		specs = []string{"deepseek/deepseek-chat"}
+		if p := llmStore.Get(); p.Active() {
+			specs = []string{p.Label()}
+		} else {
+			specs = []string{"deepseek/deepseek-chat"}
+		}
 	}
 
 	// Engagement mode: one authorized assessment, no platform/scheduler.
 	if engPath != "" {
-		if err := runEngagement(cfg, engPath, specs, webUI, webHost, webPort); err != nil {
+		if err := runEngagement(cfg, engPath, specs, llmStore, webUI, webHost, webPort); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -95,7 +105,7 @@ func main() {
 	}
 
 	// Otherwise run the mechanical scheduler against the TSec platform.
-	runScheduler(cfg, specs, webUI, webHost, webPort)
+	runScheduler(cfg, specs, llmStore, webUI, webHost, webPort)
 }
 
 // loadDotEnv reads simple KEY=VALUE lines from path and sets any that are not
@@ -131,13 +141,14 @@ func loadDotEnv(path string) {
 	}
 }
 
-func runScheduler(cfg config.Settings, specs []string, webUI bool, webHost string, webPort int) {
+func runScheduler(cfg config.Settings, specs []string, llmStore *llmconfig.Store, webUI bool, webHost string, webPort int) {
 	pf, err := platform.New(cfg.PlatformMode, cfg.PlatformBase(), cfg.BenchmarkToken)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 	sch := scheduler.New(pf, cfg, specs)
+	sch.LLM = llmStore
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -147,7 +158,7 @@ func runScheduler(cfg config.Settings, specs []string, webUI bool, webHost strin
 	if webUI {
 		fmt.Printf("Web console → http://%s:%d (Ctrl+C to stop)\n", webHost, webPort)
 		go func() {
-			if err := web.Serve(sch, webHost, webPort); err != nil {
+			if err := web.Serve(sch, llmStore, webHost, webPort); err != nil {
 				fmt.Fprintln(os.Stderr, "web console error:", err)
 			}
 		}()
@@ -155,7 +166,7 @@ func runScheduler(cfg config.Settings, specs []string, webUI bool, webHost strin
 	sch.Run(ctx)
 }
 
-func runEngagement(cfg config.Settings, path string, specs []string, webUI bool, webHost string, webPort int) error {
+func runEngagement(cfg config.Settings, path string, specs []string, llmStore *llmconfig.Store, webUI bool, webHost string, webPort int) error {
 	eng, err := engagement.Load(path)
 	if err != nil {
 		return fmt.Errorf("engagement refused: %w", err)
@@ -183,13 +194,13 @@ func runEngagement(cfg config.Settings, path string, specs []string, webUI bool,
 	defer cancel()
 
 	sw := &swarm.Swarm{
-		Meta: meta, Scope: sc, ModelSpecs: specs, Settings: cfg, BB: bb, TL: tl,
+		Meta: meta, Scope: sc, ModelSpecs: specs, Settings: cfg, BB: bb, TL: tl, LLM: llmStore,
 	}
 	if webUI {
 		runner := engrun.New(sw, bb, meta, cancel, deadline)
 		fmt.Printf("Web console → http://%s:%d (findings: confirmed/suspected/failed)\n\n", webHost, webPort)
 		go func() {
-			if err := web.Serve(runner, webHost, webPort); err != nil {
+			if err := web.Serve(runner, llmStore, webHost, webPort); err != nil {
 				fmt.Fprintln(os.Stderr, "web console error:", err)
 			}
 		}()

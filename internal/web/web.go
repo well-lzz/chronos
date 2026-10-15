@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/well-lzz/chronos/internal/console"
+	"github.com/well-lzz/chronos/internal/llm"
+	"github.com/well-lzz/chronos/internal/llmconfig"
 )
 
 // The console front-end is a Next.js app, statically exported to dist/ (built
@@ -26,8 +28,9 @@ import (
 var distFS embed.FS
 
 // Serve starts the console HTTP server over any console.Source (the scheduler
-// or a single engagement). The caller runs it in a goroutine.
-func Serve(src console.Source, host string, port int) error {
+// or a single engagement). store, when non-nil, backs the model-settings panel.
+// The caller runs it in a goroutine.
+func Serve(src console.Source, store *llmconfig.Store, host string, port int) error {
 	mux := http.NewServeMux()
 
 	sub, err := fs.Sub(distFS, "dist")
@@ -85,6 +88,62 @@ func Serve(src console.Source, host string, port int) error {
 			return
 		}
 		src.Command(c.Action, c.Challenge, c.Model, c.Message)
+		writeJSON(w, map[string]any{"ok": true})
+	})
+
+	// Model settings: GET current (key never returned), POST to save, POST /test
+	// to verify a profile against the live endpoint.
+	mux.HandleFunc("/api/llm", func(w http.ResponseWriter, r *http.Request) {
+		if store == nil {
+			writeJSON(w, map[string]any{"supported": false})
+			return
+		}
+		if r.Method == http.MethodGet {
+			pub := store.Public()
+			pub["supported"] = true
+			writeJSON(w, pub)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
+			return
+		}
+		var p llmconfig.Profile
+		if json.NewDecoder(r.Body).Decode(&p) != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if err := store.Set(p); err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		pub := store.Public()
+		pub["ok"] = true
+		writeJSON(w, pub)
+	})
+
+	mux.HandleFunc("/api/llm/test", func(w http.ResponseWriter, r *http.Request) {
+		if store == nil {
+			writeJSON(w, map[string]any{"ok": false, "error": "settings unavailable"})
+			return
+		}
+		var p llmconfig.Profile
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		// An omitted key means "test the saved one".
+		if p.APIKey == "" {
+			saved := store.Get()
+			p.APIKey = saved.APIKey
+			if p.BaseURL == "" {
+				p.BaseURL = saved.BaseURL
+			}
+			if p.Model == "" {
+				p.Model = saved.Model
+			}
+		}
+		if err := llm.Ping(r.Context(), p); err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
 		writeJSON(w, map[string]any{"ok": true})
 	})
 

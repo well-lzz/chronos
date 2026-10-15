@@ -10,6 +10,29 @@
 .eng { font-size: .82rem; color: var(--mut); }
 .meta { display: flex; align-items: center; gap: 1rem; color: var(--mut); font-size: .82rem; font-variant-numeric: tabular-nums; }
 .scope { max-width: 26rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gear { font-size: .82rem; padding: .2rem .55rem; border-radius: 1rem; max-width: 16rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.banner { background: color-mix(in srgb, #e05260 14%, var(--panel)); border: 1px solid color-mix(in srgb, #e05260 45%, transparent); color: #c0392b; border-radius: .6rem; padding: .55rem .8rem; margin-bottom: 1rem; cursor: pointer; font-size: .88rem; }
+@media (prefers-color-scheme: dark) { .banner { color: #ff8a93; } }
+
+/* settings modal */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: flex-start; justify-content: center; padding: 4rem 1rem; z-index: 50; }
+.modal { background: var(--panel); border: 1px solid var(--bd); border-radius: .8rem; width: 100%; max-width: 32rem; padding: 1rem 1.1rem 1.1rem; box-shadow: 0 1.5rem 3rem rgba(0,0,0,.3); }
+.modalHead { display: flex; align-items: center; justify-content: space-between; }
+.modalHead h2 { font-size: 1rem; margin: 0; }
+.modalHead button { border: none; background: none; font-size: 1.1rem; color: var(--mut); padding: .1rem .4rem; }
+.modalHint { color: var(--mut); font-size: .8rem; line-height: 1.5; margin: .4rem 0 .9rem; }
+.field { display: grid; grid-template-columns: 7rem 1fr; align-items: center; gap: .6rem; margin-bottom: .6rem; }
+.field span { font-size: .82rem; color: var(--mut); }
+.field input, .field select { width: 100%; }
+.testMsg { font-size: .82rem; padding: .45rem .6rem; border-radius: .5rem; margin: .2rem 0 .6rem; }
+.testOk { color: var(--confirmed); background: color-mix(in srgb, var(--confirmed) 12%, transparent); }
+.testBad { color: #e05260; background: color-mix(in srgb, #e05260 12%, transparent); word-break: break-word; }
+.modalBtns { display: flex; align-items: center; gap: .5rem; margin-top: .4rem; }
+.spacer { flex: 1; }
+.save { background: var(--accent); color: #fff; border-color: var(--accent); padding: .35rem 1.1rem; }
+.save:disabled { opacity: .5; cursor: default; }
+@media (max-width: 34rem) { .field { grid-template-columns: 1fr; gap: .2rem; } }
 
 /* summary tiles */
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: .55rem; margin-bottom: 1rem; }

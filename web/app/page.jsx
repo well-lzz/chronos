@@ -8,6 +8,23 @@ const EMPTY = {
 };
 
 const VERDICT_LABEL = { confirmed: "确认", suspected: "疑似", failed: "失败" };
+
+// Mainstream OpenAI-compatible providers. Any endpoint speaking the OpenAI chat
+// API works — pick a preset to fill the base URL, or choose 自定义 for anything else.
+const PRESETS = [
+  { id: "deepseek", name: "DeepSeek", base: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  { id: "openai", name: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o" },
+  { id: "anthropic", name: "Anthropic (OpenAI 兼容)", base: "https://api.anthropic.com/v1/", model: "claude-sonnet-4-5" },
+  { id: "qwen", name: "通义千问 Qwen (DashScope)", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
+  { id: "glm", name: "智谱 GLM", base: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-plus" },
+  { id: "kimi", name: "月之暗面 Kimi (Moonshot)", base: "https://api.moonshot.cn/v1", model: "moonshot-v1-8k" },
+  { id: "openrouter", name: "OpenRouter", base: "https://openrouter.ai/api/v1", model: "openai/gpt-4o" },
+  { id: "groq", name: "Groq", base: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
+  { id: "mistral", name: "Mistral", base: "https://api.mistral.ai/v1", model: "mistral-large-latest" },
+  { id: "siliconflow", name: "SiliconFlow 硅基流动", base: "https://api.siliconflow.cn/v1", model: "deepseek-ai/DeepSeek-V3" },
+  { id: "ollama", name: "Ollama (本地)", base: "http://localhost:11434/v1", model: "llama3.1" },
+  { id: "custom", name: "自定义 Custom", base: "", model: "" },
+];
 const KIND_LABEL = {
   operator: "操作员", text: "推理", tool_call: "调用", tool_result: "结果", error: "错误",
 };
@@ -43,6 +60,8 @@ export default function Console() {
   const [events, setEvents] = useState([]);
   const [msg, setMsg] = useState("");
   const [connected, setConnected] = useState(false);
+  const [llm, setLlm] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
   const afterRef = useRef(0);
   const logRef = useRef(null);
   const watchRef = useRef(watch);
@@ -57,7 +76,13 @@ export default function Console() {
     return () => es.close();
   }, []);
 
+  const loadLlm = useCallback(() => {
+    fetch("/api/llm").then((r) => r.json()).then(setLlm).catch(() => {});
+  }, []);
+  useEffect(() => { loadLlm(); }, [loadLlm]);
+
   const agents = useMemo(() => flattenAgents(state.swarms), [state.swarms]);
+  const needsConfig = agents.some((a) => a.status === "needs-config") || (llm && llm.supported && !llm.active);
 
   // auto-attach to the first live executor so the dialogue works out of the box
   useEffect(() => {
@@ -150,8 +175,22 @@ export default function Console() {
           {scope && <span className={s.scope} title={scope}>scope: {scope}</span>}
           {sm.budget_left_min != null && sm.budget_left_min >= 0 && <span>budget {sm.budget_left_min}min</span>}
           <span>{(sm.tokens || 0).toLocaleString()} tokens</span>
+          <button className={s.gear} onClick={() => { loadLlm(); setShowSettings(true); }} title="模型设置 Model settings">
+            ⚙ {llm && llm.model ? llm.model : "模型设置"}
+          </button>
         </div>
       </header>
+
+      {needsConfig && !showSettings && (
+        <div className={s.banner} onClick={() => { loadLlm(); setShowSettings(true); }}>
+          ⚠ 模型未配置或密钥无效 —— 点击这里打开「模型设置」，填好后 Agent 会自动恢复运行。
+        </div>
+      )}
+
+      {showSettings && (
+        <SettingsModal initial={llm} onClose={() => setShowSettings(false)}
+          onSaved={() => { loadLlm(); }} />
+      )}
 
       <section className={s.tiles}>
         <Tile label="确认 confirmed" value={sm.confirmed} kind="confirmed" />
@@ -299,6 +338,88 @@ export default function Console() {
             </div>
           </div>
         </aside>
+      </div>
+    </div>
+  );
+}
+
+function SettingsModal({ initial, onClose, onSaved }) {
+  const match = PRESETS.find((p) => p.base === (initial?.base_url || "")) || PRESETS.find((p) => p.id === (initial?.provider || "")) || PRESETS[PRESETS.length - 1];
+  const [provider, setProvider] = useState(match.id);
+  const [baseURL, setBaseURL] = useState(initial?.base_url || match.base);
+  const [model, setModel] = useState(initial?.model || match.model);
+  const [apiKey, setApiKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [test, setTest] = useState(null); // {ok,error}
+  const hasKey = !!initial?.has_key;
+
+  const pickPreset = (id) => {
+    const p = PRESETS.find((x) => x.id === id) || PRESETS[0];
+    setProvider(id);
+    if (p.id !== "custom") { setBaseURL(p.base); if (!model) setModel(p.model); }
+  };
+
+  const body = () => ({ provider, base_url: baseURL.trim(), model: model.trim(), api_key: apiKey });
+
+  const save = async () => {
+    setBusy(true); setTest(null);
+    try {
+      const r = await fetch("/api/llm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
+      const j = await r.json();
+      if (j.ok === false) { setTest({ ok: false, error: j.error || "save failed" }); setBusy(false); return; }
+      setApiKey(""); onSaved && onSaved(); onClose();
+    } catch (e) { setTest({ ok: false, error: String(e) }); }
+    setBusy(false);
+  };
+
+  const doTest = async () => {
+    setBusy(true); setTest(null);
+    try {
+      const r = await fetch("/api/llm/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
+      setTest(await r.json());
+    } catch (e) { setTest({ ok: false, error: String(e) }); }
+    setBusy(false);
+  };
+
+  return (
+    <div className={s.overlay} onClick={onClose}>
+      <div className={s.modal} onClick={(e) => e.stopPropagation()}>
+        <div className={s.modalHead}>
+          <h2>模型设置 Model settings</h2>
+          <button onClick={onClose}>✕</button>
+        </div>
+        <p className={s.modalHint}>
+          配置底层 LLM。保存后持久化到本地,下次启动自动读取;正在运行的 Agent 会在下一轮自动切换到新配置,无需重启。支持任意 OpenAI 兼容接口。
+        </p>
+
+        <label className={s.field}><span>提供商 Provider</span>
+          <select value={provider} onChange={(e) => pickPreset(e.target.value)}>
+            {PRESETS.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </label>
+        <label className={s.field}><span>Base URL</span>
+          <input value={baseURL} onChange={(e) => setBaseURL(e.target.value)} placeholder="https://api.deepseek.com/v1" />
+        </label>
+        <label className={s.field}><span>模型 Model</span>
+          <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="deepseek-chat" />
+        </label>
+        <label className={s.field}><span>API Key</span>
+          <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
+            placeholder={hasKey ? `已保存 ${initial.key_hint || "••••"} — 留空则不修改` : "sk-…"} />
+        </label>
+
+        {test && (
+          <div className={`${s.testMsg} ${test.ok ? s.testOk : s.testBad}`}>
+            {test.ok ? "✓ 连接成功,密钥与模型可用" : `✗ ${test.error}`}
+          </div>
+        )}
+
+        <div className={s.modalBtns}>
+          <button onClick={doTest} disabled={busy || !baseURL.trim() || !model.trim()}>测试连接</button>
+          <span className={s.spacer} />
+          <button onClick={onClose} disabled={busy}>取消</button>
+          <button className={s.save} onClick={save} disabled={busy || !baseURL.trim() || !model.trim() || (!apiKey && !hasKey)}>保存</button>
+        </div>
       </div>
     </div>
   );

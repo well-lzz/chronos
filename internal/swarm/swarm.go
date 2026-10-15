@@ -17,9 +17,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	openai "github.com/sashabaranov/go-openai"
+
 	"github.com/well-lzz/chronos/internal/blackboard"
 	"github.com/well-lzz/chronos/internal/config"
 	"github.com/well-lzz/chronos/internal/llm"
+	"github.com/well-lzz/chronos/internal/llmconfig"
 	"github.com/well-lzz/chronos/internal/mission"
 	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/scope"
@@ -52,7 +55,8 @@ type Swarm struct {
 	Settings   config.Settings
 	BB         *blackboard.Blackboard
 	TL         *traffic.Log
-	Platform   platform.Platform // nil = engagement (no oracle, record-only)
+	Platform   platform.Platform  // nil = engagement (no oracle, record-only)
+	LLM        *llmconfig.Store   // operator-editable model profile; nil = env/flag only
 
 	Tokens int64 // shared, mission-wide
 
@@ -98,23 +102,27 @@ func (s *Swarm) Run(ctx context.Context) string {
 	flag := ""
 
 	for _, spec := range s.ModelSpecs {
-		client, model, err := llm.Resolve(spec, s.Settings)
-		if err != nil {
-			log.Printf("[%s/%s] cannot start: %v", s.Meta.Name, spec, err)
-			s.setStatus(spec, "error")
-			s.emit(spec, 0, "error", "", "cannot start executor: "+err.Error())
-			continue
+		sp := spec
+		// Resolve the model fresh each cycle: the operator-configured profile wins
+		// when set (any OpenAI-compatible provider), otherwise fall back to the
+		// env/flag provider. The executor starts even when nothing is configured
+		// yet — the first cycle reports a config error and recovers once the
+		// operator fills in the model settings in the console.
+		resolve := func() (*openai.Client, string, error) {
+			if s.LLM != nil && s.LLM.Active() {
+				return llm.FromProfile(s.LLM.Get())
+			}
+			return llm.Resolve(sp, s.Settings)
 		}
 		var submitFn solver.SubmitFn
 		if s.Platform != nil {
-			sp := spec
 			submitFn = func(fl string) (string, bool, bool) { return s.trySubmit(fl, sp) }
 		}
 		sv := solver.New(solver.Options{
-			ModelSpec: spec, Model: model, Client: client, Meta: s.Meta, Scope: s.Scope,
+			ModelSpec: spec, Meta: s.Meta, Scope: s.Scope,
 			BB: s.BB, TL: s.TL, AllowExec: s.Settings.AllowLocalExec, Deadline: deadline,
-			Tokens: &s.Tokens, Notify: func(m string) { log.Printf("[%s/%s] %s", s.Meta.Name, spec, m) },
-			SubmitFn: submitFn, Record: s.recorder(spec),
+			Tokens: &s.Tokens, Notify: func(m string) { log.Printf("[%s/%s] %s", s.Meta.Name, sp, m) },
+			SubmitFn: submitFn, Record: s.recorder(spec), Resolve: resolve,
 		})
 		s.mu.Lock()
 		s.solvers[spec] = sv
@@ -151,6 +159,7 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 		for s.paused.Load() && ctx.Err() == nil {
 			time.Sleep(300 * time.Millisecond)
 		}
+		s.setStatus(spec, "running")
 		markerBefore := s.BB.ProgressMarker()
 		res := sv.RunUntilDoneOrGaveUp(ctx)
 		cycles++
@@ -163,6 +172,20 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 		case solver.StatusCancelled:
 			s.setStatus(spec, "cancelled")
 			return ""
+		case solver.StatusConfigError:
+			// The model isn't configured/authorized yet. Surface it, mark the
+			// executor as waiting, and keep polling — the moment the operator saves
+			// a working model in the console, the next cycle picks it up. Does not
+			// count against the retry ceiling.
+			s.emitErrorOnce(spec, res.StepCount, res.Findings+"  → 打开控制台右上角「模型设置」填写后自动恢复")
+			s.setStatus(spec, "needs-config")
+			select {
+			case <-ctx.Done():
+				s.setStatus(spec, "cancelled")
+				return ""
+			case <-time.After(3 * time.Second):
+			}
+			continue
 		}
 
 		st := termination.CycleState{

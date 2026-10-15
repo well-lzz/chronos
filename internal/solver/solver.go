@@ -6,6 +6,7 @@ package solver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -22,10 +23,11 @@ import (
 
 // Status values for a cycle result.
 const (
-	StatusGaveUp    = "gave_up"
-	StatusError     = "error"
-	StatusCancelled = "cancelled"
-	StatusFlagFound = "flag_found"
+	StatusGaveUp      = "gave_up"
+	StatusError       = "error"
+	StatusConfigError = "config_error" // model misconfigured/unauthorized — recoverable once the operator fixes it
+	StatusCancelled   = "cancelled"
+	StatusFlagFound   = "flag_found"
 )
 
 const maxToolCallsPerCycle = 40
@@ -61,6 +63,10 @@ type Options struct {
 	SubmitFn SubmitFn
 	// Record, when set, receives each step for live observation (web console).
 	Record func(step int, kind, tool, text string)
+	// Resolve, when set, supplies the client+model at the start of each cycle so
+	// an operator who fixes the LLM config mid-run is picked up without a restart.
+	// Takes precedence over Client.
+	Resolve func() (*openai.Client, string, error)
 }
 
 // Solver is one executor bound to a model and a shared mission state.
@@ -83,6 +89,7 @@ type Solver struct {
 	notify       func(string)
 	submitFn     SubmitFn
 	record       func(step int, kind, tool, text string)
+	resolve      func() (*openai.Client, string, error)
 	lastFlag     string
 	flagComplete bool
 }
@@ -92,7 +99,7 @@ func New(o Options) *Solver {
 	return &Solver{
 		ModelSpec: o.ModelSpec, Model: o.Model, client: o.Client, meta: o.Meta, scope: o.Scope,
 		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, deadline: o.Deadline, tokens: o.Tokens,
-		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record,
+		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record, resolve: o.Resolve,
 	}
 }
 
@@ -128,6 +135,21 @@ func (s *Solver) Bump(insights string) {
 // (one cycle), the per-cycle cap is hit, or the context/deadline ends.
 func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 	s.start()
+
+	// Resolve the live model config for this cycle. If the operator hasn't
+	// configured a working model yet (or the key is wrong), report it as a
+	// recoverable config error instead of a hard failure.
+	if s.resolve != nil {
+		client, model, err := s.resolve()
+		if err != nil {
+			return Result{Status: StatusConfigError, Findings: "model not configured: " + err.Error(), StepCount: s.steps}
+		}
+		s.client, s.Model = client, model
+	}
+	if s.client == nil {
+		return Result{Status: StatusConfigError, Findings: "model not configured: open 模型设置 in the console", StepCount: s.steps}
+	}
+
 	tools := toolDefs(s.allowExec && pythonAvailable(), s.meta.HasFlags())
 
 	// Prompt for this cycle, with the blackboard summary injected.
@@ -154,6 +176,13 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 		if err != nil {
 			if ctx.Err() != nil {
 				return Result{Status: StatusCancelled, StepCount: s.steps}
+			}
+			// Auth / permission failures are a config problem the operator can fix
+			// live (wrong or expired key, model not enabled) — surface them as such
+			// so the executor waits and recovers instead of burning its retries.
+			var apiErr *openai.APIError
+			if errors.As(err, &apiErr) && (apiErr.HTTPStatusCode == 401 || apiErr.HTTPStatusCode == 403) {
+				return Result{Status: StatusConfigError, Findings: fmt.Sprintf("LLM auth failed (HTTP %d): %s", apiErr.HTTPStatusCode, err.Error()), StepCount: s.steps}
 			}
 			return Result{Status: StatusError, Findings: "LLM error: " + err.Error(), StepCount: s.steps}
 		}

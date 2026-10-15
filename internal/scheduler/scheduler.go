@@ -15,6 +15,7 @@ import (
 
 	"github.com/well-lzz/chronos/internal/blackboard"
 	"github.com/well-lzz/chronos/internal/config"
+	"github.com/well-lzz/chronos/internal/llmconfig"
 	"github.com/well-lzz/chronos/internal/mission"
 	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/poller"
@@ -46,6 +47,8 @@ type Scheduler struct {
 	specs    []string
 	maxConc  int
 	runStart time.Time
+
+	LLM *llmconfig.Store // operator-editable model profile (optional)
 
 	mu             sync.Mutex
 	runs           map[string]*run
@@ -383,7 +386,7 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 		sctx, cancel := context.WithTimeout(ctx, s.perChallengeLimit(meta))
 		sw := &swarm.Swarm{
 			Meta: meta, Scope: scope.ParseConnInfo(meta.ConnectionInfo), ModelSpecs: s.specs,
-			Settings: s.cfg, Platform: s.pf,
+			Settings: s.cfg, Platform: s.pf, LLM: s.LLM,
 			BB: blackboard.LoadOrNew(meta.Name, s.cfg.StateDir),
 			TL: traffic.LoadOrNew(meta.Name, s.cfg.StateDir),
 		}
