@@ -255,12 +255,26 @@ func (s *Solver) toolSubmitFlag(argsJSON string) string {
 	if a.Flag == "" {
 		return "submit_flag error: empty flag"
 	}
-	// Assessment core has no platform oracle: record the flag as a verified
-	// finding so it enters the report, and surface it to the loop.
+	// With a platform SubmitFn (scheduler/TSec mode), the flag is submitted for
+	// real; only a confirmed flag is recorded as a verified finding. Without one
+	// (engagement mode, no oracle), record it directly.
+	if s.submitFn != nil {
+		display, confirmed, complete := s.submitFn(a.Flag)
+		if confirmed {
+			s.lastFlag = a.Flag
+			s.flagComplete = complete
+			s.bb.AddFinding(blackboard.Finding{
+				Title: "flag: " + a.Flag, Target: s.meta.Name, Category: "flag",
+				Severity: "info", Status: blackboard.Verified, Evidence: display, FoundBy: s.ModelSpec,
+			})
+		}
+		return display
+	}
 	s.lastFlag = a.Flag
+	s.flagComplete = true
 	s.bb.AddFinding(blackboard.Finding{
 		Title: "flag: " + a.Flag, Target: s.meta.Name, Category: "flag",
-		Severity: "info", Status: blackboard.Verified, Evidence: "submitted by model", FoundBy: s.ModelSpec,
+		Severity: "info", Status: blackboard.Verified, Evidence: "submitted by model (no oracle)", FoundBy: s.ModelSpec,
 	})
 	return "flag recorded as a verified finding: " + a.Flag
 }

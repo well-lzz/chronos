@@ -39,6 +39,30 @@ type Result struct {
 	Tokens    int
 }
 
+// SubmitFn submits a flag through the platform (dedup/cooldown handled by the
+// caller). Returns the display text, whether it was confirmed, and whether that
+// confirm completed the whole challenge.
+type SubmitFn func(flag string) (display string, confirmed, complete bool)
+
+// Options configures a Solver.
+type Options struct {
+	ModelSpec string
+	Model     string
+	Client    *openai.Client
+	Meta      mission.Meta
+	Scope     scope.Scope
+	BB        *blackboard.Blackboard
+	TL        *traffic.Log
+	AllowExec bool
+	Deadline  time.Time
+	Tokens    *int64
+	Notify    func(string)
+	// SubmitFn, when set, makes submit_flag go to the platform; nil = record-only.
+	SubmitFn SubmitFn
+	// Record, when set, receives each step for live observation (web console).
+	Record func(step int, kind, tool, text string)
+}
+
 // Solver is one executor bound to a model and a shared mission state.
 type Solver struct {
 	ModelSpec string
@@ -52,21 +76,29 @@ type Solver struct {
 	allowExec bool
 	deadline  time.Time
 
-	messages []openai.ChatCompletionMessage
-	started  bool
-	steps    int
-	tokens   *int64 // shared token counter (mission-wide)
-	notify   func(string)
-	lastFlag string
+	messages     []openai.ChatCompletionMessage
+	started      bool
+	steps        int
+	tokens       *int64 // shared token counter (mission-wide)
+	notify       func(string)
+	submitFn     SubmitFn
+	record       func(step int, kind, tool, text string)
+	lastFlag     string
+	flagComplete bool
 }
 
-// New builds a solver. tokens is a shared counter; notify logs upward.
-func New(modelSpec, model string, client *openai.Client, meta mission.Meta, sc scope.Scope,
-	bb *blackboard.Blackboard, tl *traffic.Log, allowExec bool, deadline time.Time,
-	tokens *int64, notify func(string)) *Solver {
+// New builds a solver from Options.
+func New(o Options) *Solver {
 	return &Solver{
-		ModelSpec: modelSpec, Model: model, client: client, meta: meta, scope: sc,
-		bb: bb, tl: tl, allowExec: allowExec, deadline: deadline, tokens: tokens, notify: notify,
+		ModelSpec: o.ModelSpec, Model: o.Model, client: o.Client, meta: o.Meta, scope: o.Scope,
+		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, deadline: o.Deadline, tokens: o.Tokens,
+		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record,
+	}
+}
+
+func (s *Solver) rec(kind, tool, text string) {
+	if s.record != nil {
+		s.record(s.steps, kind, tool, text)
 	}
 }
 
@@ -134,19 +166,24 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 
 		if len(msg.ToolCalls) == 0 {
 			// Final text, no tool calls: this cycle is done.
+			s.rec("text", "", strings.TrimSpace(msg.Content))
 			return Result{Status: StatusGaveUp, Findings: strings.TrimSpace(msg.Content), StepCount: s.steps}
 		}
 		for _, tc := range msg.ToolCalls {
 			calls++
 			s.steps++
+			s.flagComplete = false
+			s.rec("tool_call", tc.Function.Name, tc.Function.Arguments)
 			result := s.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+			s.rec("tool_result", tc.Function.Name, result)
 			s.messages = append(s.messages, openai.ChatCompletionMessage{
 				Role: openai.ChatMessageRoleTool, ToolCallID: tc.ID, Content: result,
 			})
-			if tc.Function.Name == "submit_flag" && s.meta.HasFlags() {
-				if flag := s.lastFlag; flag != "" {
-					return Result{Status: StatusFlagFound, Flag: flag, StepCount: s.steps, Findings: strings.TrimSpace(msg.Content)}
-				}
+			// A confirmed flag that completed the challenge ends this executor
+			// (recorded; does not cancel siblings). The scheduler's poller also
+			// kills the swarm on the platform-confirmed solve.
+			if tc.Function.Name == "submit_flag" && s.flagComplete && s.lastFlag != "" {
+				return Result{Status: StatusFlagFound, Flag: s.lastFlag, StepCount: s.steps, Findings: strings.TrimSpace(msg.Content)}
 			}
 		}
 		if calls >= maxToolCallsPerCycle {

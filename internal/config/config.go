@@ -14,6 +14,18 @@ type Settings struct {
 	SolverRetryDelayS   float64
 	AllowLocalExec      bool
 
+	// Platform + scheduler (mechanical shell).
+	PlatformURL          string
+	BenchmarkURL         string
+	BenchmarkToken       string
+	MaxConcurrent        int
+	KillchainTimeLimitS  int
+	TotalBudgetSeconds   int
+	MinRemainingToSpawnS int
+	MaxChallengeAttempts int
+	DeferRetryCooldownS  int
+	AutoResumeIdleS      int
+
 	// LLM providers (OpenAI-compatible). Base URLs have defaults; keys from env.
 	DeepSeekKey     string
 	DeepSeekBaseURL string
@@ -77,5 +89,24 @@ func Load() Settings {
 		GLMKey:          os.Getenv("GLM_API_KEY"),
 		GLMBaseURL:      getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
 		GLMModelID:      getenv("GLM_MODEL_ID", "glm-4-plus"),
+
+		PlatformURL:          getenv("PLATFORM_URL", ""),
+		BenchmarkURL:         getenv("BENCHMARK_BASE_URL", "https://tsecbench.zc.tencent.com"),
+		BenchmarkToken:       os.Getenv("BENCHMARK_TOKEN"),
+		MaxConcurrent:        getenvInt("MAX_CONCURRENT_CHALLENGES", 3),
+		KillchainTimeLimitS:  getenvInt("KILLCHAIN_TIME_LIMIT_SECONDS", 2700),
+		TotalBudgetSeconds:   getenvInt("TOTAL_BENCHMARK_BUDGET_SECONDS", 0),
+		MinRemainingToSpawnS: getenvInt("MIN_REMAINING_SECONDS_TO_SPAWN", 300),
+		MaxChallengeAttempts: getenvInt("MAX_CHALLENGE_ATTEMPTS", 3),
+		DeferRetryCooldownS:  getenvInt("DEFER_RETRY_COOLDOWN_SECONDS", 120),
+		AutoResumeIdleS:      getenvInt("AUTO_RESUME_IDLE_SECONDS", 240),
 	}
+}
+
+// PlatformBase returns the effective platform base URL (PLATFORM_URL overrides).
+func (s Settings) PlatformBase() string {
+	if s.PlatformURL != "" {
+		return s.PlatformURL
+	}
+	return s.BenchmarkURL
 }

@@ -10,16 +10,21 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/well-lzz/chronos/internal/blackboard"
 	"github.com/well-lzz/chronos/internal/config"
 	"github.com/well-lzz/chronos/internal/engagement"
+	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/report"
+	"github.com/well-lzz/chronos/internal/scheduler"
 	"github.com/well-lzz/chronos/internal/swarm"
 	"github.com/well-lzz/chronos/internal/traffic"
+	"github.com/well-lzz/chronos/internal/web"
 )
 
 type modelList []string
@@ -36,17 +41,20 @@ func main() {
 		models    modelList
 		noExec    bool
 		timeLimit int
+		webUI     bool
+		webHost   string
+		webPort   int
+		maxCh     int
 	)
-	flag.StringVar(&engPath, "engagement", "", "path to an engagement scope config (JSON)")
+	flag.StringVar(&engPath, "engagement", "", "run an Assessment engagement from a scope config (JSON)")
 	flag.Var(&models, "model", "model spec, repeatable (default deepseek/deepseek-chat)")
 	flag.BoolVar(&noExec, "no-exec", false, "disable the run_python tool")
-	flag.IntVar(&timeLimit, "time-limit", 0, "wall-clock seconds for the mission (default from config)")
+	flag.IntVar(&timeLimit, "time-limit", 0, "per-mission wall-clock seconds (default from config)")
+	flag.BoolVar(&webUI, "web", false, "launch the web console alongside the scheduler")
+	flag.StringVar(&webHost, "web-host", "127.0.0.1", "web console host")
+	flag.IntVar(&webPort, "web-port", 8000, "web console port")
+	flag.IntVar(&maxCh, "max-challenges", 0, "concurrent challenge window (default from config, hard cap 3)")
 	flag.Parse()
-
-	if engPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: chronos --engagement <config.json>")
-		os.Exit(2)
-	}
 
 	cfg := config.Load()
 	if noExec {
@@ -55,16 +63,49 @@ func main() {
 	if timeLimit > 0 {
 		cfg.ChallengeTimeLimitS = timeLimit
 	}
+	if maxCh > 0 {
+		cfg.MaxConcurrent = maxCh
+	}
+	if cfg.MaxConcurrent > 3 {
+		cfg.MaxConcurrent = 3
+	}
 
 	specs := []string(models)
 	if len(specs) == 0 {
 		specs = []string{"deepseek/deepseek-chat"}
 	}
 
-	if err := runEngagement(cfg, engPath, specs); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	// Engagement mode: one authorized assessment, no platform/scheduler.
+	if engPath != "" {
+		if err := runEngagement(cfg, engPath, specs); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
 	}
+
+	// Otherwise run the mechanical scheduler against the TSec platform.
+	runScheduler(cfg, specs, webUI, webHost, webPort)
+}
+
+func runScheduler(cfg config.Settings, specs []string, webUI bool, webHost string, webPort int) {
+	pf := platform.NewTSec(cfg.PlatformBase(), cfg.BenchmarkToken)
+	sch := scheduler.New(pf, cfg, specs)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("chronos scheduler — platform %s, models %s, window %d\n",
+		cfg.PlatformBase(), strings.Join(specs, ", "), cfg.MaxConcurrent)
+	if webUI {
+		fmt.Printf("Web console → http://%s:%d (Ctrl+C to stop)\n", webHost, webPort)
+		go func() {
+			if err := web.Serve(sch, webHost, webPort); err != nil {
+				fmt.Fprintln(os.Stderr, "web console error:", err)
+			}
+		}()
+	}
+	sch.Run(ctx)
 }
 
 func runEngagement(cfg config.Settings, path string, specs []string) error {

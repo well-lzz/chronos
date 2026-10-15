@@ -1,6 +1,6 @@
-# Go 版本（Assessment 核心）
+# Go 版本
 
-把 chronos 的 **Assessment 核心**从 Python 迁到 Go。这一版聚焦"真实授权评估"主链路，**暂不含** TSecBench 平台适配器、机械调度器、Web 控制台（那三块是机械外壳，后续按需补）。
+把 chronos 从 Python 迁到 Go：**Assessment 核心**（真实授权评估主链路）**加机械外壳**（TSecBench 平台 + 机械调度器 + Web 控制台）。两种运行模式共用同一内核（scope / 黑板 / traffic / solver / swarm）。
 
 ## 为什么是 Go
 
@@ -26,11 +26,20 @@ go build -o chronos ./cmd/chronos
 ### CLI
 
 ```
-chronos --engagement <config.json>   # 跑一次授权评估
-  --model SPEC      模型规格，可重复（默认 deepseek/deepseek-chat）
-  --no-exec         关闭 run_python
-  --time-limit N    本次任务墙钟秒数（默认取配置）
+chronos                               # 默认：对 TSec 平台跑机械调度器
+chronos --web                         # 调度器 + Web 控制台（默认 http://127.0.0.1:8000）
+chronos --engagement <config.json>    # 一次真实授权评估（无平台/调度器）
+  --model SPEC         模型规格，可重复（默认 deepseek/deepseek-chat）
+  --no-exec            关闭 run_python
+  --time-limit N       单任务墙钟秒数（默认取配置）
+  --max-challenges N   并发窗口（默认取配置，硬上限 3）
+  --web-host/--web-port
 ```
+
+### 两条运行主链路
+
+- **调度器模式（默认）**：`platform`(TSec) → `poller`(轮询 new/solved 事件) → `scheduler`(按分值/难度填满并发窗口、deferred 滚动重试、全局预算、死锁自愈、平台判真即 kill 该 swarm) → 每题一个协作 `swarm`。`submit_flag` 经 swarm 去重 + 递增冷却 + 猜测熔断打到平台;flag 只是平台可判真的一种 Finding,不竞速。
+- **engagement 模式**：`--engagement` 跑单个多目标 mission,无 oracle,产物进黑板 + 本地报告。
 
 ### 环境变量
 
@@ -56,8 +65,12 @@ chronos --engagement <config.json>   # 跑一次授权评估
 - `report` — JSON + Markdown + HTML（含证据流量、验证历史）。
 - `nettools` — DoRawHTTP / DoTCPSend（纯 IO）。
 - `llm` — 模型规格 → go-openai 客户端 + 模型 id。
-- `solver` — 单 executor 的工具循环（function calling）：http/tcp/run_python + 黑板/流量工具。
-- `swarm` — 并行协作 executor（不竞速、互不取消），termination 钩子 + bump 兜底。
+- `solver` — 单 executor 的工具循环（function calling）：http/tcp/run_python + 黑板/流量工具；可选 SubmitFn（平台提交）与 Record（供 Web 观测）。
+- `swarm` — 并行协作 executor（不竞速、互不取消），termination 钩子 + bump 兜底；平台模式下负责 submit 去重/冷却/熔断，并暴露 Status/Activity/Pause/Bump 给控制台。
+- `platform` — 竞赛平台接口 + TSecBench REST 适配器（challenges/start/submit/hint/close，pull→meta）。直连、不走代理。
+- `poller` — 后台轮询，发 new/solved 事件。
+- `scheduler` — 机械调度器（无 LLM）：填窗口/reap/滚动重试/预算/死锁自愈/算子命令；平台判真即 kill。
+- `web` — 内嵌控制台（net/http + **SSE**，无 websocket 依赖）：`/`、`/api/state`、`/api/stream`、`/api/activity`、`POST /api/command`。前端用 EventSource。
 
 ## 与 Python 版的等价性
 
@@ -68,4 +81,4 @@ chronos --engagement <config.json>   # 跑一次授权评估
 
 ## 未实测边界
 
-沙箱内无 LLM Key / 目标网络，故**未跑真实模型与真实目标**。已验证：`go build ./...`、`go vet ./...`、`go test ./...`（scope/blackboard/traffic/engagement/report 单测）、engagement 空 scope 拒绝、全链路空跑产出报告、python 护栏实测（CIDR 内放行 / 越界拦截 / 内部不泄漏为全局）。
+沙箱内无 LLM Key / TSec VPN / 目标网络，故**未跑真实模型、真实平台与真实目标**。已验证：`go build ./...`、`go vet ./...`、`go test ./...`（scope/blackboard/traffic/engagement/report 单测）、engagement 空 scope 拒绝、engagement 全链路空跑产出报告、python 护栏实测（CIDR 内放行 / 越界拦截 / 内部不泄漏为全局）、Web 控制台起服务并返回 `/`、`/api/state`、`/api/command`。TSec 平台适配器与调度器针对不可达平台会干净地空转(轮询报错降级为空、不误判完成)。

@@ -1,0 +1,92 @@
+// Package web is the embedded console: live run visualization + operator
+// control + per-executor activity watch. Additive observability — the scheduler
+// and swarms are unchanged. State is read from the scheduler snapshot; operator
+// actions go through the same command queue. Live push uses SSE (stdlib only,
+// no websocket dependency).
+package web
+
+import (
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/well-lzz/chronos/internal/scheduler"
+)
+
+//go:embed index.html
+var indexHTML []byte
+
+// Serve starts the console HTTP server. It returns when ctx-independent: the
+// caller runs it in a goroutine and cancels the scheduler to stop the process.
+func Serve(sch *scheduler.Scheduler, host string, port int) error {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(indexHTML)
+	})
+
+	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, sch.Snapshot())
+	})
+
+	mux.HandleFunc("/api/activity", func(w http.ResponseWriter, r *http.Request) {
+		after, _ := strconv.Atoi(r.URL.Query().Get("after"))
+		ev := sch.Activity(r.URL.Query().Get("challenge"), r.URL.Query().Get("model"), after)
+		writeJSON(w, map[string]any{"events": ev})
+	})
+
+	mux.HandleFunc("/api/stream", func(w http.ResponseWriter, r *http.Request) {
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "stream unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			data, _ := json.Marshal(sch.Snapshot())
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			fl.Flush()
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+
+	mux.HandleFunc("/api/command", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var c scheduler.Command
+		if json.NewDecoder(r.Body).Decode(&c) != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		sch.Enqueue(c)
+		writeJSON(w, map[string]any{"ok": true})
+	})
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+	log.Printf("Web console on http://%s", addr)
+	return http.ListenAndServe(addr, mux)
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
