@@ -5,54 +5,26 @@ creds.json
 # Logs and traces
 logs/
 *.log
-*.jsonl
 
-# Challenge data (downloaded at runtime)
-challenges*/
+# Go
+/chronos
+*.test
+/vendor/
 
-# Python
+# Runtime state (blackboards, traffic, reports, workspaces)
+.chronos-state/
+
+# Python bytecode (defensive)
 __pycache__/
 *.pyc
-*.egg-info/
-dist/
-build/
-.venv/
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
-pytest-cache-files-*/
-.test-tmp/
-test-output/
-uv.lock
 
-# Runtime
-workspace/
-.ctf-state/
-codex-schema-*/
-.claude/scheduled_tasks.lock
+# Next.js front-end build artifacts (web/). The built static export is committed
+# at internal/web/dist (embedded into the binary); the raw build dirs are not.
+web/node_modules/
+web/.next/
+web/out/
 
-# Working debris from challenge runs (kept locally, never committed)
-/.playwright-mcp/
-/.test-tmp-*
-/_*
-/*.pkl
-/*.bin
-/bundle.js
-/cap*.png
-/cap*.txt
-/chunk_urls.txt
-/cid_bf.txt
-/coord_dump.txt
-/allchunks.txt
-/alljs2.txt
-/dash.html
-/install_page.js
-/ocrlib.py
-/p1.txt
-/p1panel.py
-/poc*.txt
-/session.txt
-/validator*
-/HSM.class
-/f2*_validator
-/f207.py
+# built binaries (reproducible via go build)
+chronos-macos
+chronos-linux
+/chronos
