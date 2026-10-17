@@ -19,6 +19,12 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 		return s.toolHTTP(ctx, argsJSON)
 	case "tcp_send":
 		return s.toolTCP(argsJSON)
+	case "dns_lookup":
+		return s.toolDNS(ctx, argsJSON)
+	case "port_scan":
+		return s.toolPortScan(ctx, argsJSON)
+	case "tls_inspect":
+		return s.toolTLS(ctx, argsJSON)
 	case "run_python":
 		return s.toolRunPython(ctx, argsJSON)
 	case "add_fact":
@@ -104,6 +110,65 @@ func (s *Solver) toolTCP(argsJSON string) string {
 	}
 	display := nettools.DoTCPSend(a.Host, a.Port, payload, 30*time.Second, 3*time.Second)
 	tid := s.tl.RecordTCP(a.Host, a.Port, a.Payload, a.PayloadHex, display, s.ModelSpec)
+	return display + fmt.Sprintf("\n[traffic %s — cite as evidence]", tid)
+}
+
+func (s *Solver) toolDNS(ctx context.Context, argsJSON string) string {
+	var a struct {
+		Host string `json:"host"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+		return "dns_lookup error: bad args"
+	}
+	if ok, msg := s.hostAllowed(a.Host); !ok {
+		return msg
+	}
+	display := nettools.DNSLookup(ctx, a.Host, 8*time.Second)
+	tid := s.tl.RecordProbe("dns", a.Host, "dns_lookup "+a.Host, display, s.ModelSpec)
+	return display + fmt.Sprintf("\n[traffic %s — cite as evidence]", tid)
+}
+
+func (s *Solver) toolPortScan(ctx context.Context, argsJSON string) string {
+	var a struct {
+		Host  string `json:"host"`
+		Ports string `json:"ports"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+		return "port_scan error: bad args"
+	}
+	if ok, msg := s.hostAllowed(a.Host); !ok {
+		return msg
+	}
+	ports, perr := nettools.ParsePorts(a.Ports)
+	if perr != "" {
+		return "port_scan error: " + perr
+	}
+	display := nettools.PortScan(ctx, a.Host, ports, 0)
+	req := "port_scan " + a.Host
+	if a.Ports != "" {
+		req += " ports=" + a.Ports
+	}
+	tid := s.tl.RecordProbe("portscan", a.Host, req, display, s.ModelSpec)
+	return display + fmt.Sprintf("\n[traffic %s — cite as evidence]", tid)
+}
+
+func (s *Solver) toolTLS(ctx context.Context, argsJSON string) string {
+	var a struct {
+		Host string `json:"host"`
+		Port int    `json:"port"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+		return "tls_inspect error: bad args"
+	}
+	if ok, msg := s.hostAllowed(a.Host); !ok {
+		return msg
+	}
+	display := nettools.TLSInspect(ctx, a.Host, a.Port, 0)
+	port := a.Port
+	if port == 0 {
+		port = 443
+	}
+	tid := s.tl.RecordProbe("tls", fmt.Sprintf("%s:%d", a.Host, port), "tls_inspect", display, s.ModelSpec)
 	return display + fmt.Sprintf("\n[traffic %s — cite as evidence]", tid)
 }
 

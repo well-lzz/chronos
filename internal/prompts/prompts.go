@@ -83,6 +83,10 @@ func BuildHeadlessPrompt(m mission.Meta, remainingSeconds int, allowExec bool) s
 	w("- `http_request(url, method, headers, body)`: full-control HTTP within scope. Each")
 	w("  response carries a `[traffic tN]` id — cite it as finding evidence.")
 	w("- `tcp_send(host, port, payload, payload_hex)`: one raw TCP exchange; also gives a traffic id.")
+	w("- `dns_lookup(host)`: resolve an in-scope host (A/AAAA/CNAME/MX/NS/TXT) or reverse-resolve an IP.")
+	w("- `port_scan(host, ports)`: TCP connect scan + banner grab (ports optional, e.g. \"22,80,8000-8100\").")
+	w("- `tls_inspect(host, port)`: TLS version/cipher/certificate, flags weak/expired/self-signed.")
+	w("  Start broad with these before assuming HTTP — map hosts, ports and services first.")
 	w("- `traffic_search(host, url_contains, body_contains, page)` / `traffic_get(traffic_id,")
 	w("  side, offset, length)`: search/read what you ALREADY captured instead of re-fetching.")
 	if allowExec {

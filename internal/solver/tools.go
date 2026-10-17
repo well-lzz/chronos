@@ -44,6 +44,18 @@ func toolDefs(allowExec, hasFlags bool) []openai.Tool {
 				"payload":     strProp("text payload (line protocols)"),
 				"payload_hex": strProp("hex payload (binary protocols)"),
 			}, "host", "port")},
+		{"dns_lookup", "Resolve an in-scope host (A/AAAA/CNAME/MX/NS/TXT) or reverse-resolve an in-scope IP. Returns a traffic id to cite.",
+			obj(map[string]any{"host": strProp("in-scope hostname or IP")}, "host")},
+		{"port_scan", "TCP connect scan of an in-scope host with light banner grab. ports: e.g. \"80,443,8000-8010\" (default: common top ports). Returns open ports + banners and a traffic id.",
+			obj(map[string]any{
+				"host":  strProp("in-scope host"),
+				"ports": strProp("comma/range list, e.g. 22,80,443,8000-8100 (optional)"),
+			}, "host")},
+		{"tls_inspect", "TLS handshake with an in-scope host:port; reports version, cipher, certificate and flags weak/expired/self-signed. Returns a traffic id.",
+			obj(map[string]any{
+				"host": strProp("in-scope host"),
+				"port": map[string]any{"type": "integer", "description": "default 443"},
+			}, "host")},
 		{"add_fact", "Record a confirmed fact about the target (world state).",
 			obj(map[string]any{"statement": strProp("the fact"), "evidence": strProp("optional evidence")}, "statement")},
 		{"add_finding", "Record a finding (a product of the search). Record candidates too (verified=false). Cite real traffic in evidence_refs.",

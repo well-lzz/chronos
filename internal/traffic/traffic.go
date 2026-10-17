@@ -116,6 +116,19 @@ func (l *Log) RecordTCP(host string, port int, payload, payloadHex, response, fo
 	return id
 }
 
+// RecordProbe stores one non-HTTP reconnaissance observation (dns / portscan /
+// tls) and returns its id, so findings can cite it like any other exchange.
+func (l *Log) RecordProbe(kind, target, request, response, foundBy string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	id := l.nextID()
+	ex := &Exchange{ID: id, Kind: kind, Target: clip(target, 600), Method: strings.ToUpper(kind),
+		RequestText: clip(request, 8000), Response: clip(response, 24000),
+		RespLen: len(response), FoundBy: foundBy, TS: now()}
+	l.store(ex)
+	return id
+}
+
 func (l *Log) store(ex *Exchange) {
 	l.byID[ex.ID] = ex
 	l.order = append(l.order, ex.ID)
