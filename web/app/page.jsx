@@ -55,9 +55,18 @@ function fmtTime(ts) {
   try { return new Date(ts * 1000).toLocaleTimeString(); } catch { return ""; }
 }
 
-function Tile({ label, value, kind }) {
+function Tile({ label, value, kind, onClick }) {
+  const className = `${s.tile} ${kind ? s[kind] : ""} ${onClick ? s.tileAction : ""}`;
+  if (onClick) {
+    return (
+      <button type="button" className={className} onClick={onClick}>
+        <b>{value ?? 0}</b>
+        <span>{label}</span>
+      </button>
+    );
+  }
   return (
-    <div className={`${s.tile} ${kind ? s[kind] : ""}`}>
+    <div className={className}>
       <b>{value ?? 0}</b>
       <span>{label}</span>
     </div>
@@ -73,6 +82,7 @@ export default function Console() {
   const [llm, setLlm] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showScope, setShowScope] = useState(false);
+  const [findingView, setFindingView] = useState(null);
   const [operatorReady, setOperatorReady] = useState(false);
   const [uiError, setUiError] = useState("");
   const afterRef = useRef(0);
@@ -159,6 +169,10 @@ export default function Console() {
   const send = async () => {
     const t = msg.trim();
     if (!t || !watch.c) return;
+    if (!operatorReady) {
+      setUiError("当前页面缺少操作员令牌。请使用 Chronos 启动日志中的 Authenticated operator console 地址重新打开。");
+      return;
+    }
     if (await cmd("chat", { message: t })) setMsg("");
   };
 
@@ -238,11 +252,20 @@ export default function Console() {
         <ScopeModal initial={state.engagement?.targets || []} onClose={() => setShowScope(false)} />
       )}
 
+      {findingView && (
+        <FindingsModal findings={findings} initial={findingView}
+          onClose={() => setFindingView(null)} />
+      )}
+
       <section className={s.tiles}>
-        <Tile label="确认 confirmed" value={sm.confirmed} kind="confirmed" />
-        <Tile label="疑似 suspected" value={sm.suspected} kind="suspected" />
-        <Tile label="失败 failed" value={sm.failed} kind="failed" />
-        <Tile label="findings" value={sm.findings} />
+        <Tile label="确认 confirmed" value={sm.confirmed} kind="confirmed"
+          onClick={() => setFindingView({ filter: "confirmed" })} />
+        <Tile label="疑似 suspected" value={sm.suspected} kind="suspected"
+          onClick={() => setFindingView({ filter: "suspected" })} />
+        <Tile label="失败 failed" value={sm.failed} kind="failed"
+          onClick={() => setFindingView({ filter: "failed" })} />
+        <Tile label="findings" value={sm.findings}
+          onClick={() => setFindingView({ filter: "all" })} />
         <Tile label="facts" value={sm.facts} />
         <Tile label="executors" value={agents.length} />
       </section>
@@ -338,11 +361,11 @@ export default function Console() {
           </div>
 
           <div className={s.inputBar}>
-            <input placeholder={watch.c ? (cur?.paused ? "与 Agent 对话（执行已暂停，动作将在 resume 后继续）" : "与 Agent 对话并下达指令…  (Enter 发送)") : "no executor to talk to"}
-              value={msg} disabled={!watch.c || !operatorReady}
+            <textarea rows={2} placeholder={watch.c ? (!operatorReady ? "可输入消息；发送前请使用已认证控制台地址打开页面" : cur?.paused ? "与 Agent 对话（执行已暂停，动作将在 resume 后继续）" : "与 Agent 对话并下达指令…  (Enter 发送，Shift+Enter 换行)") : "no executor to talk to"}
+              value={msg} disabled={!watch.c}
               onChange={(e) => setMsg(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") send(); }} />
-            <button className={s.send} onClick={send} disabled={!watch.c || !operatorReady || !msg.trim()}>发送</button>
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
+            <button className={s.send} onClick={send} disabled={!watch.c || !msg.trim()}>发送</button>
           </div>
         </main>
 
@@ -353,7 +376,8 @@ export default function Console() {
             {findings.length === 0 && <div className={s.empty}>no findings yet</div>}
             <div className={s.flist}>
               {findings.map((f) => (
-                <div key={f.id} className={s.finding}>
+                <button type="button" key={f.id} className={s.finding}
+                  onClick={() => setFindingView({ filter: "all", id: f.id })}>
                   <div className={s.frow}>
                     <span className={`${s.sev} ${s["sev_" + f.severity] || ""}`}>{f.severity}</span>
                     <span className={`${s.verdict} ${s["v_" + f.verdict] || ""}`}>{VERDICT_LABEL[f.verdict] || f.verdict}</span>
@@ -363,7 +387,7 @@ export default function Console() {
                     {f.target ? `${f.target} · ` : ""}{f.category || "—"}
                     {f.evidence > 0 ? ` · ${f.evidence} evidence` : ""}
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           </div>
@@ -386,6 +410,104 @@ export default function Console() {
         </aside>
       </div>
     </div>
+  );
+}
+
+function FindingsModal({ findings, initial, onClose }) {
+  const filter = initial?.filter || "all";
+  const filtered = useMemo(() => filter === "all" ? findings : findings.filter((finding) => finding.verdict === filter), [findings, filter]);
+  const [selectedId, setSelectedId] = useState(initial?.id || filtered[0]?.id || null);
+  const selected = filtered.find((finding) => finding.id === selectedId) || filtered[0] || null;
+
+  useEffect(() => {
+    if (!selected && filtered[0]) setSelectedId(filtered[0].id);
+  }, [filtered, selected]);
+
+  const title = filter === "all" ? "全部 Findings" : `${VERDICT_LABEL[filter] || filter} Findings`;
+  return (
+    <div className={s.overlay} onClick={onClose}>
+      <div className={`${s.modal} ${s.findingsModal}`} onClick={(event) => event.stopPropagation()}>
+        <div className={s.modalHead}>
+          <h2>{title} <span className={s.count}>{filtered.length}</span></h2>
+          <button onClick={onClose}>✕</button>
+        </div>
+        <div className={s.findingsDetailGrid}>
+          <div className={s.findingsNav}>
+            {filtered.length === 0 && <div className={s.empty}>当前分类暂无记录</div>}
+            {filtered.map((finding) => (
+              <button type="button" key={finding.id}
+                className={`${s.findingNavItem} ${selected?.id === finding.id ? s.findingNavActive : ""}`}
+                onClick={() => setSelectedId(finding.id)}>
+                <span className={`${s.sev} ${s["sev_" + finding.severity] || ""}`}>{finding.severity}</span>
+                <strong>{finding.title}</strong>
+                <small>{finding.id} · {VERDICT_LABEL[finding.verdict] || finding.verdict}</small>
+              </button>
+            ))}
+          </div>
+          <div className={s.findingDetail}>
+            {!selected && <div className={s.empty}>选择一条 Finding 查看详情</div>}
+            {selected && <FindingDetail finding={selected} />}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FindingDetail({ finding }) {
+  const verifications = finding.verifications || [];
+  const refs = finding.evidence_refs || [];
+  return (
+    <>
+      <div className={s.detailHead}>
+        <div>
+          <span className={`${s.sev} ${s["sev_" + finding.severity] || ""}`}>{finding.severity}</span>
+          <span className={`${s.verdict} ${s["v_" + finding.verdict] || ""}`}>{VERDICT_LABEL[finding.verdict] || finding.verdict}</span>
+        </div>
+        <h3>{finding.title}</h3>
+      </div>
+      <dl className={s.detailMeta}>
+        <div><dt>ID</dt><dd>{finding.id}</dd></div>
+        <div><dt>状态</dt><dd>{finding.status || finding.verdict}</dd></div>
+        <div><dt>目标</dt><dd>{finding.target || "—"}</dd></div>
+        <div><dt>分类</dt><dd>{finding.category || "—"}</dd></div>
+        <div><dt>发现者</dt><dd>{finding.found_by || "—"}</dd></div>
+        <div><dt>时间</dt><dd>{fmtTime(finding.verified_ts || finding.ts) || "—"}</dd></div>
+      </dl>
+      <DetailBlock title="证据 Evidence" value={finding.evidence_text} />
+      <DetailBlock title="复现步骤 Reproduction" value={finding.reproduction} />
+      <DetailBlock title="修复建议 Remediation" value={finding.remediation} />
+      {refs.length > 0 && (
+        <section className={s.detailBlock}>
+          <h4>证据引用 Evidence refs</h4>
+          <div className={s.refList}>{refs.map((ref, index) => (
+            <span key={`${ref.ref}-${ref.role}-${index}`}><b>{ref.ref}</b>{ref.role ? ` · ${ref.role}` : ""}{ref.note ? ` · ${ref.note}` : ""}</span>
+          ))}</div>
+        </section>
+      )}
+      {verifications.length > 0 && (
+        <section className={s.detailBlock}>
+          <h4>验证记录 Verifications</h4>
+          <div className={s.verificationList}>{verifications.map((verification, index) => (
+            <article key={`${verification.ts || index}-${index}`}>
+              <div><b>{verification.verdict}</b>{verification.by ? ` · ${verification.by}` : ""}{verification.ts ? ` · ${fmtTime(verification.ts)}` : ""}</div>
+              {verification.summary && <p>{verification.summary}</p>}
+              {verification.evidence && <pre>{verification.evidence}</pre>}
+            </article>
+          ))}</div>
+        </section>
+      )}
+    </>
+  );
+}
+
+function DetailBlock({ title, value }) {
+  if (!value) return null;
+  return (
+    <section className={s.detailBlock}>
+      <h4>{title}</h4>
+      <pre>{value}</pre>
+    </section>
   );
 }
 

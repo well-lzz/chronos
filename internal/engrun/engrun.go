@@ -46,7 +46,12 @@ func (r *Runner) Snapshot() map[string]any {
 		}
 		findings = append(findings, map[string]any{
 			"id": f.ID, "title": f.Title, "severity": f.Severity, "verdict": f.Verdict,
-			"target": target, "category": f.Category, "evidence": f.Evidence, "mission": meta.Name,
+			"status": f.Status, "target": target, "category": f.Category,
+			"evidence": f.Evidence, "evidence_text": f.EvidenceText,
+			"reproduction": f.Reproduction, "remediation": f.Remediation,
+			"found_by": f.FoundBy, "ts": f.TS, "verified_ts": f.VerifiedTS,
+			"evidence_refs": f.EvidenceRefs, "verifications": f.Verifications,
+			"mission": meta.Name,
 		})
 	}
 	console.SortFindings(findings)
