@@ -255,6 +255,9 @@ func runScheduler(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 
 	fmt.Printf("chronos scheduler — platform adapter %q (%s), models %s, window %d\n",
 		cfg.PlatformMode, cfg.PlatformBase(), strings.Join(specs, ", "), cfg.MaxConcurrent)
+	if usesDeepSeek(specs) && len(cfg.DeepSeekKeys) > 1 {
+		fmt.Printf("DeepSeek API key pool: %d keys (request-level round-robin; automatic failover enabled)\n", len(cfg.DeepSeekKeys))
+	}
 	if webUI {
 		fmt.Printf("Web console → http://%s:%d (Ctrl+C to stop)\n", webHost, webPort)
 		go func() {
@@ -264,6 +267,16 @@ func runScheduler(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 		}()
 	}
 	return sch.Run(ctx)
+}
+
+func usesDeepSeek(specs []string) bool {
+	for _, spec := range specs {
+		provider := strings.SplitN(strings.TrimSpace(spec), "/", 2)[0]
+		if provider == "" || provider == "deepseek" {
+			return true
+		}
+	}
+	return false
 }
 
 func runEngagement(cfg config.Settings, path string, specs []string, llmStore *llmconfig.Store, webUI bool, webHost string, webPort int) error {
