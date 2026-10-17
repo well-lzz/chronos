@@ -40,6 +40,8 @@ go env -w GOPROXY=direct GOSUMDB=off
 go build -o chronos ./cmd/chronos
 ```
 
+TSecBench 托管评测的镜像、离线预检、运行变量和提交材料见 [`docs/tsecbench-hosted.md`](docs/tsecbench-hosted.md)。执行 `./scripts/package-tsecbench.sh` 只会构建并导出镜像，不会启动评测。
+
 ## 运行
 
 ```bash
@@ -56,6 +58,13 @@ chronos --engagement examples/engagement.example.json --web
 ### 控制台：以「发现」为中心
 
 控制台不讲「题目解没解」——真实业务(渗透/漏挖/代审)没有 solved/unsolved/deferred，只有**发现的判定**：**确认 confirmed / 疑似 suspected / 失败 failed**(= 内核 verified / candidate+inconclusive / refuted 的呈现归并)。页面顶部是三类判定计数 + 发现总数 + facts + tokens;主体是发现列表(严重度 + 判定徽章 + 证据数);右侧是 executor 列表,点进去可实时看它的推理流并 pause/resume/kill/发指令。两种模式(scheduler / engagement)都用这套发现视图。
+
+启动后日志会额外打印一次带随机 `#operator=...` 片段的 **Authenticated operator console** 地址。只有从这个地址打开的浏览器会话可以发消息、暂停/恢复任务、修改模型或更新 Scope；普通 `http://127.0.0.1:8000` 页面保持只读。
+
+- **直接对话**：输入框会触发一个独立的无工具模型回合，Agent 必须给操作员文字回复；同一条消息同时进入执行队列。任务暂停时仍可对话，动作会等待恢复。
+- **Scope 设置**：engagement 控制台顶部的 `Scope` 按钮可替换当前授权主机/IP/URL/CIDR。更新立即应用到 HTTP、TCP 和 `run_python` 的结构性范围锁。
+- **边界不由聊天改变**：聊天或提示词永远不能扩大 Scope；超范围请求会被拒绝，必须由持有操作员令牌的人在 Scope 界面显式修改。
+- **安全启动**：带 `--web` 的 engagement 默认暂停；操作员检查或修改 Scope 后点击 `resume` 才开始自主执行。
 
 两条运行主链路共用同一内核（scope / 黑板 / traffic / solver / swarm）：
 
@@ -74,6 +83,7 @@ chronos [flags]
   --no-exec            关闭 run_python（兼容参数；默认已关闭）
   --time-limit N       单任务墙钟秒数（默认取配置）
   --max-challenges N   并发窗口（默认取配置，硬上限 3）
+  --preflight          仅离线检查配置，不访问平台、模型或题目
   --web                启动 Web 控制台
   --web-host/--web-port
 ```
@@ -88,6 +98,7 @@ chronos [flags]
 | `GLM_API_KEY` / `GLM_BASE_URL` / `GLM_MODEL_ID` | — / bigmodel v4 / `glm-4-plus` | |
 | `PLATFORM_MODE` | `tsec` | 平台适配器(内置仅 TSecBench;可自行扩展) |
 | `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN` | TSecBench / — | TSecBench 适配器的地址与令牌 |
+| `TSECBENCH_HOSTED` | `false` | 托管模式下自动把模型 Base URL 改写到 `*.tsecbench.gw` |
 | `CHRONOS_STATE_DIR` | `.chronos-state` | 黑板 / 流量 / 报告 / 工作区根目录 |
 | `MAX_CONCURRENT_CHALLENGES` | `3` | 并发窗口（硬上限 3） |
 | `CHALLENGE_TIME_LIMIT_SECONDS` | `1800` | 默认单任务墙钟预算 |
@@ -137,4 +148,4 @@ chronos [flags]
 
 ## 现状与边界
 
-未实测真实模型 / 真实平台 / 真实目标（需 DeepSeek Key、TSec VPN 与靶场网络）。已验证：`go build ./...`、`go vet ./...`、`go test ./...`（scope/blackboard/traffic/engagement/report 单测）、engagement 空 scope 拒绝、engagement 全链路空跑产出报告、Web 控制台起服务并返回各接口、`run_python` 护栏实测（CIDR 内放行 / 越界拦截 / 内部不泄漏为全局）。
+未启动真实 TSecBench 评测，也未访问真实赛题（需平台生成任务并由操作员明确开始）。适配层提供官方 API 契约测试、托管网关改写测试与离线 `--preflight`；其余已验证项包括 `go build ./...`、`go vet ./...`、`go test ./...`、engagement 空 scope 拒绝、报告生成、Web API 与 `run_python` Scope 护栏。

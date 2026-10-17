@@ -55,3 +55,11 @@ func TestInitialPollFailureIsReturned(t *testing.T) {
 		t.Fatalf("got %v, want %v", err, want)
 	}
 }
+
+func TestPriorityPrefersReusableContainer(t *testing.T) {
+	ready := platform.Challenge{Name: "ready", Value: 10, ContainerStatus: "available", ContainerAddr: []string{"10.0.0.1:80"}}
+	highScore := platform.Challenge{Name: "new", Value: 1000, ContainerStatus: "closed"}
+	if !priorityLess(ready, highScore) {
+		t.Fatal("an already-running container should be reused before starting a new one")
+	}
+}

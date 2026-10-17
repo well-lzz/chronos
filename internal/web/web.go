@@ -7,7 +7,10 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +41,10 @@ var distFS embed.FS
 func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host string, port int) error {
 	if !loopbackHost(host) {
 		return fmt.Errorf("web console refuses non-loopback host %q; use 127.0.0.1, ::1, or localhost", host)
+	}
+	operatorToken, err := newOperatorToken()
+	if err != nil {
+		return fmt.Errorf("generate operator token: %w", err)
 	}
 	mux := http.NewServeMux()
 
@@ -85,6 +92,9 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		if !authorizeOperator(w, r, operatorToken) {
+			return
+		}
 		var c struct {
 			Action    string `json:"action"`
 			Challenge string `json:"challenge"`
@@ -97,6 +107,41 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 		}
 		src.Command(c.Action, c.Challenge, c.Model, c.Message)
 		writeJSON(w, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/api/scope", func(w http.ResponseWriter, r *http.Request) {
+		controller, ok := src.(console.ScopeController)
+		if !ok {
+			writeJSON(w, console.ScopeConfig{Supported: false})
+			return
+		}
+		if r.Method == http.MethodGet {
+			writeJSON(w, controller.ScopeConfig())
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
+			return
+		}
+		if !authorizeOperator(w, r, operatorToken) {
+			return
+		}
+		var request struct {
+			Targets []string `json:"targets"`
+		}
+		if !decodeJSON(w, r, &request) {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if err := controller.UpdateScope(request.Targets); err != nil {
+			writeJSONStatus(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		response := controller.ScopeConfig()
+		writeJSON(w, map[string]any{
+			"ok": true, "supported": response.Supported, "editable": response.Editable,
+			"targets": response.Targets, "description": response.Description,
+		})
 	})
 
 	// Model settings: GET current (key never returned), POST to save, POST /test
@@ -116,6 +161,9 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 			http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
 			return
 		}
+		if !authorizeOperator(w, r, operatorToken) {
+			return
+		}
 		var p llmconfig.Profile
 		if !decodeJSON(w, r, &p) {
 			http.Error(w, "bad json", http.StatusBadRequest)
@@ -133,6 +181,9 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 	mux.HandleFunc("/api/llm/test", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if !authorizeOperator(w, r, operatorToken) {
 			return
 		}
 		if store == nil {
@@ -164,6 +215,7 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	log.Printf("Web console on http://%s", addr)
+	log.Printf("Authenticated operator console: http://%s/#operator=%s", addr, operatorToken)
 	server := &http.Server{
 		Addr: addr, Handler: protect(mux), ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
@@ -180,8 +232,33 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 	return nil
 }
 
+func newOperatorToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func authorizeOperator(w http.ResponseWriter, r *http.Request, expected string) bool {
+	provided := strings.TrimSpace(r.Header.Get("X-Chronos-Operator"))
+	if len(provided) != len(expected) || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		writeJSONStatus(w, http.StatusUnauthorized, map[string]any{
+			"ok": false, "error": "operator authorization required; reopen the authenticated console URL printed by Chronos",
+		})
+		return false
+	}
+	return true
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONStatus(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 

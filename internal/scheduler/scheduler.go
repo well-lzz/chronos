@@ -196,6 +196,10 @@ func (s *Scheduler) handleCommand(ctx context.Context, c Command) {
 		if r != nil {
 			r.sw.Bump(c.Model, c.Message)
 		}
+	case "chat":
+		if r != nil {
+			r.sw.Chat(c.Model, c.Message)
+		}
 	}
 }
 
@@ -277,6 +281,11 @@ func guessKillchain(m mission.Meta) bool {
 }
 
 func priorityLess(a, b platform.Challenge) bool {
+	aReady := a.ContainerStatus == "available" && len(a.ContainerAddr) > 0
+	bReady := b.ContainerStatus == "available" && len(b.ContainerAddr) > 0
+	if aReady != bReady {
+		return aReady
+	}
 	if a.Value != b.Value {
 		return a.Value > b.Value // higher score first
 	}
@@ -476,11 +485,8 @@ func (s *Scheduler) shutdown() {
 		runs = append(runs, r)
 	}
 	s.mu.Unlock()
-	for _, r := range runs {
-		select {
-		case <-r.done:
-		case <-time.After(10 * time.Second):
-		}
+	if s.poll != nil {
+		s.poll.Stop()
 	}
 	pullsDone := make(chan struct{})
 	go func() {
@@ -489,13 +495,22 @@ func (s *Scheduler) shutdown() {
 	}()
 	select {
 	case <-pullsDone:
-	case <-time.After(10 * time.Second):
+	case <-time.After(3 * time.Second):
 		log.Printf("Timed out waiting for pending platform pulls to stop")
 	}
-	if s.poll != nil {
-		s.poll.Stop()
-	}
 	s.pf.Close()
+	runsDone := make(chan struct{})
+	go func() {
+		for _, r := range runs {
+			<-r.done
+		}
+		close(runsDone)
+	}()
+	select {
+	case <-runsDone:
+	case <-time.After(8 * time.Second):
+		log.Printf("Timed out waiting for active swarms to stop")
+	}
 }
 
 func truncate(s string, n int) string {

@@ -87,8 +87,12 @@ func findingRow(mission string, f blackboard.FindingRow) map[string]any {
 	}
 	return map[string]any{
 		"id": mission + "/" + f.ID, "title": f.Title, "severity": f.Severity,
-		"verdict": f.Verdict, "target": target, "category": f.Category,
-		"evidence": f.Evidence, "mission": mission,
+		"status": f.Status, "verdict": f.Verdict, "target": target, "category": f.Category,
+		"evidence": f.Evidence, "evidence_text": f.EvidenceText,
+		"reproduction": f.Reproduction, "remediation": f.Remediation,
+		"found_by": f.FoundBy, "ts": f.TS, "verified_ts": f.VerifiedTS,
+		"evidence_refs": f.EvidenceRefs, "verifications": f.Verifications,
+		"mission": mission,
 	}
 }
 

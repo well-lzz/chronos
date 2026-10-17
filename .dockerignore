@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+.chronos-state
+dist
+logs
+*.log
+web/node_modules
+web/.next
+web/out
+chronos
+chronos-*

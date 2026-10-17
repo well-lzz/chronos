@@ -10,7 +10,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -49,6 +51,7 @@ func main() {
 		webHost   string
 		webPort   int
 		maxCh     int
+		preflight bool
 	)
 	flag.StringVar(&engPath, "engagement", "", "run an Assessment engagement from a scope config (JSON)")
 	flag.Var(&models, "model", "model spec, repeatable (default deepseek/deepseek-chat)")
@@ -59,6 +62,7 @@ func main() {
 	flag.StringVar(&webHost, "web-host", "127.0.0.1", "web console host")
 	flag.IntVar(&webPort, "web-port", 8000, "web console port")
 	flag.IntVar(&maxCh, "max-challenges", 0, "concurrent challenge window (default from config, hard cap 3)")
+	flag.BoolVar(&preflight, "preflight", false, "validate runtime configuration without contacting the platform or model")
 	flag.Parse()
 
 	// Convenience: load KEY=VALUE pairs from a .env in the working directory (and
@@ -99,6 +103,13 @@ func main() {
 			specs = []string{"deepseek/deepseek-chat"}
 		}
 	}
+	if preflight {
+		if err := runPreflight(cfg, specs, llmStore); err != nil {
+			fmt.Fprintln(os.Stderr, "preflight failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// Engagement mode: one authorized assessment, no platform/scheduler.
 	if engPath != "" {
@@ -114,6 +125,79 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func runPreflight(cfg config.Settings, specs []string, llmStore *llmconfig.Store) error {
+	var failures []string
+	base, err := url.Parse(cfg.PlatformBase())
+	if err != nil || base.Hostname() == "" || (base.Scheme != "http" && base.Scheme != "https") {
+		failures = append(failures, "BENCHMARK_BASE_URL/PLATFORM_URL must be an absolute HTTP(S) URL")
+	}
+	if strings.TrimSpace(cfg.BenchmarkToken) == "" {
+		failures = append(failures, "BENCHMARK_TOKEN is not configured")
+	}
+	if cfg.MaxConcurrent < 1 || cfg.MaxConcurrent > 3 {
+		failures = append(failures, "MAX_CONCURRENT_CHALLENGES must be between 1 and 3")
+	}
+
+	modelLabel, modelBase, modelKey := "", "", ""
+	if llmStore != nil && llmStore.Active() {
+		profile := llmStore.Get()
+		modelLabel, modelBase, modelKey = profile.Label(), profile.BaseURL, profile.APIKey
+		if cfg.TSecBenchHosted {
+			modelBase = config.TSecBenchGatewayURL(modelBase)
+		}
+	} else if len(specs) > 0 {
+		modelLabel = specs[0]
+		provider := strings.SplitN(specs[0], "/", 2)[0]
+		switch provider {
+		case "", "deepseek":
+			modelBase, modelKey = cfg.DeepSeekBaseURL, cfg.DeepSeekKey
+		case "qwen":
+			modelBase, modelKey = cfg.QwenBaseURL, cfg.QwenKey
+		case "glm":
+			modelBase, modelKey = cfg.GLMBaseURL, cfg.GLMKey
+		default:
+			failures = append(failures, fmt.Sprintf("unsupported environment model provider %q", provider))
+		}
+	}
+	if strings.TrimSpace(modelKey) == "" {
+		failures = append(failures, "the selected model API key is not configured")
+	}
+	if parsed, parseErr := url.Parse(modelBase); parseErr != nil || parsed.Hostname() == "" {
+		failures = append(failures, "the selected model base URL is invalid")
+	}
+	if cfg.TSecBenchHosted && !config.IsTSecBenchGatewayURL(modelBase) {
+		failures = append(failures, "the selected model endpoint is not routed through *.tsecbench.gw")
+	}
+
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		failures = append(failures, "state directory cannot be created: "+err.Error())
+	} else if f, err := os.CreateTemp(cfg.StateDir, ".preflight-*"); err != nil {
+		failures = append(failures, "state directory is not writable: "+err.Error())
+	} else {
+		name := f.Name()
+		_ = f.Close()
+		_ = os.Remove(name)
+	}
+	if cfg.AllowLocalExec {
+		if _, err := exec.LookPath("python3"); err != nil {
+			failures = append(failures, "ALLOW_LOCAL_EXEC is enabled but python3 is unavailable")
+		}
+	}
+
+	fmt.Println("Chronos preflight (offline; no evaluation was started)")
+	fmt.Printf("  Platform: %s (%s)\n", cfg.PlatformMode, cfg.PlatformBase())
+	fmt.Printf("  BENCHMARK_TOKEN: configured=%t\n", strings.TrimSpace(cfg.BenchmarkToken) != "")
+	fmt.Printf("  Hosted routing: %t\n", cfg.TSecBenchHosted)
+	fmt.Printf("  Model: %s (%s), key configured=%t\n", modelLabel, modelBase, strings.TrimSpace(modelKey) != "")
+	fmt.Printf("  Concurrency: %d/3; total budget: %ds\n", cfg.MaxConcurrent, cfg.TotalBudgetSeconds)
+	fmt.Printf("  Python tool: enabled=%t; state: %s\n", cfg.AllowLocalExec, cfg.StateDir)
+	if len(failures) > 0 {
+		return fmt.Errorf("%s", strings.Join(failures, "; "))
+	}
+	fmt.Println("  Result: ready")
+	return nil
 }
 
 // loadDotEnv reads simple KEY=VALUE lines from path and sets any that are not
@@ -210,6 +294,9 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 		Meta: meta, Scope: sc, ModelSpecs: specs, Settings: cfg, BB: bb, TL: tl, LLM: llmStore,
 	}
 	if webUI {
+		// Web engagements are operator-led: configure/review Scope and converse
+		// while paused, then explicitly resume autonomous execution.
+		sw.Pause()
 		runner := engrun.New(sw, bb, meta, cancel, deadline)
 		fmt.Printf("Web console → http://%s:%d (findings: confirmed/suspected/failed)\n\n", webHost, webPort)
 		go func() {
@@ -227,7 +314,7 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 	fmt.Printf("  Facts: %d   Sub-goals: %d   Tokens: %d\n", c["facts"], c["subgoals_total"], sw.TotalTokens())
 
 	rm := report.RunMeta{
-		Mode: "assessment", Goal: eng.Goal, Scope: sc.Describe(), Models: specs,
+		Mode: "assessment", Goal: eng.Goal, Scope: sw.CurrentScope().Describe(), Models: specs,
 		Started: started.Format("2006-01-02 15:04:05"), Ended: time.Now().Format("2006-01-02 15:04:05"),
 		DurationSeconds: int(time.Since(started).Seconds()),
 	}

@@ -381,14 +381,22 @@ func Verdict(status string) string {
 
 // FindingRow is the presentation view of one finding for a console snapshot.
 type FindingRow struct {
-	ID       string `json:"id"`
-	Title    string `json:"title"`
-	Severity string `json:"severity"`
-	Status   string `json:"status"`
-	Verdict  string `json:"verdict"`
-	Target   string `json:"target,omitempty"`
-	Category string `json:"category,omitempty"`
-	Evidence int    `json:"evidence"`
+	ID            string         `json:"id"`
+	Title         string         `json:"title"`
+	Severity      string         `json:"severity"`
+	Status        string         `json:"status"`
+	Verdict       string         `json:"verdict"`
+	Target        string         `json:"target,omitempty"`
+	Category      string         `json:"category,omitempty"`
+	Evidence      int            `json:"evidence"`
+	EvidenceText  string         `json:"evidence_text,omitempty"`
+	Reproduction  string         `json:"reproduction,omitempty"`
+	Remediation   string         `json:"remediation,omitempty"`
+	FoundBy       string         `json:"found_by,omitempty"`
+	TS            float64        `json:"ts"`
+	VerifiedTS    *float64       `json:"verified_ts,omitempty"`
+	EvidenceRefs  []EvidenceRef  `json:"evidence_refs,omitempty"`
+	Verifications []Verification `json:"verifications,omitempty"`
 }
 
 // FindingsPublic returns findings as presentation rows (verdict-labeled, sorted).
@@ -399,7 +407,10 @@ func (b *Blackboard) FindingsPublic() []FindingRow {
 		out = append(out, FindingRow{
 			ID: f.ID, Title: f.Title, Severity: f.Severity, Status: f.Status,
 			Verdict: Verdict(f.Status), Target: f.Target, Category: f.Category,
-			Evidence: len(f.EvidenceRefs),
+			Evidence: len(f.EvidenceRefs), EvidenceText: f.Evidence,
+			Reproduction: f.Reproduction, Remediation: f.Remediation, FoundBy: f.FoundBy,
+			TS: f.TS, VerifiedTS: f.VerifiedTS, EvidenceRefs: f.EvidenceRefs,
+			Verifications: f.Verifications,
 		})
 	}
 	return out

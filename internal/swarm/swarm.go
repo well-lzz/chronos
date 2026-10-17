@@ -37,7 +37,7 @@ import (
 type ActEvent struct {
 	Seq  int64  `json:"seq"`
 	Step int    `json:"step"`
-	Kind string `json:"kind"` // tool_call | tool_result | text | operator
+	Kind string `json:"kind"` // tool_call | tool_result | text | operator | assistant | status
 	Tool string `json:"tool,omitempty"`
 	Text string `json:"text"`
 }
@@ -65,6 +65,7 @@ type Swarm struct {
 	activity map[string][]ActEvent
 	status   map[string]string
 	lastErr  map[string]string // last surfaced error per spec (dedup consecutive)
+	runCtx   context.Context
 	paused   atomic.Bool
 	evSeq    int64 // monotonic activity cursor (atomic)
 
@@ -97,6 +98,9 @@ func (s *Swarm) init() {
 // carries the wall-clock budget. Returns the flag if any executor found one.
 func (s *Swarm) Run(ctx context.Context) string {
 	s.init()
+	s.mu.Lock()
+	s.runCtx = ctx
+	s.mu.Unlock()
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(time.Duration(s.Settings.ChallengeTimeLimitS) * time.Second)
@@ -114,7 +118,7 @@ func (s *Swarm) Run(ctx context.Context) string {
 		// operator fills in the model settings in the console.
 		resolve := func() (*openai.Client, string, error) {
 			if s.LLM != nil && s.LLM.Active() {
-				return llm.FromProfile(s.LLM.Get())
+				return llm.FromProfileWithSettings(s.LLM.Get(), s.Settings)
 			}
 			return llm.Resolve(sp, s.Settings)
 		}
@@ -361,6 +365,67 @@ func (s *Swarm) Status() map[string]any {
 
 func (s *Swarm) Pause()  { s.paused.Store(true) }
 func (s *Swarm) Resume() { s.paused.Store(false) }
+
+// UpdateScope atomically replaces the structural egress boundary for the swarm
+// and every live solver. Operator chat cannot call this method; only the
+// authenticated console scope endpoint can.
+func (s *Swarm) UpdateScope(next scope.Scope) {
+	s.mu.Lock()
+	s.Scope = next
+	s.Meta.ConnectionInfo = next.Describe()
+	solvers := make(map[string]*solver.Solver, len(s.solvers))
+	for spec, sv := range s.solvers {
+		solvers[spec] = sv
+	}
+	s.mu.Unlock()
+	for spec, sv := range solvers {
+		sv.SetScope(next)
+		s.emit(spec, 0, "status", "", "Scope updated by operator: "+next.Describe())
+	}
+}
+
+// CurrentScope returns the immutable current boundary snapshot.
+func (s *Swarm) CurrentScope() scope.Scope {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Scope
+}
+
+// Chat records a human turn, queues it for autonomous execution, and launches
+// a separate no-tools model turn that guarantees a direct conversational reply.
+func (s *Swarm) Chat(spec, message string) bool {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return false
+	}
+	if len(message) > 4000 {
+		message = message[:4000]
+	}
+	s.mu.Lock()
+	sv := s.solvers[spec]
+	ctx := s.runCtx
+	s.mu.Unlock()
+	if sv == nil {
+		return false
+	}
+	s.emit(spec, 0, "operator", "", message)
+	s.emit(spec, 0, "status", "", "已收到指令，Agent 正在回复；所有执行动作仍受当前 Scope 强制约束。")
+	sv.Guide(message)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func(paused bool) {
+		replyCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		reply, err := sv.ReplyToOperator(replyCtx, message, paused)
+		if err != nil {
+			s.emitErrorOnce(spec, 0, "Agent reply failed: "+err.Error())
+			return
+		}
+		s.emit(spec, 0, "assistant", "", reply)
+	}(s.paused.Load())
+	return true
+}
 
 // Bump injects operator guidance into one running executor and records it in the
 // activity stream so the console chat shows the human's message in order.

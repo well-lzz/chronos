@@ -26,15 +26,25 @@ const PRESETS = [
   { id: "custom", name: "自定义 Custom", base: "", model: "" },
 ];
 const KIND_LABEL = {
-  operator: "操作员", text: "推理", tool_call: "调用", tool_result: "结果", error: "错误",
+  operator: "操作员", assistant: "Agent 回复", status: "状态", text: "推理",
+  tool_call: "调用", tool_result: "结果", error: "错误",
 };
+
+const OPERATOR_TOKEN_KEY = "chronos.operator.token";
+
+function operatorFetch(url, options = {}) {
+  const token = typeof window === "undefined" ? "" : sessionStorage.getItem(OPERATOR_TOKEN_KEY) || "";
+  const headers = new Headers(options.headers || {});
+  if (token) headers.set("X-Chronos-Operator", token);
+  return fetch(url, { ...options, headers });
+}
 
 // flatten swarms{name:{agents:{spec:{...}}}} → [{challenge,model,status,steps,paused}]
 function flattenAgents(swarms) {
   const out = [];
   for (const [name, st] of Object.entries(swarms || {})) {
     for (const [m, a] of Object.entries(st.agents || {})) {
-      out.push({ challenge: name, model: m, status: a.status, steps: a.steps || 0, paused: !!st.paused });
+      out.push({ challenge: name, model: m, status: st.paused ? "paused" : a.status, steps: a.steps || 0, paused: !!st.paused });
     }
   }
   return out;
@@ -45,9 +55,18 @@ function fmtTime(ts) {
   try { return new Date(ts * 1000).toLocaleTimeString(); } catch { return ""; }
 }
 
-function Tile({ label, value, kind }) {
+function Tile({ label, value, kind, onClick }) {
+  const className = `${s.tile} ${kind ? s[kind] : ""} ${onClick ? s.tileAction : ""}`;
+  if (onClick) {
+    return (
+      <button type="button" className={className} onClick={onClick}>
+        <b>{value ?? 0}</b>
+        <span>{label}</span>
+      </button>
+    );
+  }
   return (
-    <div className={`${s.tile} ${kind ? s[kind] : ""}`}>
+    <div className={className}>
       <b>{value ?? 0}</b>
       <span>{label}</span>
     </div>
@@ -62,10 +81,24 @@ export default function Console() {
   const [connected, setConnected] = useState(false);
   const [llm, setLlm] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showScope, setShowScope] = useState(false);
+  const [findingView, setFindingView] = useState(null);
+  const [operatorReady, setOperatorReady] = useState(false);
+  const [uiError, setUiError] = useState("");
   const afterRef = useRef(0);
   const logRef = useRef(null);
   const watchRef = useRef(watch);
   watchRef.current = watch;
+
+  useEffect(() => {
+    const prefix = "#operator=";
+    if (window.location.hash.startsWith(prefix)) {
+      const token = decodeURIComponent(window.location.hash.slice(prefix.length));
+      if (token) sessionStorage.setItem(OPERATOR_TOKEN_KEY, token);
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+    setOperatorReady(!!sessionStorage.getItem(OPERATOR_TOKEN_KEY));
+  }, []);
 
   // live snapshot stream
   useEffect(() => {
@@ -115,20 +148,32 @@ export default function Console() {
 
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [events]);
 
-  const cmd = useCallback((action, extra) => {
+  const cmd = useCallback(async (action, extra) => {
     const w = watchRef.current;
-    fetch("/api/command", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, challenge: w.c, model: w.m, ...(extra || {}) }),
-    }).catch(() => {});
+    try {
+      const response = await operatorFetch("/api/command", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, challenge: w.c, model: w.m, ...(extra || {}) }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || result.ok === false) throw new Error(result.error || `HTTP ${response.status}`);
+      setUiError("");
+      return true;
+    } catch (error) {
+      setUiError(String(error));
+      return false;
+    }
   }, []);
 
   const pickWatch = (c, m) => { setWatch({ c, m }); setEvents([]); afterRef.current = 0; };
-  const send = () => {
+  const send = async () => {
     const t = msg.trim();
     if (!t || !watch.c) return;
-    cmd("bump", { message: t });           // appears in the timeline as an operator turn
-    setMsg("");
+    if (!operatorReady) {
+      setUiError("当前页面缺少操作员令牌。请使用 Chronos 启动日志中的 Authenticated operator console 地址重新打开。");
+      return;
+    }
+    if (await cmd("chat", { message: t })) setMsg("");
   };
 
   const sm = state.summary || {};
@@ -175,6 +220,9 @@ export default function Console() {
           {scope && <span className={s.scope} title={scope}>scope: {scope}</span>}
           {sm.budget_left_min != null && sm.budget_left_min >= 0 && <span>budget {sm.budget_left_min}min</span>}
           <span>{(sm.tokens || 0).toLocaleString()} tokens</span>
+          {state.engagement?.scope_editable && (
+            <button className={s.gear} onClick={() => setShowScope(true)} title="授权范围 Scope">◎ Scope</button>
+          )}
           <button className={s.gear} onClick={() => { loadLlm(); setShowSettings(true); }} title="模型设置 Model settings">
             ⚙ {llm && llm.model ? llm.model : "模型设置"}
           </button>
@@ -187,16 +235,37 @@ export default function Console() {
         </div>
       )}
 
+      {!operatorReady && (
+        <div className={s.banner}>
+          ⚠ 当前页面没有操作员令牌，只能查看。请使用 Chronos 启动日志中的 “Authenticated operator console” 地址重新打开。
+        </div>
+      )}
+
+      {uiError && <div className={s.banner}>⚠ {uiError}</div>}
+
       {showSettings && (
         <SettingsModal initial={llm} onClose={() => setShowSettings(false)}
           onSaved={() => { loadLlm(); }} />
       )}
 
+      {showScope && (
+        <ScopeModal initial={state.engagement?.targets || []} onClose={() => setShowScope(false)} />
+      )}
+
+      {findingView && (
+        <FindingsModal findings={findings} initial={findingView}
+          onClose={() => setFindingView(null)} />
+      )}
+
       <section className={s.tiles}>
-        <Tile label="确认 confirmed" value={sm.confirmed} kind="confirmed" />
-        <Tile label="疑似 suspected" value={sm.suspected} kind="suspected" />
-        <Tile label="失败 failed" value={sm.failed} kind="failed" />
-        <Tile label="findings" value={sm.findings} />
+        <Tile label="确认 confirmed" value={sm.confirmed} kind="confirmed"
+          onClick={() => setFindingView({ filter: "confirmed" })} />
+        <Tile label="疑似 suspected" value={sm.suspected} kind="suspected"
+          onClick={() => setFindingView({ filter: "suspected" })} />
+        <Tile label="失败 failed" value={sm.failed} kind="failed"
+          onClick={() => setFindingView({ filter: "failed" })} />
+        <Tile label="findings" value={sm.findings}
+          onClick={() => setFindingView({ filter: "all" })} />
         <Tile label="facts" value={sm.facts} />
         <Tile label="executors" value={agents.length} />
       </section>
@@ -243,7 +312,7 @@ export default function Console() {
             </div>
             {behavior.total > 0 && (
               <div className={s.kinds}>
-                {["text", "tool_call", "tool_result", "operator"].map((k) =>
+                {["assistant", "status", "text", "tool_call", "tool_result", "operator"].map((k) =>
                   behavior.kinds[k] ? <span key={k} className={s[`k_${k}`]}>{KIND_LABEL[k]} {behavior.kinds[k]}</span> : null
                 )}
               </div>
@@ -267,9 +336,9 @@ export default function Console() {
               </select>
             </div>
             <div className={s.ctrls}>
-              <button onClick={() => cmd("pause")} disabled={!watch.c}>pause</button>
-              <button onClick={() => cmd("resume")} disabled={!watch.c}>resume</button>
-              <button className={s.kill} onClick={() => cmd("kill")} disabled={!watch.c}>kill</button>
+              <button onClick={() => cmd("pause")} disabled={!watch.c || !operatorReady}>pause</button>
+              <button onClick={() => cmd("resume")} disabled={!watch.c || !operatorReady}>resume</button>
+              <button className={s.kill} onClick={() => cmd("kill")} disabled={!watch.c || !operatorReady}>kill</button>
             </div>
           </div>
 
@@ -292,10 +361,10 @@ export default function Console() {
           </div>
 
           <div className={s.inputBar}>
-            <input placeholder={watch.c ? "给 Agent 下达指令…  (Enter 发送)" : "no executor to talk to"}
+            <textarea rows={2} placeholder={watch.c ? (!operatorReady ? "可输入消息；发送前请使用已认证控制台地址打开页面" : cur?.paused ? "与 Agent 对话（执行已暂停，动作将在 resume 后继续）" : "与 Agent 对话并下达指令…  (Enter 发送，Shift+Enter 换行)") : "no executor to talk to"}
               value={msg} disabled={!watch.c}
               onChange={(e) => setMsg(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") send(); }} />
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
             <button className={s.send} onClick={send} disabled={!watch.c || !msg.trim()}>发送</button>
           </div>
         </main>
@@ -307,7 +376,8 @@ export default function Console() {
             {findings.length === 0 && <div className={s.empty}>no findings yet</div>}
             <div className={s.flist}>
               {findings.map((f) => (
-                <div key={f.id} className={s.finding}>
+                <button type="button" key={f.id} className={s.finding}
+                  onClick={() => setFindingView({ filter: "all", id: f.id })}>
                   <div className={s.frow}>
                     <span className={`${s.sev} ${s["sev_" + f.severity] || ""}`}>{f.severity}</span>
                     <span className={`${s.verdict} ${s["v_" + f.verdict] || ""}`}>{VERDICT_LABEL[f.verdict] || f.verdict}</span>
@@ -317,7 +387,7 @@ export default function Console() {
                     {f.target ? `${f.target} · ` : ""}{f.category || "—"}
                     {f.evidence > 0 ? ` · ${f.evidence} evidence` : ""}
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           </div>
@@ -338,6 +408,153 @@ export default function Console() {
             </div>
           </div>
         </aside>
+      </div>
+    </div>
+  );
+}
+
+function FindingsModal({ findings, initial, onClose }) {
+  const filter = initial?.filter || "all";
+  const filtered = useMemo(() => filter === "all" ? findings : findings.filter((finding) => finding.verdict === filter), [findings, filter]);
+  const [selectedId, setSelectedId] = useState(initial?.id || filtered[0]?.id || null);
+  const selected = filtered.find((finding) => finding.id === selectedId) || filtered[0] || null;
+
+  useEffect(() => {
+    if (!selected && filtered[0]) setSelectedId(filtered[0].id);
+  }, [filtered, selected]);
+
+  const title = filter === "all" ? "全部 Findings" : `${VERDICT_LABEL[filter] || filter} Findings`;
+  return (
+    <div className={s.overlay} onClick={onClose}>
+      <div className={`${s.modal} ${s.findingsModal}`} onClick={(event) => event.stopPropagation()}>
+        <div className={s.modalHead}>
+          <h2>{title} <span className={s.count}>{filtered.length}</span></h2>
+          <button onClick={onClose}>✕</button>
+        </div>
+        <div className={s.findingsDetailGrid}>
+          <div className={s.findingsNav}>
+            {filtered.length === 0 && <div className={s.empty}>当前分类暂无记录</div>}
+            {filtered.map((finding) => (
+              <button type="button" key={finding.id}
+                className={`${s.findingNavItem} ${selected?.id === finding.id ? s.findingNavActive : ""}`}
+                onClick={() => setSelectedId(finding.id)}>
+                <span className={`${s.sev} ${s["sev_" + finding.severity] || ""}`}>{finding.severity}</span>
+                <strong>{finding.title}</strong>
+                <small>{finding.id} · {VERDICT_LABEL[finding.verdict] || finding.verdict}</small>
+              </button>
+            ))}
+          </div>
+          <div className={s.findingDetail}>
+            {!selected && <div className={s.empty}>选择一条 Finding 查看详情</div>}
+            {selected && <FindingDetail finding={selected} />}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FindingDetail({ finding }) {
+  const verifications = finding.verifications || [];
+  const refs = finding.evidence_refs || [];
+  return (
+    <>
+      <div className={s.detailHead}>
+        <div>
+          <span className={`${s.sev} ${s["sev_" + finding.severity] || ""}`}>{finding.severity}</span>
+          <span className={`${s.verdict} ${s["v_" + finding.verdict] || ""}`}>{VERDICT_LABEL[finding.verdict] || finding.verdict}</span>
+        </div>
+        <h3>{finding.title}</h3>
+      </div>
+      <dl className={s.detailMeta}>
+        <div><dt>ID</dt><dd>{finding.id}</dd></div>
+        <div><dt>状态</dt><dd>{finding.status || finding.verdict}</dd></div>
+        <div><dt>目标</dt><dd>{finding.target || "—"}</dd></div>
+        <div><dt>分类</dt><dd>{finding.category || "—"}</dd></div>
+        <div><dt>发现者</dt><dd>{finding.found_by || "—"}</dd></div>
+        <div><dt>时间</dt><dd>{fmtTime(finding.verified_ts || finding.ts) || "—"}</dd></div>
+      </dl>
+      <DetailBlock title="证据 Evidence" value={finding.evidence_text} />
+      <DetailBlock title="复现步骤 Reproduction" value={finding.reproduction} />
+      <DetailBlock title="修复建议 Remediation" value={finding.remediation} />
+      {refs.length > 0 && (
+        <section className={s.detailBlock}>
+          <h4>证据引用 Evidence refs</h4>
+          <div className={s.refList}>{refs.map((ref, index) => (
+            <span key={`${ref.ref}-${ref.role}-${index}`}><b>{ref.ref}</b>{ref.role ? ` · ${ref.role}` : ""}{ref.note ? ` · ${ref.note}` : ""}</span>
+          ))}</div>
+        </section>
+      )}
+      {verifications.length > 0 && (
+        <section className={s.detailBlock}>
+          <h4>验证记录 Verifications</h4>
+          <div className={s.verificationList}>{verifications.map((verification, index) => (
+            <article key={`${verification.ts || index}-${index}`}>
+              <div><b>{verification.verdict}</b>{verification.by ? ` · ${verification.by}` : ""}{verification.ts ? ` · ${fmtTime(verification.ts)}` : ""}</div>
+              {verification.summary && <p>{verification.summary}</p>}
+              {verification.evidence && <pre>{verification.evidence}</pre>}
+            </article>
+          ))}</div>
+        </section>
+      )}
+    </>
+  );
+}
+
+function DetailBlock({ title, value }) {
+  if (!value) return null;
+  return (
+    <section className={s.detailBlock}>
+      <h4>{title}</h4>
+      <pre>{value}</pre>
+    </section>
+  );
+}
+
+function ScopeModal({ initial, onClose }) {
+  const [value, setValue] = useState((initial || []).join("\n"));
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const save = async () => {
+    const targets = value.split(/[\n,]+/).map((item) => item.trim()).filter(Boolean);
+    setBusy(true); setResult(null);
+    try {
+      const response = await operatorFetch("/api/scope", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targets }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || body.ok === false) throw new Error(body.error || `HTTP ${response.status}`);
+      setResult({ ok: true, text: `Scope 已更新：${body.description}` });
+      setTimeout(onClose, 500);
+    } catch (error) {
+      setResult({ ok: false, text: String(error) });
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className={s.overlay} onClick={onClose}>
+      <div className={s.modal} onClick={(event) => event.stopPropagation()}>
+        <div className={s.modalHead}>
+          <h2>授权范围 Scope</h2>
+          <button onClick={onClose}>✕</button>
+        </div>
+        <p className={s.modalHint}>
+          每行填写一个获授权的主机、IP、URL 或 CIDR。保存会替换当前范围；Agent 的 HTTP、TCP 和本地脚本网络访问继续由后端强制校验，聊天内容不能扩大范围。
+        </p>
+        <label className={s.scopeField}>
+          <span>授权目标</span>
+          <textarea value={value} onChange={(event) => setValue(event.target.value)}
+            placeholder={"https://staging.example.com\n10.10.5.0/24\n192.0.2.10"} rows={8} />
+        </label>
+        {result && <div className={`${s.testMsg} ${result.ok ? s.testOk : s.testBad}`}>{result.text}</div>}
+        <div className={s.modalBtns}>
+          <span className={s.spacer} />
+          <button onClick={onClose} disabled={busy}>取消</button>
+          <button className={s.save} onClick={save} disabled={busy || !value.trim()}>保存并应用</button>
+        </div>
       </div>
     </div>
   );
@@ -364,7 +581,7 @@ function SettingsModal({ initial, onClose, onSaved }) {
   const save = async () => {
     setBusy(true); setTest(null);
     try {
-      const r = await fetch("/api/llm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
+      const r = await operatorFetch("/api/llm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
       const j = await r.json();
       if (j.ok === false) { setTest({ ok: false, error: j.error || "save failed" }); setBusy(false); return; }
       setApiKey(""); onSaved && onSaved(); onClose();
@@ -375,7 +592,7 @@ function SettingsModal({ initial, onClose, onSaved }) {
   const doTest = async () => {
     setBusy(true); setTest(null);
     try {
-      const r = await fetch("/api/llm/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
+      const r = await operatorFetch("/api/llm/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
       setTest(await r.json());
     } catch (e) { setTest({ ok: false, error: String(e) }); }
     setBusy(false);

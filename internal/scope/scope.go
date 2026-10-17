@@ -90,6 +90,12 @@ func (s Scope) Describe() string {
 	return strings.Join(s.raw, ", ")
 }
 
+// Entries returns the operator-provided scope entries in their original order.
+// The returned slice is a copy and can be safely exposed to the console.
+func (s Scope) Entries() []string {
+	return append([]string(nil), s.raw...)
+}
+
 // CIDRStrings returns the authorized networks as strings.
 func (s Scope) CIDRStrings() []string {
 	out := make([]string, 0, len(s.nets))
