@@ -6,8 +6,10 @@ package poller
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
 	"log"
-	"math/rand"
+	"math/big"
 	"sync"
 	"time"
 
@@ -49,17 +51,19 @@ func New(pf platform.Platform, interval, jitter time.Duration) *Poller {
 }
 
 // Start does a silent initial poll, then runs the background loop.
-func (p *Poller) Start(ctx context.Context) {
-	p.seed()
+func (p *Poller) Start(ctx context.Context) error {
+	if err := p.seed(); err != nil {
+		return err
+	}
 	log.Printf("Poller initialized: %d challenges, %d solved", len(p.known), len(p.solved))
 	go p.loop(ctx)
+	return nil
 }
 
-func (p *Poller) seed() {
+func (p *Poller) seed() error {
 	chs, solved, err := p.pf.FetchPollState()
 	if err != nil {
-		log.Printf("Initial poll error: %v", err)
-		return
+		return fmt.Errorf("initial platform poll: %w", err)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -68,6 +72,7 @@ func (p *Poller) seed() {
 		p.stubs[c.Name] = c
 	}
 	p.solved = solved
+	return nil
 }
 
 func (p *Poller) Stop() { p.stopOnce.Do(func() { close(p.stop) }) }
@@ -167,7 +172,12 @@ func (p *Poller) nextDelay() time.Duration {
 	if lo < 0 {
 		lo = 0
 	}
-	return lo + time.Duration(rand.Int63n(int64(2*j+1)))
+	span := int64(2*j + 1)
+	offset, err := rand.Int(rand.Reader, big.NewInt(span))
+	if err != nil {
+		return p.interval
+	}
+	return lo + time.Duration(offset.Int64())
 }
 
 func (p *Poller) loop(ctx context.Context) {

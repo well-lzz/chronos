@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,17 +49,18 @@ type SubmitFn func(flag string) (display string, confirmed, complete bool)
 
 // Options configures a Solver.
 type Options struct {
-	ModelSpec string
-	Model     string
-	Client    *openai.Client
-	Meta      mission.Meta
-	Scope     scope.Scope
-	BB        *blackboard.Blackboard
-	TL        *traffic.Log
-	AllowExec bool
-	Deadline  time.Time
-	Tokens    *int64
-	Notify    func(string)
+	ModelSpec   string
+	Model       string
+	Client      *openai.Client
+	Meta        mission.Meta
+	Scope       scope.Scope
+	BB          *blackboard.Blackboard
+	TL          *traffic.Log
+	AllowExec   bool
+	InsecureTLS bool
+	Deadline    time.Time
+	Tokens      *int64
+	Notify      func(string)
 	// SubmitFn, when set, makes submit_flag go to the platform; nil = record-only.
 	SubmitFn SubmitFn
 	// Record, when set, receives each step for live observation (web console).
@@ -75,12 +77,13 @@ type Solver struct {
 	Model     string
 	client    *openai.Client
 
-	meta      mission.Meta
-	scope     scope.Scope
-	bb        *blackboard.Blackboard
-	tl        *traffic.Log
-	allowExec bool
-	deadline  time.Time
+	meta        mission.Meta
+	scope       scope.Scope
+	bb          *blackboard.Blackboard
+	tl          *traffic.Log
+	allowExec   bool
+	insecureTLS bool
+	deadline    time.Time
 
 	messages     []openai.ChatCompletionMessage
 	started      bool
@@ -92,13 +95,14 @@ type Solver struct {
 	resolve      func() (*openai.Client, string, error)
 	lastFlag     string
 	flagComplete bool
+	messageMu    sync.Mutex
 }
 
 // New builds a solver from Options.
 func New(o Options) *Solver {
 	return &Solver{
 		ModelSpec: o.ModelSpec, Model: o.Model, client: o.Client, meta: o.Meta, scope: o.Scope,
-		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, deadline: o.Deadline, tokens: o.Tokens,
+		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, insecureTLS: o.InsecureTLS, deadline: o.Deadline, tokens: o.Tokens,
 		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record, resolve: o.Resolve,
 	}
 }
@@ -110,6 +114,8 @@ func (s *Solver) rec(kind, tool, text string) {
 }
 
 func (s *Solver) start() {
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
 	if s.started {
 		return
 	}
@@ -124,11 +130,31 @@ func (s *Solver) start() {
 
 // Bump injects sibling insights and prepares to resume.
 func (s *Solver) Bump(insights string) {
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
 	s.messages = append(s.messages, openai.ChatCompletionMessage{
 		Role: openai.ChatMessageRoleUser,
 		Content: "Your previous attempt did not finish. Insights from other executors (unverified — " +
 			"verify before trusting):\n\n" + insights + "\n\nContinue the search.",
 	})
+}
+
+func (s *Solver) appendMessage(message openai.ChatCompletionMessage) {
+	s.messageMu.Lock()
+	s.messages = append(s.messages, message)
+	s.messageMu.Unlock()
+}
+
+func (s *Solver) messageSnapshot() []openai.ChatCompletionMessage {
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
+	return append([]openai.ChatCompletionMessage(nil), s.messages...)
+}
+
+func (s *Solver) hasHistory() bool {
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
+	return len(s.messages) > 1
 }
 
 // RunUntilDoneOrGaveUp runs the tool loop until the model stops calling tools
@@ -154,13 +180,13 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 
 	// Prompt for this cycle, with the blackboard summary injected.
 	prompt := "Solve this task."
-	if len(s.messages) > 1 {
+	if s.hasHistory() {
 		prompt = "Continue solving."
 	}
 	if sum := s.bb.Summary(); sum != "" {
 		prompt = sum + "\n\n" + prompt
 	}
-	s.messages = append(s.messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: prompt})
+	s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: prompt})
 
 	calls := 0
 	for {
@@ -171,7 +197,7 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 			return Result{Status: StatusGaveUp, Findings: "time budget reached", StepCount: s.steps}
 		}
 		resp, err := s.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-			Model: s.Model, Messages: s.messages, Tools: tools,
+			Model: s.Model, Messages: s.messageSnapshot(), Tools: tools,
 		})
 		if err != nil {
 			if ctx.Err() != nil {
@@ -191,7 +217,7 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 			return Result{Status: StatusError, Findings: "empty LLM response", StepCount: s.steps}
 		}
 		msg := resp.Choices[0].Message
-		s.messages = append(s.messages, msg)
+		s.appendMessage(msg)
 
 		if len(msg.ToolCalls) == 0 {
 			// Final text, no tool calls: this cycle is done.
@@ -205,7 +231,7 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 			s.rec("tool_call", tc.Function.Name, tc.Function.Arguments)
 			result := s.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
 			s.rec("tool_result", tc.Function.Name, result)
-			s.messages = append(s.messages, openai.ChatCompletionMessage{
+			s.appendMessage(openai.ChatCompletionMessage{
 				Role: openai.ChatMessageRoleTool, ToolCallID: tc.ID, Content: result,
 			})
 			// A confirmed flag that completed the challenge ends this executor

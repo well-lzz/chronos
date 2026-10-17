@@ -76,7 +76,7 @@ func build(bb *blackboard.Blackboard, rm RunMeta) report {
 // RenderReports writes report.{json,md,html} into outDir, returns the paths.
 func RenderReports(bb *blackboard.Blackboard, outDir string, rm RunMeta) (map[string]string, error) {
 	r := build(bb, rm)
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return nil, err
 	}
 	paths := map[string]string{
@@ -88,13 +88,13 @@ func RenderReports(bb *blackboard.Blackboard, outDir string, rm RunMeta) (map[st
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(paths["json"], jsonData, 0o644); err != nil {
+	if err := os.WriteFile(paths["json"], jsonData, 0o600); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(paths["md"], []byte(renderMarkdown(r)), 0o644); err != nil {
+	if err := os.WriteFile(paths["md"], []byte(renderMarkdown(r)), 0o600); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(paths["html"], []byte(renderHTML(r)), 0o644); err != nil {
+	if err := os.WriteFile(paths["html"], []byte(renderHTML(r)), 0o600); err != nil {
 		return nil, err
 	}
 	return paths, nil

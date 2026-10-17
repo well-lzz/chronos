@@ -1,0 +1,57 @@
+package scheduler
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/well-lzz/chronos/internal/config"
+	"github.com/well-lzz/chronos/internal/mission"
+	"github.com/well-lzz/chronos/internal/platform"
+)
+
+type fakePlatform struct {
+	pollErr error
+}
+
+func (f *fakePlatform) FetchAllChallenges() ([]platform.Challenge, error) { return nil, f.pollErr }
+func (f *fakePlatform) FetchSolvedNames() (map[string]bool, error) {
+	return map[string]bool{}, f.pollErr
+}
+func (f *fakePlatform) FetchPollState() ([]platform.Challenge, map[string]bool, error) {
+	if f.pollErr != nil {
+		return nil, nil, f.pollErr
+	}
+	return []platform.Challenge{{Name: "slow"}}, map[string]bool{}, nil
+}
+func (f *fakePlatform) SubmitFlag(string, string) (platform.SubmitResult, error) {
+	return platform.SubmitResult{}, nil
+}
+func (f *fakePlatform) PullChallenge(ctx context.Context, _ platform.Challenge) (mission.Meta, error) {
+	<-ctx.Done()
+	return mission.Meta{}, ctx.Err()
+}
+func (f *fakePlatform) ReleaseChallenge(string) bool                  { return true }
+func (f *fakePlatform) CloseStaleContainers(map[string]bool) []string { return nil }
+func (f *fakePlatform) FetchHint(string) (string, error)              { return "", nil }
+func (f *fakePlatform) Close()                                        {}
+
+func TestGlobalBudgetCancelsPendingPullAndExits(t *testing.T) {
+	s := New(&fakePlatform{}, config.Settings{TotalBudgetSeconds: 1, MaxConcurrent: 1}, []string{"test/model"})
+	started := time.Now()
+	if err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("scheduler exceeded shutdown bound: %v", elapsed)
+	}
+}
+
+func TestInitialPollFailureIsReturned(t *testing.T) {
+	want := errors.New("platform unavailable")
+	s := New(&fakePlatform{pollErr: want}, config.Settings{}, nil)
+	if err := s.Run(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+}

@@ -25,7 +25,7 @@ func truncate(s string) string {
 }
 
 // DoRawHTTP sends a full-control HTTP request and returns a verbatim transcript.
-func DoRawHTTP(ctx context.Context, url, method string, headers map[string]string, body string, timeout time.Duration) string {
+func DoRawHTTP(ctx context.Context, url, method string, headers map[string]string, body string, timeout time.Duration, hostAllowed func(string) bool, insecureTLS bool) string {
 	url = strings.TrimSpace(url)
 	if url == "" {
 		return "http_request error: empty url"
@@ -49,9 +49,18 @@ func DoRawHTTP(ctx context.Context, url, method string, headers map[string]strin
 	}
 	client := &http.Client{
 		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			if hostAllowed == nil || !hostAllowed(req.URL.Hostname()) {
+				return fmt.Errorf("redirect blocked by scope lock: %q is not authorized", req.URL.Hostname())
+			}
+			return nil
+		},
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // targets use self-signed certs
-			Proxy:           nil,                                   // never route target traffic through any proxy
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecureTLS},
+			Proxy:           nil, // never route target traffic through any proxy
 		},
 	}
 	resp, err := client.Do(req)
@@ -84,7 +93,10 @@ func DoTCPSend(host string, port int, payload []byte, readTimeout, silence time.
 	if strings.TrimSpace(host) == "" {
 		return "tcp_send error: empty host"
 	}
-	addr := fmt.Sprintf("%s:%d", host, port)
+	if port < 1 || port > 65535 {
+		return fmt.Sprintf("tcp_send error: invalid port %d", port)
+	}
+	addr := net.JoinHostPort(strings.Trim(strings.TrimSpace(host), "[]"), fmt.Sprintf("%d", port))
 	conn, err := net.DialTimeout("tcp", addr, readTimeout)
 	if err != nil {
 		return fmt.Sprintf("tcp_send error: cannot connect to %s — %v", addr, err)

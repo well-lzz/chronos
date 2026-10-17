@@ -82,11 +82,11 @@ func (s *Store) Set(p Profile) error {
 	if strings.TrimSpace(p.APIKey) == "" {
 		p.APIKey = s.p.APIKey // preserve existing secret
 	}
-	s.p = p
 	if s.path == "" {
+		s.p = p
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(p, "", "  ")
@@ -97,7 +97,12 @@ func (s *Store) Set(p Profile) error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	s.p = p
+	return nil
 }
 
 // Public is the console-safe view: the key itself is never returned, only

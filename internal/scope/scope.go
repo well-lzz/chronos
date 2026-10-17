@@ -113,6 +113,9 @@ func normalizeHost(token string) string {
 	if i := strings.IndexByte(t, '/'); i >= 0 {
 		t = t[:i] // drop any path
 	}
+	if host, _, err := net.SplitHostPort(t); err == nil {
+		t = host
+	}
 	t = strings.Trim(t, "[]")
 	// Strip a trailing :port only for a single-colon (IPv4/hostname) value.
 	if strings.Count(t, ":") == 1 {

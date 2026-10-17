@@ -13,6 +13,7 @@ type Settings struct {
 	MaxBumps            int
 	SolverRetryDelayS   float64
 	AllowLocalExec      bool
+	TargetInsecureTLS   bool
 
 	// Platform + scheduler (mechanical shell). The platform is a pluggable work
 	// source; TSecBench is one adapter (PlatformMode="tsec"), not a hard binding.
@@ -20,6 +21,7 @@ type Settings struct {
 	PlatformURL          string
 	BenchmarkURL         string
 	BenchmarkToken       string
+	PlatformInsecureTLS  bool
 	MaxConcurrent        int
 	KillchainTimeLimitS  int
 	TotalBudgetSeconds   int
@@ -82,7 +84,8 @@ func Load() Settings {
 		ChallengeTimeLimitS: getenvInt("CHALLENGE_TIME_LIMIT_SECONDS", 1800),
 		MaxBumps:            getenvInt("MAX_BUMPS", 20),
 		SolverRetryDelayS:   getenvFloat("SOLVER_RETRY_DELAY_SECONDS", 2.0),
-		AllowLocalExec:      getenvBool("ALLOW_LOCAL_EXEC", true),
+		AllowLocalExec:      getenvBool("ALLOW_LOCAL_EXEC", false),
+		TargetInsecureTLS:   getenvBool("TARGET_INSECURE_TLS", false),
 
 		DeepSeekKey:     os.Getenv("DEEPSEEK_API_KEY"),
 		DeepSeekBaseURL: getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
@@ -96,6 +99,7 @@ func Load() Settings {
 		PlatformURL:          getenv("PLATFORM_URL", ""),
 		BenchmarkURL:         getenv("BENCHMARK_BASE_URL", "https://tsecbench.zc.tencent.com"),
 		BenchmarkToken:       os.Getenv("BENCHMARK_TOKEN"),
+		PlatformInsecureTLS:  getenvBool("PLATFORM_INSECURE_TLS", false),
 		MaxConcurrent:        getenvInt("MAX_CONCURRENT_CHALLENGES", 3),
 		KillchainTimeLimitS:  getenvInt("KILLCHAIN_TIME_LIMIT_SECONDS", 2700),
 		TotalBudgetSeconds:   getenvInt("TOTAL_BENCHMARK_BUDGET_SECONDS", 0),

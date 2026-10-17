@@ -2,6 +2,7 @@ package platform
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -33,14 +34,14 @@ type TSec struct {
 
 // NewTSec builds a TSec adapter. The HTTP client never uses an env proxy (the
 // platform is a direct domestic service reached over the VPN).
-func NewTSec(baseURL, token string) *TSec {
+func NewTSec(baseURL, token string, insecureTLS bool) *TSec {
 	return &TSec{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecureTLS},
 				Proxy:           nil,
 			},
 		},
@@ -50,7 +51,7 @@ func NewTSec(baseURL, token string) *TSec {
 	}
 }
 
-func (t *TSec) do(method, path string, params url.Values, body any) (json.RawMessage, int, error) {
+func (t *TSec) do(ctx context.Context, method, path string, params url.Values, body any) (json.RawMessage, int, error) {
 	u := t.BaseURL + "/" + strings.TrimLeft(path, "/")
 	if len(params) > 0 {
 		u += "?" + params.Encode()
@@ -60,7 +61,7 @@ func (t *TSec) do(method, path string, params url.Values, body any) (json.RawMes
 		b, _ := json.Marshal(body)
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, u, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -74,7 +75,10 @@ func (t *TSec) do(method, path string, params url.Values, body any) (json.RawMes
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if readErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read platform response: %w", readErr)
+	}
 	if resp.StatusCode >= 400 {
 		return data, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(data), 300))
 	}
@@ -104,19 +108,17 @@ type rawChallenge struct {
 }
 
 func (t *TSec) FetchAllChallenges() ([]Challenge, error) {
-	data, _, err := t.do("GET", "openapi/v1/challenges", nil, nil)
+	data, _, err := t.do(context.Background(), "GET", "openapi/v1/challenges", nil, nil)
 	if err != nil {
 		body := strings.ToLower(string(data))
 		if strings.Contains(body, "already finished") || strings.Contains(body, "task_not_found") {
 			return nil, fmt.Errorf("TSec task is not runnable: %s", truncate(string(data), 300))
 		}
-		log.Printf("TSec fetch_all_challenges failed: %v", err)
-		return nil, nil // degrade to empty for the poller
+		return nil, fmt.Errorf("TSec fetch challenges: %w", err)
 	}
 	var raw []rawChallenge
-	if json.Unmarshal(data, &raw) != nil {
-		log.Printf("TSec API returned non-list")
-		return nil, nil
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("TSec API returned invalid challenge data: %w", err)
 	}
 	out := make([]Challenge, 0, len(raw))
 	t.mu.Lock()
@@ -167,7 +169,10 @@ func (t *TSec) FetchPollState() ([]Challenge, map[string]bool, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	solved, _ := t.FetchSolvedNames()
+	solved, err := t.FetchSolvedNames()
+	if err != nil {
+		return nil, nil, err
+	}
 	return ch, solved, nil
 }
 
@@ -198,7 +203,7 @@ func (t *TSec) SubmitFlag(challengeName, flag string) (SubmitResult, error) {
 		return SubmitResult{Status: "unknown", Message: "not found",
 			Display: fmt.Sprintf("UNKNOWN — '%s' not found on platform", challengeName)}, nil
 	}
-	data, _, err := t.do("POST", "openapi/v1/challenges/submit", nil,
+	data, _, err := t.do(context.Background(), "POST", "openapi/v1/challenges/submit", nil,
 		map[string]string{"unique_code": ch.UniqueCode, "flag": strings.TrimSpace(flag)})
 	if err != nil {
 		var body struct {
@@ -245,10 +250,10 @@ func (t *TSec) SubmitFlag(challengeName, flag string) (SubmitResult, error) {
 		Progress: fmt.Sprintf("%d/%d flags", r.CorrectFlagCount, r.TotalFlagCount)}, nil
 }
 
-func (t *TSec) startChallenge(uniqueCode string) ([]string, error) {
+func (t *TSec) startChallenge(ctx context.Context, uniqueCode string) ([]string, error) {
 	var lastErr error
 	for attempt := 0; attempt < 6; attempt++ {
-		data, status, err := t.do("POST", "openapi/v1/challenges/start", url.Values{"unique_code": {uniqueCode}}, nil)
+		data, status, err := t.do(ctx, "POST", "openapi/v1/challenges/start", url.Values{"unique_code": {uniqueCode}}, nil)
 		if err == nil {
 			var resp struct {
 				ContainerAddr []string `json:"container_addr"`
@@ -263,7 +268,9 @@ func (t *TSec) startChallenge(uniqueCode string) ([]string, error) {
 		}
 		lastErr = err
 		if status == 409 && strings.Contains(strings.ToLower(string(data)), "max active") {
-			time.Sleep(time.Duration(4+attempt*2) * time.Second)
+			if !sleepContext(ctx, time.Duration(4+attempt*2)*time.Second) {
+				return nil, ctx.Err()
+			}
 			continue
 		}
 		return nil, err
@@ -274,7 +281,7 @@ func (t *TSec) startChallenge(uniqueCode string) ([]string, error) {
 func (t *TSec) closeChallenge(uniqueCode string) error {
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
-		_, status, err := t.do("POST", "openapi/v1/challenges/close", url.Values{"unique_code": {uniqueCode}}, nil)
+		_, status, err := t.do(context.Background(), "POST", "openapi/v1/challenges/close", url.Values{"unique_code": {uniqueCode}}, nil)
 		if err == nil {
 			t.mu.Lock()
 			delete(t.started, uniqueCode)
@@ -325,7 +332,7 @@ func (t *TSec) FetchHint(challengeName string) (string, error) {
 	if !ok || ch.UniqueCode == "" {
 		return "", nil
 	}
-	data, _, err := t.do("GET", "openapi/v1/challenges/hint", url.Values{"unique_code": {ch.UniqueCode}}, nil)
+	data, _, err := t.do(context.Background(), "GET", "openapi/v1/challenges/hint", url.Values{"unique_code": {ch.UniqueCode}}, nil)
 	if err != nil {
 		return "", err
 	}
@@ -338,7 +345,7 @@ func (t *TSec) FetchHint(challengeName string) (string, error) {
 
 // PullChallenge starts the container if needed and returns a mission.Meta with
 // the container address(es) in ConnectionInfo. Fails if no address appears.
-func (t *TSec) PullChallenge(ch Challenge) (mission.Meta, error) {
+func (t *TSec) PullChallenge(ctx context.Context, ch Challenge) (mission.Meta, error) {
 	addrs := ch.ContainerAddr
 	t.mu.Lock()
 	if len(addrs) == 0 {
@@ -349,11 +356,17 @@ func (t *TSec) PullChallenge(ch Challenge) (mission.Meta, error) {
 	t.mu.Unlock()
 
 	if len(addrs) == 0 && ch.UniqueCode != "" {
-		if a, err := t.startChallenge(ch.UniqueCode); err == nil && len(a) > 0 {
+		a, err := t.startChallenge(ctx, ch.UniqueCode)
+		if err != nil {
+			return mission.Meta{}, err
+		}
+		if len(a) > 0 {
 			addrs = a
 		}
 		for i := 0; len(addrs) == 0 && i < 10; i++ {
-			time.Sleep(3 * time.Second)
+			if !sleepContext(ctx, 3*time.Second) {
+				return mission.Meta{}, ctx.Err()
+			}
 			chs, err := t.FetchAllChallenges()
 			if err != nil {
 				continue
@@ -376,6 +389,17 @@ func (t *TSec) PullChallenge(ch Challenge) (mission.Meta, error) {
 		Name: ch.Name, Category: ch.Category, Description: ch.Description,
 		ConnectionInfo: strings.Join(addrs, ", "), FlagCount: ch.FlagCount,
 	}, nil
+}
+
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (t *TSec) Close() {}

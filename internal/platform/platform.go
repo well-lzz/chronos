@@ -6,6 +6,7 @@
 package platform
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/well-lzz/chronos/internal/mission"
@@ -16,10 +17,10 @@ import (
 // source, implement the Platform interface and register it here; the scheduler,
 // swarm and console are platform-agnostic. (Real engagements use no platform at
 // all — see the engagement path.)
-func New(mode, baseURL, token string) (Platform, error) {
+func New(mode, baseURL, token string, insecureTLS bool) (Platform, error) {
 	switch mode {
 	case "", "tsec", "tsecbench", "benchmark":
-		return NewTSec(baseURL, token), nil
+		return NewTSec(baseURL, token, insecureTLS), nil
 	default:
 		return nil, fmt.Errorf("unknown platform mode %q — register an adapter in platform.New", mode)
 	}
@@ -61,7 +62,7 @@ type Platform interface {
 	SubmitFlag(challengeName, flag string) (SubmitResult, error)
 	// PullChallenge starts the challenge's container if needed and returns a
 	// mission.Meta whose ConnectionInfo carries the container address(es).
-	PullChallenge(ch Challenge) (mission.Meta, error)
+	PullChallenge(ctx context.Context, ch Challenge) (mission.Meta, error)
 	ReleaseChallenge(challengeName string) bool
 	CloseStaleContainers(keep map[string]bool) []string
 	FetchHint(challengeName string) (string, error)

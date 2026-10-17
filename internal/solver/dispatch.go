@@ -80,8 +80,11 @@ func (s *Solver) toolHTTP(ctx context.Context, argsJSON string) string {
 	if ok, msg := s.hostAllowed(host); !ok {
 		return msg
 	}
-	display := nettools.DoRawHTTP(ctx, a.URL, a.Method, a.Headers, a.Body, 30*time.Second)
-	tid := s.tl.RecordHTTP(a.Method, a.URL, a.Headers, a.Body, display, s.ModelSpec)
+	display := nettools.DoRawHTTP(ctx, a.URL, a.Method, a.Headers, a.Body, 30*time.Second, s.scope.Allows, s.insecureTLS)
+	tid, err := s.tl.RecordHTTP(a.Method, a.URL, a.Headers, a.Body, display, s.ModelSpec)
+	if err != nil {
+		return display + "\ntraffic persistence error: " + err.Error()
+	}
 	return display + fmt.Sprintf("\n[traffic %s — cite as evidence with add_finding/verify_finding]", tid)
 }
 
@@ -103,7 +106,10 @@ func (s *Solver) toolTCP(argsJSON string) string {
 		return "tcp_send error: " + err.Error()
 	}
 	display := nettools.DoTCPSend(a.Host, a.Port, payload, 30*time.Second, 3*time.Second)
-	tid := s.tl.RecordTCP(a.Host, a.Port, a.Payload, a.PayloadHex, display, s.ModelSpec)
+	tid, err := s.tl.RecordTCP(a.Host, a.Port, a.Payload, a.PayloadHex, display, s.ModelSpec)
+	if err != nil {
+		return display + "\ntraffic persistence error: " + err.Error()
+	}
 	return display + fmt.Sprintf("\n[traffic %s — cite as evidence]", tid)
 }
 
@@ -115,7 +121,10 @@ func (s *Solver) toolAddFact(argsJSON string) string {
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return "add_fact error: bad args"
 	}
-	id := s.bb.AddFact(a.Statement, a.Evidence, s.ModelSpec)
+	id, err := s.bb.AddFact(a.Statement, a.Evidence, s.ModelSpec)
+	if err != nil {
+		return "add_fact persistence error: " + err.Error()
+	}
 	return "fact " + id + " recorded."
 }
 
@@ -144,11 +153,14 @@ func (s *Solver) toolAddFinding(argsJSON string) string {
 		status = blackboard.Verified
 	}
 	refs, warns := s.normalizeRefs(a.EvidenceRefs)
-	id := s.bb.AddFinding(blackboard.Finding{
+	id, err := s.bb.AddFinding(blackboard.Finding{
 		Title: a.Title, Severity: a.Severity, Target: a.Target, Category: a.Category,
 		Status: status, Evidence: a.Evidence, Reproduction: a.Reproduction,
 		FoundBy: s.ModelSpec, EvidenceRefs: refs,
 	})
+	if err != nil {
+		return "add_finding persistence error: " + err.Error()
+	}
 	msg := "finding " + id + " recorded"
 	if a.Verified {
 		msg += " (verified)."
@@ -188,7 +200,11 @@ func (s *Solver) toolVerifyFinding(argsJSON string) string {
 		return "verdict must be one of: reproduced, refuted, inconclusive."
 	}
 	refs, warns := s.normalizeRefs(a.EvidenceRefs)
-	if !s.bb.VerifyFinding(a.FindingID, status, a.Summary, a.Evidence, refs, s.ModelSpec) {
+	persisted, err := s.bb.VerifyFinding(a.FindingID, status, a.Summary, a.Evidence, refs, s.ModelSpec)
+	if err != nil {
+		return "verify_finding persistence error: " + err.Error()
+	}
+	if !persisted {
 		return "no finding " + a.FindingID + "."
 	}
 	msg := "finding " + a.FindingID + " -> " + status + "."
@@ -205,7 +221,11 @@ func (s *Solver) toolAddSubgoal(argsJSON string) string {
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return "add_subgoal error: bad args"
 	}
-	return "sub-goal " + s.bb.AddSubgoal(a.Description, s.ModelSpec) + " added."
+	id, err := s.bb.AddSubgoal(a.Description, s.ModelSpec)
+	if err != nil {
+		return "add_subgoal persistence error: " + err.Error()
+	}
+	return "sub-goal " + id + " added."
 }
 
 func (s *Solver) toolResolveSubgoal(argsJSON string) string {
@@ -216,7 +236,11 @@ func (s *Solver) toolResolveSubgoal(argsJSON string) string {
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return "resolve_subgoal error: bad args"
 	}
-	if s.bb.ResolveSubgoal(a.SubgoalID, a.Outcome) {
+	ok, err := s.bb.ResolveSubgoal(a.SubgoalID, a.Outcome)
+	if err != nil {
+		return "resolve_subgoal persistence error: " + err.Error()
+	}
+	if ok {
 		return "sub-goal " + a.SubgoalID + " resolved."
 	}
 	return "no sub-goal " + a.SubgoalID + "."
@@ -263,18 +287,22 @@ func (s *Solver) toolSubmitFlag(argsJSON string) string {
 		if confirmed {
 			s.lastFlag = a.Flag
 			s.flagComplete = complete
-			s.bb.AddFinding(blackboard.Finding{
+			if _, err := s.bb.AddFinding(blackboard.Finding{
 				Title: "flag: " + a.Flag, Target: s.meta.Name, Category: "flag",
 				Severity: "info", Status: blackboard.Verified, Evidence: display, FoundBy: s.ModelSpec,
-			})
+			}); err != nil {
+				return display + "\nflag persistence error: " + err.Error()
+			}
 		}
 		return display
 	}
 	s.lastFlag = a.Flag
 	s.flagComplete = true
-	s.bb.AddFinding(blackboard.Finding{
+	if _, err := s.bb.AddFinding(blackboard.Finding{
 		Title: "flag: " + a.Flag, Target: s.meta.Name, Category: "flag",
 		Severity: "info", Status: blackboard.Verified, Evidence: "submitted by model (no oracle)", FoundBy: s.ModelSpec,
-	})
+	}); err != nil {
+		return "flag persistence error: " + err.Error()
+	}
 	return "flag recorded as a verified finding: " + a.Flag
 }

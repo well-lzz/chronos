@@ -55,8 +55,8 @@ type Swarm struct {
 	Settings   config.Settings
 	BB         *blackboard.Blackboard
 	TL         *traffic.Log
-	Platform   platform.Platform  // nil = engagement (no oracle, record-only)
-	LLM        *llmconfig.Store   // operator-editable model profile; nil = env/flag only
+	Platform   platform.Platform // nil = engagement (no oracle, record-only)
+	LLM        *llmconfig.Store  // operator-editable model profile; nil = env/flag only
 
 	Tokens int64 // shared, mission-wide
 
@@ -79,14 +79,18 @@ type Swarm struct {
 }
 
 func (s *Swarm) init() {
+	s.mu.Lock()
 	s.solvers = map[string]*solver.Solver{}
 	s.activity = map[string][]ActEvent{}
 	s.status = map[string]string{}
 	s.lastErr = map[string]string{}
+	s.mu.Unlock()
+	s.subMu.Lock()
 	s.submitted = map[string]bool{}
 	s.submitCount = map[string]int{}
 	s.lastSubmit = map[string]time.Time{}
 	s.confirmed = map[string]bool{}
+	s.subMu.Unlock()
 }
 
 // Run launches one executor per model spec and waits for all to finish. ctx
@@ -120,7 +124,7 @@ func (s *Swarm) Run(ctx context.Context) string {
 		}
 		sv := solver.New(solver.Options{
 			ModelSpec: spec, Meta: s.Meta, Scope: s.Scope,
-			BB: s.BB, TL: s.TL, AllowExec: s.Settings.AllowLocalExec, Deadline: deadline,
+			BB: s.BB, TL: s.TL, AllowExec: s.Settings.AllowLocalExec, InsecureTLS: s.Settings.TargetInsecureTLS, Deadline: deadline,
 			Tokens: &s.Tokens, Notify: func(m string) { log.Printf("[%s/%s] %s", s.Meta.Name, sp, m) },
 			SubmitFn: submitFn, Record: s.recorder(spec), Resolve: resolve,
 		})

@@ -8,19 +8,19 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
 var pythonPath string
-var pythonChecked bool
+var pythonOnce sync.Once
 
 func pythonAvailable() bool {
-	if !pythonChecked {
-		pythonChecked = true
+	pythonOnce.Do(func() {
 		if p, err := exec.LookPath("python3"); err == nil {
 			pythonPath = p
 		}
-	}
+	})
 	return pythonPath != ""
 }
 
@@ -38,7 +38,7 @@ func decodePayload(payload, payloadHex string) ([]byte, error) {
 // drift-prevention guard, not an adversarial sandbox: determined code can still
 // reach raw handles via ctypes; real isolation needs an OS boundary.
 func guardPreamble(hosts, cidrs []string) string {
-	hj, _ := json.Marshal(append(hosts, "127.0.0.1", "localhost", "::1"))
+	hj, _ := json.Marshal(hosts)
 	cj, _ := json.Marshal(cidrs)
 	return fmt.Sprintf(`
 def _chronos_target_lock():
