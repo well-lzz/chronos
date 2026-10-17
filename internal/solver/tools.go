@@ -21,6 +21,11 @@ var evidenceRefsSchema = map[string]any{
 }
 
 func obj(props map[string]any, required ...string) map[string]any {
+	// required must always serialize as a JSON array, never null — strict schema
+	// validators (DeepSeek) reject "required": null for a no-required-fields tool.
+	if required == nil {
+		required = []string{}
+	}
 	return map[string]any{"type": "object", "properties": props, "required": required}
 }
 

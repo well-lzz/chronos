@@ -82,7 +82,9 @@ export default function Console() {
   useEffect(() => { loadLlm(); }, [loadLlm]);
 
   const agents = useMemo(() => flattenAgents(state.swarms), [state.swarms]);
-  const needsConfig = agents.some((a) => a.status === "needs-config") || (llm && llm.supported && !llm.active);
+  // Only flag a genuine config problem: an executor that resolve/auth-failed.
+  // A key supplied via env/.env leaves llm.active false yet works, so don't nag on that alone.
+  const needsConfig = agents.some((a) => a.status === "needs-config");
 
   // auto-attach to the first live executor so the dialogue works out of the box
   useEffect(() => {
