@@ -140,10 +140,10 @@ func runPreflight(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 		failures = append(failures, "MAX_CONCURRENT_CHALLENGES must be between 1 and 3")
 	}
 
-	modelLabel, modelBase, modelKey := "", "", ""
+	modelLabel, modelBase, modelKeyCount := "", "", 0
 	if llmStore != nil && llmStore.Active() {
 		profile := llmStore.Get()
-		modelLabel, modelBase, modelKey = profile.Label(), profile.BaseURL, profile.APIKey
+		modelLabel, modelBase, modelKeyCount = profile.Label(), profile.BaseURL, 1
 		if cfg.TSecBenchHosted {
 			modelBase = config.TSecBenchGatewayURL(modelBase)
 		}
@@ -152,16 +152,25 @@ func runPreflight(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 		provider := strings.SplitN(specs[0], "/", 2)[0]
 		switch provider {
 		case "", "deepseek":
-			modelBase, modelKey = cfg.DeepSeekBaseURL, cfg.DeepSeekKey
+			modelBase, modelKeyCount = cfg.DeepSeekBaseURL, len(cfg.DeepSeekKeys)
+			if modelKeyCount == 0 && strings.TrimSpace(cfg.DeepSeekKey) != "" {
+				modelKeyCount = 1
+			}
 		case "qwen":
-			modelBase, modelKey = cfg.QwenBaseURL, cfg.QwenKey
+			modelBase = cfg.QwenBaseURL
+			if strings.TrimSpace(cfg.QwenKey) != "" {
+				modelKeyCount = 1
+			}
 		case "glm":
-			modelBase, modelKey = cfg.GLMBaseURL, cfg.GLMKey
+			modelBase = cfg.GLMBaseURL
+			if strings.TrimSpace(cfg.GLMKey) != "" {
+				modelKeyCount = 1
+			}
 		default:
 			failures = append(failures, fmt.Sprintf("unsupported environment model provider %q", provider))
 		}
 	}
-	if strings.TrimSpace(modelKey) == "" {
+	if modelKeyCount == 0 {
 		failures = append(failures, "the selected model API key is not configured")
 	}
 	if parsed, parseErr := url.Parse(modelBase); parseErr != nil || parsed.Hostname() == "" {
@@ -190,7 +199,7 @@ func runPreflight(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 	fmt.Printf("  Platform: %s (%s)\n", cfg.PlatformMode, cfg.PlatformBase())
 	fmt.Printf("  BENCHMARK_TOKEN: configured=%t\n", strings.TrimSpace(cfg.BenchmarkToken) != "")
 	fmt.Printf("  Hosted routing: %t\n", cfg.TSecBenchHosted)
-	fmt.Printf("  Model: %s (%s), key configured=%t\n", modelLabel, modelBase, strings.TrimSpace(modelKey) != "")
+	fmt.Printf("  Model: %s (%s), keys configured=%d\n", modelLabel, modelBase, modelKeyCount)
 	fmt.Printf("  Concurrency: %d/3; total budget: %ds\n", cfg.MaxConcurrent, cfg.TotalBudgetSeconds)
 	fmt.Printf("  Python tool: enabled=%t; state: %s\n", cfg.AllowLocalExec, cfg.StateDir)
 	if len(failures) > 0 {

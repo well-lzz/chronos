@@ -36,6 +36,7 @@ type Settings struct {
 
 	// LLM providers (OpenAI-compatible). Base URLs have defaults; keys from env.
 	DeepSeekKey     string
+	DeepSeekKeys    []string
 	DeepSeekBaseURL string
 	QwenKey         string
 	QwenBaseURL     string
@@ -81,9 +82,29 @@ func getenvBool(key string, def bool) bool {
 	}
 }
 
+func uniqueNonEmpty(values ...string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		for _, item := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '\n' || r == '\r' }) {
+			item = strings.TrimSpace(item)
+			if item != "" && !seen[item] {
+				seen[item] = true
+				out = append(out, item)
+			}
+		}
+	}
+	return out
+}
+
 // Load reads settings from the environment.
 func Load() Settings {
 	hosted := getenvBool("TSECBENCH_HOSTED", false)
+	deepSeekKeys := uniqueNonEmpty(os.Getenv("DEEPSEEK_API_KEY"), os.Getenv("DEEPSEEK_API_KEY_2"), os.Getenv("DEEPSEEK_API_KEYS"))
+	deepSeekKey := ""
+	if len(deepSeekKeys) > 0 {
+		deepSeekKey = deepSeekKeys[0]
+	}
 	settings := Settings{
 		StateDir:            getenv("CHRONOS_STATE_DIR", getenv("STATE_DIR", ".chronos-state")),
 		ChallengeTimeLimitS: getenvInt("CHALLENGE_TIME_LIMIT_SECONDS", 1800),
@@ -92,7 +113,8 @@ func Load() Settings {
 		AllowLocalExec:      getenvBool("ALLOW_LOCAL_EXEC", false),
 		TargetInsecureTLS:   getenvBool("TARGET_INSECURE_TLS", false),
 
-		DeepSeekKey:     os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekKey:     deepSeekKey,
+		DeepSeekKeys:    deepSeekKeys,
 		DeepSeekBaseURL: getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
 		QwenKey:         os.Getenv("QWEN_API_KEY"),
 		QwenBaseURL:     getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),

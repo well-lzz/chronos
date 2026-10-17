@@ -46,7 +46,7 @@ chronos --engagement <config.json>    # 一次真实授权评估（无平台/调
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | — | DeepSeek Key（主） |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_API_KEY_2` | — | DeepSeek Key 池，逐请求轮询并自动故障切换 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | |
 | `QWEN_API_KEY` / `QWEN_BASE_URL` | — / dashscope 兼容端点 | |
 | `GLM_API_KEY` / `GLM_BASE_URL` / `GLM_MODEL_ID` | — / bigmodel v4 / `glm-4-plus` | |
