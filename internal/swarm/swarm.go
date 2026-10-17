@@ -118,7 +118,7 @@ func (s *Swarm) Run(ctx context.Context) string {
 		// operator fills in the model settings in the console.
 		resolve := func() (*openai.Client, string, error) {
 			if s.LLM != nil && s.LLM.Active() {
-				return llm.FromProfile(s.LLM.Get())
+				return llm.FromProfileWithSettings(s.LLM.Get(), s.Settings)
 			}
 			return llm.Resolve(sp, s.Settings)
 		}

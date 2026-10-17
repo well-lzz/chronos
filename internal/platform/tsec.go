@@ -58,7 +58,10 @@ func (t *TSec) do(ctx context.Context, method, path string, params url.Values, b
 	}
 	var rdr io.Reader
 	if body != nil {
-		b, _ := json.Marshal(body)
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, fmt.Errorf("encode platform request: %w", err)
+		}
 		rdr = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
@@ -107,6 +110,31 @@ type rawChallenge struct {
 	ContainerAddr    []string `json:"container_addr"`
 }
 
+type apiErrorBody struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func parseAPIError(data []byte) apiErrorBody {
+	var body apiErrorBody
+	_ = json.Unmarshal(data, &body)
+	return body
+}
+
+func isCapacityError(data []byte) bool {
+	body := parseAPIError(data)
+	if body.Code != "invalid_state" {
+		return false
+	}
+	message := strings.ToLower(body.Message + " " + string(data))
+	for _, marker := range []string{"max active", "capacity", "concurrent", "limit", "最多", "同时启动", "并发", "上限"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *TSec) FetchAllChallenges() ([]Challenge, error) {
 	data, _, err := t.do(context.Background(), "GET", "openapi/v1/challenges", nil, nil)
 	if err != nil {
@@ -123,6 +151,8 @@ func (t *TSec) FetchAllChallenges() ([]Challenge, error) {
 	out := make([]Challenge, 0, len(raw))
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.index = make(map[string]Challenge, len(raw))
+	t.solved = make(map[string]bool, len(raw))
 	for _, r := range raw {
 		name := r.Name
 		if name == "" {
@@ -206,11 +236,7 @@ func (t *TSec) SubmitFlag(challengeName, flag string) (SubmitResult, error) {
 	data, _, err := t.do(context.Background(), "POST", "openapi/v1/challenges/submit", nil,
 		map[string]string{"unique_code": ch.UniqueCode, "flag": strings.TrimSpace(flag)})
 	if err != nil {
-		var body struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		}
-		_ = json.Unmarshal(data, &body)
+		body := parseAPIError(data)
 		switch body.Code {
 		case "duplicate":
 			if ch.FlagCount > 1 {
@@ -231,7 +257,9 @@ func (t *TSec) SubmitFlag(challengeName, flag string) (SubmitResult, error) {
 		}
 	}
 	var r submitResp
-	_ = json.Unmarshal(data, &r)
+	if err := json.Unmarshal(data, &r); err != nil {
+		return SubmitResult{}, fmt.Errorf("TSec submit returned invalid data: %w", err)
+	}
 	if r.Correct {
 		complete := r.TotalFlagCount > 0 && r.CorrectFlagCount >= r.TotalFlagCount
 		if complete {
@@ -258,7 +286,9 @@ func (t *TSec) startChallenge(ctx context.Context, uniqueCode string) ([]string,
 			var resp struct {
 				ContainerAddr []string `json:"container_addr"`
 			}
-			_ = json.Unmarshal(data, &resp)
+			if err := json.Unmarshal(data, &resp); err != nil {
+				return nil, fmt.Errorf("TSec start returned invalid data: %w", err)
+			}
 			if len(resp.ContainerAddr) > 0 {
 				t.mu.Lock()
 				t.started[uniqueCode] = resp.ContainerAddr
@@ -267,7 +297,7 @@ func (t *TSec) startChallenge(ctx context.Context, uniqueCode string) ([]string,
 			return resp.ContainerAddr, nil
 		}
 		lastErr = err
-		if status == 409 && strings.Contains(strings.ToLower(string(data)), "max active") {
+		if status == 409 && isCapacityError(data) {
 			if !sleepContext(ctx, time.Duration(4+attempt*2)*time.Second) {
 				return nil, ctx.Err()
 			}
@@ -279,9 +309,15 @@ func (t *TSec) startChallenge(ctx context.Context, uniqueCode string) ([]string,
 }
 
 func (t *TSec) closeChallenge(uniqueCode string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return t.closeChallengeContext(ctx, uniqueCode)
+}
+
+func (t *TSec) closeChallengeContext(ctx context.Context, uniqueCode string) error {
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
-		_, status, err := t.do(context.Background(), "POST", "openapi/v1/challenges/close", url.Values{"unique_code": {uniqueCode}}, nil)
+		data, status, err := t.do(ctx, "POST", "openapi/v1/challenges/close", url.Values{"unique_code": {uniqueCode}}, nil)
 		if err == nil {
 			t.mu.Lock()
 			delete(t.started, uniqueCode)
@@ -289,10 +325,19 @@ func (t *TSec) closeChallenge(uniqueCode string) error {
 			return nil
 		}
 		lastErr = err
+		body := parseAPIError(data)
+		if status == http.StatusConflict && body.Code == "invalid_state" {
+			t.mu.Lock()
+			delete(t.started, uniqueCode)
+			t.mu.Unlock()
+			return nil
+		}
 		if status != 0 && status < 500 {
 			return err // terminal (e.g. already closed)
 		}
-		time.Sleep([]time.Duration{3, 8, 15}[min(attempt, 2)] * time.Second)
+		if !sleepContext(ctx, []time.Duration{2, 4, 8}[min(attempt, 2)]*time.Second) {
+			return ctx.Err()
+		}
 	}
 	return fmt.Errorf("TSec close %s failed: %w", uniqueCode, lastErr)
 }
@@ -385,6 +430,9 @@ func (t *TSec) PullChallenge(ctx context.Context, ch Challenge) (mission.Meta, e
 	if len(addrs) == 0 {
 		return mission.Meta{}, fmt.Errorf("TSec: container for %s did not become available — spawn aborted, retry later", ch.Name)
 	}
+	t.mu.Lock()
+	t.started[ch.UniqueCode] = append([]string(nil), addrs...)
+	t.mu.Unlock()
 	return mission.Meta{
 		Name: ch.Name, Category: ch.Category, Description: ch.Description,
 		ConnectionInfo: strings.Join(addrs, ", "), FlagCount: ch.FlagCount,
@@ -402,4 +450,26 @@ func sleepContext(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func (t *TSec) Close() {}
+func (t *TSec) Close() {
+	t.mu.Lock()
+	uniqueCodes := make([]string, 0, len(t.started))
+	for uniqueCode := range t.started {
+		uniqueCodes = append(uniqueCodes, uniqueCode)
+	}
+	t.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, uniqueCode := range uniqueCodes {
+		uniqueCode := uniqueCode
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := t.closeChallengeContext(ctx, uniqueCode); err != nil {
+				log.Printf("TSec shutdown close failed for %s: %v", uniqueCode, err)
+			}
+		}()
+	}
+	wg.Wait()
+}

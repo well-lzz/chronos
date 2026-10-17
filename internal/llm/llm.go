@@ -19,7 +19,17 @@ import (
 // operator-configured profile (base URL + key + model). This is the generic path
 // that lets the agent run on any mainstream provider.
 func FromProfile(p llmconfig.Profile) (*openai.Client, string, error) {
+	return FromProfileWithSettings(p, config.Settings{})
+}
+
+// FromProfileWithSettings applies runtime-specific endpoint routing before
+// building the client. In TSecBench hosted mode this prevents a console-saved
+// public endpoint from bypassing the competition gateway rewrite.
+func FromProfileWithSettings(p llmconfig.Profile, cfg config.Settings) (*openai.Client, string, error) {
 	base := strings.TrimSpace(p.BaseURL)
+	if cfg.TSecBenchHosted {
+		base = config.TSecBenchGatewayURL(base)
+	}
 	key := strings.TrimSpace(p.APIKey)
 	model := strings.TrimSpace(p.Model)
 	if base == "" {

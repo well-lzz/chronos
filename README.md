@@ -40,6 +40,8 @@ go env -w GOPROXY=direct GOSUMDB=off
 go build -o chronos ./cmd/chronos
 ```
 
+TSecBench 托管评测的镜像、离线预检、运行变量和提交材料见 [`docs/tsecbench-hosted.md`](docs/tsecbench-hosted.md)。执行 `./scripts/package-tsecbench.sh` 只会构建并导出镜像，不会启动评测。
+
 ## 运行
 
 ```bash
@@ -81,6 +83,7 @@ chronos [flags]
   --no-exec            关闭 run_python（兼容参数；默认已关闭）
   --time-limit N       单任务墙钟秒数（默认取配置）
   --max-challenges N   并发窗口（默认取配置，硬上限 3）
+  --preflight          仅离线检查配置，不访问平台、模型或题目
   --web                启动 Web 控制台
   --web-host/--web-port
 ```
@@ -95,6 +98,7 @@ chronos [flags]
 | `GLM_API_KEY` / `GLM_BASE_URL` / `GLM_MODEL_ID` | — / bigmodel v4 / `glm-4-plus` | |
 | `PLATFORM_MODE` | `tsec` | 平台适配器(内置仅 TSecBench;可自行扩展) |
 | `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN` | TSecBench / — | TSecBench 适配器的地址与令牌 |
+| `TSECBENCH_HOSTED` | `false` | 托管模式下自动把模型 Base URL 改写到 `*.tsecbench.gw` |
 | `CHRONOS_STATE_DIR` | `.chronos-state` | 黑板 / 流量 / 报告 / 工作区根目录 |
 | `MAX_CONCURRENT_CHALLENGES` | `3` | 并发窗口（硬上限 3） |
 | `CHALLENGE_TIME_LIMIT_SECONDS` | `1800` | 默认单任务墙钟预算 |
@@ -144,4 +148,4 @@ chronos [flags]
 
 ## 现状与边界
 
-未实测真实模型 / 真实平台 / 真实目标（需 DeepSeek Key、TSec VPN 与靶场网络）。已验证：`go build ./...`、`go vet ./...`、`go test ./...`（scope/blackboard/traffic/engagement/report 单测）、engagement 空 scope 拒绝、engagement 全链路空跑产出报告、Web 控制台起服务并返回各接口、`run_python` 护栏实测（CIDR 内放行 / 越界拦截 / 内部不泄漏为全局）。
+未启动真实 TSecBench 评测，也未访问真实赛题（需平台生成任务并由操作员明确开始）。适配层提供官方 API 契约测试、托管网关改写测试与离线 `--preflight`；其余已验证项包括 `go build ./...`、`go vet ./...`、`go test ./...`、engagement 空 scope 拒绝、报告生成、Web API 与 `run_python` Scope 护栏。

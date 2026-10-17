@@ -3,8 +3,11 @@
 package config
 
 import (
+	"net"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Settings struct {
@@ -21,6 +24,7 @@ type Settings struct {
 	PlatformURL          string
 	BenchmarkURL         string
 	BenchmarkToken       string
+	TSecBenchHosted      bool
 	PlatformInsecureTLS  bool
 	MaxConcurrent        int
 	KillchainTimeLimitS  int
@@ -79,7 +83,8 @@ func getenvBool(key string, def bool) bool {
 
 // Load reads settings from the environment.
 func Load() Settings {
-	return Settings{
+	hosted := getenvBool("TSECBENCH_HOSTED", false)
+	settings := Settings{
 		StateDir:            getenv("CHRONOS_STATE_DIR", getenv("STATE_DIR", ".chronos-state")),
 		ChallengeTimeLimitS: getenvInt("CHALLENGE_TIME_LIMIT_SECONDS", 1800),
 		MaxBumps:            getenvInt("MAX_BUMPS", 20),
@@ -99,6 +104,7 @@ func Load() Settings {
 		PlatformURL:          getenv("PLATFORM_URL", ""),
 		BenchmarkURL:         getenv("BENCHMARK_BASE_URL", "https://tsecbench.zc.tencent.com"),
 		BenchmarkToken:       os.Getenv("BENCHMARK_TOKEN"),
+		TSecBenchHosted:      hosted,
 		PlatformInsecureTLS:  getenvBool("PLATFORM_INSECURE_TLS", false),
 		MaxConcurrent:        getenvInt("MAX_CONCURRENT_CHALLENGES", 3),
 		KillchainTimeLimitS:  getenvInt("KILLCHAIN_TIME_LIMIT_SECONDS", 2700),
@@ -108,6 +114,12 @@ func Load() Settings {
 		DeferRetryCooldownS:  getenvInt("DEFER_RETRY_COOLDOWN_SECONDS", 120),
 		AutoResumeIdleS:      getenvInt("AUTO_RESUME_IDLE_SECONDS", 240),
 	}
+	if hosted {
+		settings.DeepSeekBaseURL = TSecBenchGatewayURL(settings.DeepSeekBaseURL)
+		settings.QwenBaseURL = TSecBenchGatewayURL(settings.QwenBaseURL)
+		settings.GLMBaseURL = TSecBenchGatewayURL(settings.GLMBaseURL)
+	}
+	return settings
 }
 
 // PlatformBase returns the effective platform base URL (PLATFORM_URL overrides).
@@ -116,4 +128,30 @@ func (s Settings) PlatformBase() string {
 		return s.PlatformURL
 	}
 	return s.BenchmarkURL
+}
+
+// TSecBenchGatewayURL converts a public OpenAI-compatible endpoint to the
+// allowlisted gateway form used inside TSecBench hosted containers. Invalid or
+// non-HTTP URLs are returned unchanged so validation can report them clearly.
+func TSecBenchGatewayURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return raw
+	}
+	if !strings.HasSuffix(strings.ToLower(u.Hostname()), ".tsecbench.gw") {
+		host := u.Hostname() + ".tsecbench.gw"
+		if port := u.Port(); port != "" {
+			host = net.JoinHostPort(host, port)
+		}
+		u.Host = host
+	}
+	u.Scheme = "http"
+	return u.String()
+}
+
+// IsTSecBenchGatewayURL reports whether raw is ready for the hosted network.
+func IsTSecBenchGatewayURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && u.Scheme == "http" && strings.HasSuffix(strings.ToLower(u.Hostname()), ".tsecbench.gw")
 }

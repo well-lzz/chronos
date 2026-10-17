@@ -41,3 +41,22 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm audit --omit=dev --audit-level=high
+
+  tsecbench-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - run: docker buildx build --platform linux/amd64 --load -f Dockerfile.tsecbench -t chronos-tsecbench:ci .
+      - run: |
+          mkdir -p dist
+          docker save chronos-tsecbench:ci | gzip -9 > dist/chronos-tsecbench-amd64.tar.gz
+          test "$(wc -c < dist/chronos-tsecbench-amd64.tar.gz)" -lt 3221225472
+          sha256sum dist/chronos-tsecbench-amd64.tar.gz > dist/chronos-tsecbench-amd64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chronos-tsecbench-amd64
+          path: |
+            dist/chronos-tsecbench-amd64.tar.gz
+            dist/chronos-tsecbench-amd64.tar.gz.sha256
+          retention-days: 7

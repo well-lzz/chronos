@@ -8,6 +8,7 @@ logs/
 
 # Go
 /chronos
+/dist/
 *.test
 /vendor/
 
