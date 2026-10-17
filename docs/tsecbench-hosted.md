@@ -41,6 +41,8 @@ DEEPSEEK_API_KEY_2=<第二个 DeepSeek Key>
 
 只有一个 Key 时仅填写 `DEEPSEEK_API_KEY` 即可。配置两个 Key 后，每个模型 HTTP 请求会在 Key 之间轮询分流；遇到 401、403、408、429、网络错误或 5xx 时，同一请求会自动改用另一个 Key。失败切换不会并发重复请求。若两个 Key 属于同一 DeepSeek 账户，它们仍可能共享账户级额度，分流不能绕过服务商总配额。
 
+容器真实启动后会在标准输出打印 `DeepSeek API key pool: 2 keys (request-level round-robin; automatic failover enabled)`。该日志只显示 Key 数量，不显示 Key 内容；出现这行即表示平台表单里的第二个变量已经进入实际请求客户端。
+
 可选地显式设置公共地址；Chronos 会在托管模式自动改写为网关地址：
 
 ```text
