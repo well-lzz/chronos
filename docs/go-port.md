@@ -79,6 +79,8 @@ chronos --engagement <config.json>    # 一次真实授权评估（无平台/调
 
 控制台前端是 `web/` 下的 **Next.js（App Router，React 19）** 应用，`output: 'export'` 静态导出后**嵌进 Go 二进制**，单二进制部署不变。
 
+运行时会生成一次性的操作员令牌，并把认证入口打印为 `http://127.0.0.1:8000/#operator=...`。令牌只保存在浏览器 `sessionStorage`，不会写入页面或暴露给 Agent 工具；所有控制、模型配置和 Scope 更新接口都要求该令牌。engagement 模式允许操作员在界面替换 Scope，solver 在每次 HTTP/TCP/脚本调用时读取当前边界并强制校验。对话采用独立的无工具回复回合，因此即使执行器暂停或正忙，操作员仍会得到明确回复；消息本身不能修改 Scope。
+
 ```bash
 cd web && npm ci && npm run build        # 产出 web/out/
 rm -rf ../internal/web/dist && cp -r out ../internal/web/dist

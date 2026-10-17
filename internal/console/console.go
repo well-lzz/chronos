@@ -17,6 +17,21 @@ type Source interface {
 	Command(action, challenge, model, message string)
 }
 
+// ScopeConfig is the operator-visible authorization boundary for an engagement.
+type ScopeConfig struct {
+	Supported   bool     `json:"supported"`
+	Editable    bool     `json:"editable"`
+	Targets     []string `json:"targets"`
+	Description string   `json:"description"`
+}
+
+// ScopeController is implemented only by sources whose authorization boundary
+// may be replaced by the authenticated operator at runtime.
+type ScopeController interface {
+	ScopeConfig() ScopeConfig
+	UpdateScope(targets []string) error
+}
+
 var verdictRank = map[string]int{"confirmed": 0, "suspected": 1, "failed": 2}
 var sevRank = map[string]int{"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 

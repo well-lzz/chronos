@@ -80,7 +80,9 @@ func (s *Solver) toolHTTP(ctx context.Context, argsJSON string) string {
 	if ok, msg := s.hostAllowed(host); !ok {
 		return msg
 	}
-	display := nettools.DoRawHTTP(ctx, a.URL, a.Method, a.Headers, a.Body, 30*time.Second, s.scope.Allows, s.insecureTLS)
+	display := nettools.DoRawHTTP(ctx, a.URL, a.Method, a.Headers, a.Body, 30*time.Second, func(host string) bool {
+		return s.scopeSnapshot().Allows(host)
+	}, s.insecureTLS)
 	tid, err := s.tl.RecordHTTP(a.Method, a.URL, a.Headers, a.Body, display, s.ModelSpec)
 	if err != nil {
 		return display + "\ntraffic persistence error: " + err.Error()

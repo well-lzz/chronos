@@ -26,15 +26,25 @@ const PRESETS = [
   { id: "custom", name: "自定义 Custom", base: "", model: "" },
 ];
 const KIND_LABEL = {
-  operator: "操作员", text: "推理", tool_call: "调用", tool_result: "结果", error: "错误",
+  operator: "操作员", assistant: "Agent 回复", status: "状态", text: "推理",
+  tool_call: "调用", tool_result: "结果", error: "错误",
 };
+
+const OPERATOR_TOKEN_KEY = "chronos.operator.token";
+
+function operatorFetch(url, options = {}) {
+  const token = typeof window === "undefined" ? "" : sessionStorage.getItem(OPERATOR_TOKEN_KEY) || "";
+  const headers = new Headers(options.headers || {});
+  if (token) headers.set("X-Chronos-Operator", token);
+  return fetch(url, { ...options, headers });
+}
 
 // flatten swarms{name:{agents:{spec:{...}}}} → [{challenge,model,status,steps,paused}]
 function flattenAgents(swarms) {
   const out = [];
   for (const [name, st] of Object.entries(swarms || {})) {
     for (const [m, a] of Object.entries(st.agents || {})) {
-      out.push({ challenge: name, model: m, status: a.status, steps: a.steps || 0, paused: !!st.paused });
+      out.push({ challenge: name, model: m, status: st.paused ? "paused" : a.status, steps: a.steps || 0, paused: !!st.paused });
     }
   }
   return out;
@@ -62,10 +72,23 @@ export default function Console() {
   const [connected, setConnected] = useState(false);
   const [llm, setLlm] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showScope, setShowScope] = useState(false);
+  const [operatorReady, setOperatorReady] = useState(false);
+  const [uiError, setUiError] = useState("");
   const afterRef = useRef(0);
   const logRef = useRef(null);
   const watchRef = useRef(watch);
   watchRef.current = watch;
+
+  useEffect(() => {
+    const prefix = "#operator=";
+    if (window.location.hash.startsWith(prefix)) {
+      const token = decodeURIComponent(window.location.hash.slice(prefix.length));
+      if (token) sessionStorage.setItem(OPERATOR_TOKEN_KEY, token);
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+    setOperatorReady(!!sessionStorage.getItem(OPERATOR_TOKEN_KEY));
+  }, []);
 
   // live snapshot stream
   useEffect(() => {
@@ -115,20 +138,28 @@ export default function Console() {
 
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [events]);
 
-  const cmd = useCallback((action, extra) => {
+  const cmd = useCallback(async (action, extra) => {
     const w = watchRef.current;
-    fetch("/api/command", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, challenge: w.c, model: w.m, ...(extra || {}) }),
-    }).catch(() => {});
+    try {
+      const response = await operatorFetch("/api/command", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, challenge: w.c, model: w.m, ...(extra || {}) }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || result.ok === false) throw new Error(result.error || `HTTP ${response.status}`);
+      setUiError("");
+      return true;
+    } catch (error) {
+      setUiError(String(error));
+      return false;
+    }
   }, []);
 
   const pickWatch = (c, m) => { setWatch({ c, m }); setEvents([]); afterRef.current = 0; };
-  const send = () => {
+  const send = async () => {
     const t = msg.trim();
     if (!t || !watch.c) return;
-    cmd("bump", { message: t });           // appears in the timeline as an operator turn
-    setMsg("");
+    if (await cmd("chat", { message: t })) setMsg("");
   };
 
   const sm = state.summary || {};
@@ -175,6 +206,9 @@ export default function Console() {
           {scope && <span className={s.scope} title={scope}>scope: {scope}</span>}
           {sm.budget_left_min != null && sm.budget_left_min >= 0 && <span>budget {sm.budget_left_min}min</span>}
           <span>{(sm.tokens || 0).toLocaleString()} tokens</span>
+          {state.engagement?.scope_editable && (
+            <button className={s.gear} onClick={() => setShowScope(true)} title="授权范围 Scope">◎ Scope</button>
+          )}
           <button className={s.gear} onClick={() => { loadLlm(); setShowSettings(true); }} title="模型设置 Model settings">
             ⚙ {llm && llm.model ? llm.model : "模型设置"}
           </button>
@@ -187,9 +221,21 @@ export default function Console() {
         </div>
       )}
 
+      {!operatorReady && (
+        <div className={s.banner}>
+          ⚠ 当前页面没有操作员令牌，只能查看。请使用 Chronos 启动日志中的 “Authenticated operator console” 地址重新打开。
+        </div>
+      )}
+
+      {uiError && <div className={s.banner}>⚠ {uiError}</div>}
+
       {showSettings && (
         <SettingsModal initial={llm} onClose={() => setShowSettings(false)}
           onSaved={() => { loadLlm(); }} />
+      )}
+
+      {showScope && (
+        <ScopeModal initial={state.engagement?.targets || []} onClose={() => setShowScope(false)} />
       )}
 
       <section className={s.tiles}>
@@ -243,7 +289,7 @@ export default function Console() {
             </div>
             {behavior.total > 0 && (
               <div className={s.kinds}>
-                {["text", "tool_call", "tool_result", "operator"].map((k) =>
+                {["assistant", "status", "text", "tool_call", "tool_result", "operator"].map((k) =>
                   behavior.kinds[k] ? <span key={k} className={s[`k_${k}`]}>{KIND_LABEL[k]} {behavior.kinds[k]}</span> : null
                 )}
               </div>
@@ -267,9 +313,9 @@ export default function Console() {
               </select>
             </div>
             <div className={s.ctrls}>
-              <button onClick={() => cmd("pause")} disabled={!watch.c}>pause</button>
-              <button onClick={() => cmd("resume")} disabled={!watch.c}>resume</button>
-              <button className={s.kill} onClick={() => cmd("kill")} disabled={!watch.c}>kill</button>
+              <button onClick={() => cmd("pause")} disabled={!watch.c || !operatorReady}>pause</button>
+              <button onClick={() => cmd("resume")} disabled={!watch.c || !operatorReady}>resume</button>
+              <button className={s.kill} onClick={() => cmd("kill")} disabled={!watch.c || !operatorReady}>kill</button>
             </div>
           </div>
 
@@ -292,11 +338,11 @@ export default function Console() {
           </div>
 
           <div className={s.inputBar}>
-            <input placeholder={watch.c ? "给 Agent 下达指令…  (Enter 发送)" : "no executor to talk to"}
-              value={msg} disabled={!watch.c}
+            <input placeholder={watch.c ? (cur?.paused ? "与 Agent 对话（执行已暂停，动作将在 resume 后继续）" : "与 Agent 对话并下达指令…  (Enter 发送)") : "no executor to talk to"}
+              value={msg} disabled={!watch.c || !operatorReady}
               onChange={(e) => setMsg(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") send(); }} />
-            <button className={s.send} onClick={send} disabled={!watch.c || !msg.trim()}>发送</button>
+            <button className={s.send} onClick={send} disabled={!watch.c || !operatorReady || !msg.trim()}>发送</button>
           </div>
         </main>
 
@@ -343,6 +389,55 @@ export default function Console() {
   );
 }
 
+function ScopeModal({ initial, onClose }) {
+  const [value, setValue] = useState((initial || []).join("\n"));
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const save = async () => {
+    const targets = value.split(/[\n,]+/).map((item) => item.trim()).filter(Boolean);
+    setBusy(true); setResult(null);
+    try {
+      const response = await operatorFetch("/api/scope", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targets }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || body.ok === false) throw new Error(body.error || `HTTP ${response.status}`);
+      setResult({ ok: true, text: `Scope 已更新：${body.description}` });
+      setTimeout(onClose, 500);
+    } catch (error) {
+      setResult({ ok: false, text: String(error) });
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className={s.overlay} onClick={onClose}>
+      <div className={s.modal} onClick={(event) => event.stopPropagation()}>
+        <div className={s.modalHead}>
+          <h2>授权范围 Scope</h2>
+          <button onClick={onClose}>✕</button>
+        </div>
+        <p className={s.modalHint}>
+          每行填写一个获授权的主机、IP、URL 或 CIDR。保存会替换当前范围；Agent 的 HTTP、TCP 和本地脚本网络访问继续由后端强制校验，聊天内容不能扩大范围。
+        </p>
+        <label className={s.scopeField}>
+          <span>授权目标</span>
+          <textarea value={value} onChange={(event) => setValue(event.target.value)}
+            placeholder={"https://staging.example.com\n10.10.5.0/24\n192.0.2.10"} rows={8} />
+        </label>
+        {result && <div className={`${s.testMsg} ${result.ok ? s.testOk : s.testBad}`}>{result.text}</div>}
+        <div className={s.modalBtns}>
+          <span className={s.spacer} />
+          <button onClick={onClose} disabled={busy}>取消</button>
+          <button className={s.save} onClick={save} disabled={busy || !value.trim()}>保存并应用</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SettingsModal({ initial, onClose, onSaved }) {
   const match = PRESETS.find((p) => p.base === (initial?.base_url || "")) || PRESETS.find((p) => p.id === (initial?.provider || "")) || PRESETS[PRESETS.length - 1];
   const [provider, setProvider] = useState(match.id);
@@ -364,7 +459,7 @@ function SettingsModal({ initial, onClose, onSaved }) {
   const save = async () => {
     setBusy(true); setTest(null);
     try {
-      const r = await fetch("/api/llm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
+      const r = await operatorFetch("/api/llm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
       const j = await r.json();
       if (j.ok === false) { setTest({ ok: false, error: j.error || "save failed" }); setBusy(false); return; }
       setApiKey(""); onSaved && onSaved(); onClose();
@@ -375,7 +470,7 @@ function SettingsModal({ initial, onClose, onSaved }) {
   const doTest = async () => {
     setBusy(true); setTest(null);
     try {
-      const r = await fetch("/api/llm/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
+      const r = await operatorFetch("/api/llm/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
       setTest(await r.json());
     } catch (e) { setTest({ ok: false, error: String(e) }); }
     setBusy(false);

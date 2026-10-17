@@ -85,7 +85,8 @@ func (s *Solver) toolRunPython(ctx context.Context, argsJSON string) string {
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil || strings.TrimSpace(a.Code) == "" {
 		return "run_python error: empty or invalid code"
 	}
-	code := guardPreamble(s.scope.Hosts(), s.scope.CIDRStrings()) + "\n" + a.Code
+	currentScope := s.scopeSnapshot()
+	code := guardPreamble(currentScope.Hosts(), currentScope.CIDRStrings()) + "\n" + a.Code
 
 	f, err := os.CreateTemp("", "chronos_*.py")
 	if err != nil {

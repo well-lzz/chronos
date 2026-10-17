@@ -57,6 +57,13 @@ chronos --engagement examples/engagement.example.json --web
 
 控制台不讲「题目解没解」——真实业务(渗透/漏挖/代审)没有 solved/unsolved/deferred，只有**发现的判定**：**确认 confirmed / 疑似 suspected / 失败 failed**(= 内核 verified / candidate+inconclusive / refuted 的呈现归并)。页面顶部是三类判定计数 + 发现总数 + facts + tokens;主体是发现列表(严重度 + 判定徽章 + 证据数);右侧是 executor 列表,点进去可实时看它的推理流并 pause/resume/kill/发指令。两种模式(scheduler / engagement)都用这套发现视图。
 
+启动后日志会额外打印一次带随机 `#operator=...` 片段的 **Authenticated operator console** 地址。只有从这个地址打开的浏览器会话可以发消息、暂停/恢复任务、修改模型或更新 Scope；普通 `http://127.0.0.1:8000` 页面保持只读。
+
+- **直接对话**：输入框会触发一个独立的无工具模型回合，Agent 必须给操作员文字回复；同一条消息同时进入执行队列。任务暂停时仍可对话，动作会等待恢复。
+- **Scope 设置**：engagement 控制台顶部的 `Scope` 按钮可替换当前授权主机/IP/URL/CIDR。更新立即应用到 HTTP、TCP 和 `run_python` 的结构性范围锁。
+- **边界不由聊天改变**：聊天或提示词永远不能扩大 Scope；超范围请求会被拒绝，必须由持有操作员令牌的人在 Scope 界面显式修改。
+- **安全启动**：带 `--web` 的 engagement 默认暂停；操作员检查或修改 Scope 后点击 `resume` 才开始自主执行。
+
 两条运行主链路共用同一内核（scope / 黑板 / traffic / solver / swarm）：
 
 - **调度器模式（默认）**：`platform`(**可插拔工作源**，内置 TSecBench 适配器) → `poller`(轮询事件) → `scheduler`(按分值→难度填满并发窗口、滚动重试、全局预算、死锁自愈、**平台判真即 kill 该 swarm**) → 每个目标一个协作 `swarm`。`submit_flag` 经 swarm 去重 + 递增冷却 + 猜测熔断打到平台。

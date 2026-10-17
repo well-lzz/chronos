@@ -48,3 +48,15 @@ func TestBracketedIPv6WithPort(t *testing.T) {
 		t.Fatal("bracketed IPv6 target with port was not normalized")
 	}
 }
+
+func TestEntriesReturnsCopy(t *testing.T) {
+	s := Parse([]string{"https://app.test:8443/path", "10.20.0.0/16"})
+	entries := s.Entries()
+	if len(entries) != 2 || entries[0] != "https://app.test:8443/path" {
+		t.Fatalf("Entries=%v", entries)
+	}
+	entries[0] = "evil.test"
+	if s.Entries()[0] != "https://app.test:8443/path" {
+		t.Fatal("Entries exposed mutable internal state")
+	}
+}

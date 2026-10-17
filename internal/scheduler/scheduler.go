@@ -196,6 +196,10 @@ func (s *Scheduler) handleCommand(ctx context.Context, c Command) {
 		if r != nil {
 			r.sw.Bump(c.Model, c.Message)
 		}
+	case "chat":
+		if r != nil {
+			r.sw.Chat(c.Model, c.Message)
+		}
 	}
 }
 

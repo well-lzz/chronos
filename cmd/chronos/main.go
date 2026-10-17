@@ -210,6 +210,9 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 		Meta: meta, Scope: sc, ModelSpecs: specs, Settings: cfg, BB: bb, TL: tl, LLM: llmStore,
 	}
 	if webUI {
+		// Web engagements are operator-led: configure/review Scope and converse
+		// while paused, then explicitly resume autonomous execution.
+		sw.Pause()
 		runner := engrun.New(sw, bb, meta, cancel, deadline)
 		fmt.Printf("Web console → http://%s:%d (findings: confirmed/suspected/failed)\n\n", webHost, webPort)
 		go func() {
@@ -227,7 +230,7 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 	fmt.Printf("  Facts: %d   Sub-goals: %d   Tokens: %d\n", c["facts"], c["subgoals_total"], sw.TotalTokens())
 
 	rm := report.RunMeta{
-		Mode: "assessment", Goal: eng.Goal, Scope: sc.Describe(), Models: specs,
+		Mode: "assessment", Goal: eng.Goal, Scope: sw.CurrentScope().Describe(), Models: specs,
 		Started: started.Format("2006-01-02 15:04:05"), Ended: time.Now().Format("2006-01-02 15:04:05"),
 		DurationSeconds: int(time.Since(started).Seconds()),
 	}

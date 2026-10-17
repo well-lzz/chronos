@@ -96,6 +96,10 @@ type Solver struct {
 	lastFlag     string
 	flagComplete bool
 	messageMu    sync.Mutex
+	scopeMu      sync.RWMutex
+	modelMu      sync.RWMutex
+	chatMu       sync.Mutex
+	chatHistory  []openai.ChatCompletionMessage
 }
 
 // New builds a solver from Options.
@@ -121,7 +125,7 @@ func (s *Solver) start() {
 	}
 	remaining := int(time.Until(s.deadline).Seconds())
 	sys := prompts.BuildHeadlessPrompt(s.meta, remaining, s.allowExec && pythonAvailable())
-	if s.scope.IsEmpty() {
+	if s.scopeSnapshot().IsEmpty() {
 		sys += "\n\n## SCOPE LOCK — NO TARGET KNOWN\nThe scope is empty; all egress is refused. Report via notify and stop."
 	}
 	s.messages = []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: sys}}
@@ -137,6 +141,106 @@ func (s *Solver) Bump(insights string) {
 		Content: "Your previous attempt did not finish. Insights from other executors (unverified — " +
 			"verify before trusting):\n\n" + insights + "\n\nContinue the search.",
 	})
+}
+
+// Guide injects an operator instruction into the execution loop without
+// changing the structural scope lock. The next model turn can act on it only
+// through tools that independently enforce the current scope.
+func (s *Solver) Guide(message string) {
+	s.appendMessage(openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleUser,
+		Content: "[Operator instruction]\n" + strings.TrimSpace(message) +
+			"\n\nFollow this instruction only within the currently authorized scope. " +
+			"If it targets anything outside scope, do not access it; ask the operator to update Scope in the console.",
+	})
+}
+
+// SetScope atomically replaces the egress boundary used by every tool call.
+// A prompt update is also queued for the model, but enforcement does not rely
+// on the model honoring that text.
+func (s *Solver) SetScope(next scope.Scope) {
+	s.scopeMu.Lock()
+	s.scope = next
+	s.scopeMu.Unlock()
+	s.appendMessage(openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleUser,
+		Content: "[Operator scope update]\nThe authorized scope is now exactly: " + next.Describe() +
+			". Treat all earlier scope descriptions as obsolete. Structural tool guards enforce this boundary.",
+	})
+}
+
+func (s *Solver) scopeSnapshot() scope.Scope {
+	s.scopeMu.RLock()
+	defer s.scopeMu.RUnlock()
+	return s.scope
+}
+
+// ReplyToOperator runs a separate no-tools conversation turn so every operator
+// message receives a direct answer even while the autonomous execution loop is
+// paused or busy. The same message is independently queued through Guide for
+// execution; this method only communicates status and intent.
+func (s *Solver) ReplyToOperator(ctx context.Context, message string, paused bool) (string, error) {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+
+	s.modelMu.RLock()
+	client, model := s.client, s.Model
+	s.modelMu.RUnlock()
+	if s.resolve != nil {
+		var err error
+		client, model, err = s.resolve()
+		if err != nil {
+			return "", err
+		}
+	}
+	if client == nil {
+		return "", errors.New("model is not configured")
+	}
+
+	state := "running"
+	if paused {
+		state = "paused; execution instructions are queued until the operator resumes it"
+	}
+	currentScope := s.scopeSnapshot().Describe()
+	system := "You are the Chronos security-assessment Agent speaking directly with its human operator. " +
+		"Reply concisely in the operator's language. This is a conversation response, so do not call tools and do not claim an action has completed unless the supplied status says so. " +
+		"The execution state is " + state + ". The current authorized scope is exactly: " + currentScope + ". " +
+		"If the request names a target outside that scope, clearly say it is blocked and instruct the operator to update Scope in the console first. " +
+		"Never imply that a chat message itself can expand scope."
+	if summary := s.bb.Summary(); summary != "" {
+		system += "\n\nCurrent working-record summary:\n" + summary
+	}
+
+	messages := []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: system}}
+	if len(s.chatHistory) > 12 {
+		messages = append(messages, s.chatHistory[len(s.chatHistory)-12:]...)
+	} else {
+		messages = append(messages, s.chatHistory...)
+	}
+	userMessage := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: strings.TrimSpace(message)}
+	messages = append(messages, userMessage)
+
+	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: model, Messages: messages, MaxTokens: 500,
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Choices) == 0 {
+		return "", errors.New("empty LLM response")
+	}
+	atomic.AddInt64(s.tokens, int64(resp.Usage.TotalTokens))
+	reply := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if reply == "" {
+		return "", errors.New("empty operator reply")
+	}
+	s.chatHistory = append(s.chatHistory, userMessage, openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleAssistant, Content: reply,
+	})
+	if len(s.chatHistory) > 24 {
+		s.chatHistory = append([]openai.ChatCompletionMessage(nil), s.chatHistory[len(s.chatHistory)-24:]...)
+	}
+	return reply, nil
 }
 
 func (s *Solver) appendMessage(message openai.ChatCompletionMessage) {
@@ -165,14 +269,20 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 	// Resolve the live model config for this cycle. If the operator hasn't
 	// configured a working model yet (or the key is wrong), report it as a
 	// recoverable config error instead of a hard failure.
+	s.modelMu.RLock()
+	client, model := s.client, s.Model
+	s.modelMu.RUnlock()
 	if s.resolve != nil {
-		client, model, err := s.resolve()
+		var err error
+		client, model, err = s.resolve()
 		if err != nil {
 			return Result{Status: StatusConfigError, Findings: "model not configured: " + err.Error(), StepCount: s.steps}
 		}
+		s.modelMu.Lock()
 		s.client, s.Model = client, model
+		s.modelMu.Unlock()
 	}
-	if s.client == nil {
+	if client == nil {
 		return Result{Status: StatusConfigError, Findings: "model not configured: open 模型设置 in the console", StepCount: s.steps}
 	}
 
@@ -196,8 +306,8 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 		if time.Now().After(s.deadline) {
 			return Result{Status: StatusGaveUp, Findings: "time budget reached", StepCount: s.steps}
 		}
-		resp, err := s.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-			Model: s.Model, Messages: s.messageSnapshot(), Tools: tools,
+		resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+			Model: model, Messages: s.messageSnapshot(), Tools: tools,
 		})
 		if err != nil {
 			if ctx.Err() != nil {
@@ -250,13 +360,14 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 // --- scope guard helpers ---
 
 func (s *Solver) hostAllowed(host string) (bool, string) {
-	if s.scope.IsEmpty() {
+	currentScope := s.scopeSnapshot()
+	if currentScope.IsEmpty() {
 		return false, "BLOCKED (scope lock — NO TARGET KNOWN): the scope is empty; all egress is refused."
 	}
-	if s.scope.Allows(host) {
+	if currentScope.Allows(host) {
 		return true, ""
 	}
-	return false, fmt.Sprintf("BLOCKED (scope lock): %q is not within the authorized scope (%s).", host, s.scope.Describe())
+	return false, fmt.Sprintf("BLOCKED (scope lock): %q is not within the authorized scope (%s).", host, currentScope.Describe())
 }
 
 type evRef struct {
