@@ -6,7 +6,10 @@ package llm
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -14,6 +17,63 @@ import (
 	"github.com/well-lzz/chronos/internal/config"
 	"github.com/well-lzz/chronos/internal/llmconfig"
 )
+
+type httpDoer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+type keyPoolDoer struct {
+	base httpDoer
+	keys []string
+	next atomic.Uint64
+}
+
+func (p *keyPoolDoer) Do(req *http.Request) (*http.Response, error) {
+	start := int(p.next.Add(1)-1) % len(p.keys)
+	var lastErr error
+	for attempt := 0; attempt < len(p.keys); attempt++ {
+		request := req.Clone(req.Context())
+		if attempt > 0 && req.Body != nil {
+			if req.GetBody == nil {
+				return nil, lastErr
+			}
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, err
+			}
+			request.Body = body
+		}
+		request.Header.Set("Authorization", "Bearer "+p.keys[(start+attempt)%len(p.keys)])
+		resp, err := p.base.Do(request)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if !retryableStatus(resp.StatusCode) || attempt == len(p.keys)-1 {
+			return resp, nil
+		}
+		if resp.Body != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+		}
+		lastErr = fmt.Errorf("LLM HTTP %d", resp.StatusCode)
+	}
+	return nil, lastErr
+}
+
+func retryableStatus(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests || status >= 500
+}
+
+func newClient(baseURL string, keys []string) *openai.Client {
+	oc := openai.DefaultConfig(keys[0])
+	oc.BaseURL = baseURL
+	if len(keys) > 1 {
+		oc.HTTPClient = &keyPoolDoer{base: &http.Client{}, keys: append([]string(nil), keys...)}
+	}
+	return openai.NewClientWithConfig(oc)
+}
 
 // FromProfile builds a client for any OpenAI-compatible endpoint described by an
 // operator-configured profile (base URL + key + model). This is the generic path
@@ -41,9 +101,7 @@ func FromProfileWithSettings(p llmconfig.Profile, cfg config.Settings) (*openai.
 	if model == "" {
 		return nil, "", fmt.Errorf("no model id configured")
 	}
-	oc := openai.DefaultConfig(key)
-	oc.BaseURL = base
-	return openai.NewClientWithConfig(oc), model, nil
+	return newClient(base, []string{key}), model, nil
 }
 
 // Ping issues a tiny completion to confirm a profile's base URL, key, and model
@@ -66,32 +124,34 @@ func Ping(ctx context.Context, p llmconfig.Profile) error {
 // Resolve returns a configured client and the concrete model id for a spec.
 func Resolve(spec string, cfg config.Settings) (*openai.Client, string, error) {
 	provider, model := split(spec)
-	var baseURL, key string
+	var baseURL string
+	var keys []string
 	switch provider {
 	case "deepseek", "":
-		baseURL, key = cfg.DeepSeekBaseURL, cfg.DeepSeekKey
+		baseURL, keys = cfg.DeepSeekBaseURL, cfg.DeepSeekKeys
+		if len(keys) == 0 && cfg.DeepSeekKey != "" {
+			keys = []string{cfg.DeepSeekKey}
+		}
 		if model == "" {
 			model = "deepseek-chat"
 		}
 	case "qwen":
-		baseURL, key = cfg.QwenBaseURL, cfg.QwenKey
+		baseURL, keys = cfg.QwenBaseURL, []string{cfg.QwenKey}
 		if model == "" {
 			model = "qwen-plus"
 		}
 	case "glm":
-		baseURL, key = cfg.GLMBaseURL, cfg.GLMKey
+		baseURL, keys = cfg.GLMBaseURL, []string{cfg.GLMKey}
 		if model == "" {
 			model = cfg.GLMModelID
 		}
 	default:
 		return nil, "", fmt.Errorf("unknown provider %q in spec %q", provider, spec)
 	}
-	if key == "" {
+	if len(keys) == 0 || strings.TrimSpace(keys[0]) == "" {
 		return nil, "", fmt.Errorf("no API key for provider %q (set the matching *_API_KEY)", provider)
 	}
-	oc := openai.DefaultConfig(key)
-	oc.BaseURL = baseURL
-	return openai.NewClientWithConfig(oc), model, nil
+	return newClient(baseURL, keys), model, nil
 }
 
 func split(spec string) (provider, model string) {

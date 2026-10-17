@@ -32,11 +32,14 @@
 - `BENCHMARK_TOKEN`
 - `BENCHMARK_BASE_URL`
 
-在托管表单中只需增加模型密钥。DeepSeek 推荐配置：
+在托管表单中增加两个独立变量。DeepSeek 双 Key 推荐配置：
 
 ```text
-DEEPSEEK_API_KEY=<平台运行时密钥>
+DEEPSEEK_API_KEY=<第一个 DeepSeek Key>
+DEEPSEEK_API_KEY_2=<第二个 DeepSeek Key>
 ```
+
+只有一个 Key 时仅填写 `DEEPSEEK_API_KEY` 即可。配置两个 Key 后，每个模型 HTTP 请求会在 Key 之间轮询分流；遇到 401、403、408、429、网络错误或 5xx 时，同一请求会自动改用另一个 Key。失败切换不会并发重复请求。若两个 Key 属于同一 DeepSeek 账户，它们仍可能共享账户级额度，分流不能绕过服务商总配额。
 
 可选地显式设置公共地址；Chronos 会在托管模式自动改写为网关地址：
 
@@ -54,7 +57,8 @@ Qwen 或 GLM 可分别使用 `QWEN_API_KEY`、`QWEN_BASE_URL`，或 `GLM_API_KEY
 docker run --rm \
   -e BENCHMARK_BASE_URL=https://tsecbench.zc.tencent.com \
   -e BENCHMARK_TOKEN=placeholder-for-offline-check \
-  -e DEEPSEEK_API_KEY=placeholder-for-offline-check \
+  -e DEEPSEEK_API_KEY=placeholder-key-one \
+  -e DEEPSEEK_API_KEY_2=placeholder-key-two \
   chronos-tsecbench:submission --preflight
 ```
 
@@ -63,6 +67,7 @@ docker run --rm \
 ```text
 Chronos preflight (offline; no evaluation was started)
 Hosted routing: true
+keys configured=2
 Result: ready
 ```
 

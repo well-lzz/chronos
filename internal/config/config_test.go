@@ -36,3 +36,23 @@ func TestLoadRewritesModelEndpointsOnlyInHostedMode(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadDeepSeekKeyPool(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "key-one")
+	t.Setenv("DEEPSEEK_API_KEY_2", " key-two ")
+	t.Setenv("DEEPSEEK_API_KEYS", "key-two,key-three\nkey-one")
+
+	cfg := Load()
+	want := []string{"key-one", "key-two", "key-three"}
+	if len(cfg.DeepSeekKeys) != len(want) {
+		t.Fatalf("DeepSeekKeys = %#v", cfg.DeepSeekKeys)
+	}
+	for i := range want {
+		if cfg.DeepSeekKeys[i] != want[i] {
+			t.Fatalf("DeepSeekKeys[%d] = %q, want %q", i, cfg.DeepSeekKeys[i], want[i])
+		}
+	}
+	if cfg.DeepSeekKey != "key-one" {
+		t.Fatalf("legacy DeepSeekKey = %q", cfg.DeepSeekKey)
+	}
+}
