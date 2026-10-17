@@ -162,6 +162,9 @@ func (s *Solver) SetScope(next scope.Scope) {
 	s.scopeMu.Lock()
 	s.scope = next
 	s.scopeMu.Unlock()
+	s.chatMu.Lock()
+	s.chatHistory = nil
+	s.chatMu.Unlock()
 	s.appendMessage(openai.ChatCompletionMessage{
 		Role: openai.ChatMessageRoleUser,
 		Content: "[Operator scope update]\nThe authorized scope is now exactly: " + next.Describe() +
@@ -206,7 +209,7 @@ func (s *Solver) ReplyToOperator(ctx context.Context, message string, paused boo
 		"Reply concisely in the operator's language. This is a conversation response, so do not call tools and do not claim an action has completed unless the supplied status says so. " +
 		"The execution state is " + state + ". The current authorized scope is exactly: " + currentScope + ". " +
 		"If the request names a target outside that scope, clearly say it is blocked and instruct the operator to update Scope in the console first. " +
-		"Never imply that a chat message itself can expand scope."
+		"Never imply that a chat message itself can expand scope. Never describe Scope from memory: when asked, repeat the exact current value from this system message."
 	if summary := s.bb.Summary(); summary != "" {
 		system += "\n\nCurrent working-record summary:\n" + summary
 	}
@@ -240,7 +243,7 @@ func (s *Solver) ReplyToOperator(ctx context.Context, message string, paused boo
 	if len(s.chatHistory) > 24 {
 		s.chatHistory = append([]openai.ChatCompletionMessage(nil), s.chatHistory[len(s.chatHistory)-24:]...)
 	}
-	return reply, nil
+	return "当前后端强制 Scope：\n" + currentScope + "\n\n" + reply, nil
 }
 
 func (s *Solver) appendMessage(message openai.ChatCompletionMessage) {

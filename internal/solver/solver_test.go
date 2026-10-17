@@ -34,6 +34,7 @@ func TestConcurrentBumpAndMessageSnapshot(t *testing.T) {
 
 func TestSetScopeReplacesAuthorizationBoundary(t *testing.T) {
 	s := New(Options{Scope: scope.Parse([]string{"old.example"})})
+	s.chatHistory = []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleAssistant, Content: "old scope"}}
 	if ok, _ := s.hostAllowed("old.example"); !ok {
 		t.Fatal("initial scope rejected old.example")
 	}
@@ -46,6 +47,9 @@ func TestSetScopeReplacesAuthorizationBoundary(t *testing.T) {
 	}
 	if ok, _ := s.hostAllowed("10.20.4.5"); !ok {
 		t.Fatal("updated scope rejected CIDR member")
+	}
+	if len(s.chatHistory) != 0 {
+		t.Fatal("scope update retained stale chat history")
 	}
 }
 
@@ -75,7 +79,7 @@ func TestReplyToOperatorUsesDedicatedNoToolsTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reply != "收到，当前执行已暂停。" {
+	if reply != "当前后端强制 Scope：\ntarget.example\n\n收到，当前执行已暂停。" {
 		t.Fatalf("reply=%q", reply)
 	}
 	if _, ok := requestBody["tools"]; ok {
