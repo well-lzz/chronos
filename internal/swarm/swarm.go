@@ -1,7 +1,7 @@
 // Package swarm runs several executors in parallel on one mission. They share
 // the mission's blackboard and traffic log and COLLABORATE — no racing, no
 // sibling cancellation. Each executor searches until the termination hook says
-// stop, a hard bump ceiling is hit, or the wall-clock budget ends. When a
+// stop (default: never), the operator cancels, or the wall-clock budget ends. When a
 // Platform is set, submit_flag goes through it (deduped + cooldown + a circuit
 // breaker on blind guessing); a confirmed flag is recorded but does not cancel
 // the others (the scheduler's poller kills the swarm on a platform-confirmed
@@ -142,10 +142,12 @@ func (s *Swarm) Run(ctx context.Context) string {
 }
 
 func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string) string {
-	maxBumps := s.Settings.MaxBumps
-	if maxBumps <= 0 {
-		maxBumps = 20
-	}
+	// The stop condition belongs to the operator (kill) or the target (the
+	// engagement's wall-clock budget / SIGTERM), not to the program. There is no
+	// default "diminishing returns" cutoff and no default retry ceiling: the
+	// executor keeps searching until it is cancelled or the budget ends. An
+	// operator who explicitly sets MAX_BUMPS > 0 opts back into a retry cap.
+	bumpCap := s.Settings.MaxBumps // <= 0 means unbounded
 	retry := time.Duration(s.Settings.SolverRetryDelayS * float64(time.Second))
 	started := time.Now()
 	bumps, cycles := 0, 0
@@ -211,9 +213,9 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 
 		if res.Status == solver.StatusGaveUp || res.Status == solver.StatusError {
 			bumps++
-			if bumps > maxBumps {
-				log.Printf("[%s/%s] max bumps (%d) reached", s.Meta.Name, spec, maxBumps)
-				s.emit(spec, res.StepCount, "text", "", "Executor stopped: retry ceiling reached after repeated failures.")
+			if bumpCap > 0 && bumps > bumpCap {
+				log.Printf("[%s/%s] operator-set bump cap (%d) reached", s.Meta.Name, spec, bumpCap)
+				s.emit(spec, res.StepCount, "text", "", "Executor stopped: operator-set retry cap reached.")
 				s.setStatus(spec, "finished")
 				return ""
 			}

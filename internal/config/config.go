@@ -80,7 +80,7 @@ func Load() Settings {
 	return Settings{
 		StateDir:            getenv("CHRONOS_STATE_DIR", getenv("STATE_DIR", ".chronos-state")),
 		ChallengeTimeLimitS: getenvInt("CHALLENGE_TIME_LIMIT_SECONDS", 1800),
-		MaxBumps:            getenvInt("MAX_BUMPS", 20),
+		MaxBumps:            getenvInt("MAX_BUMPS", 0), // 0 = unbounded; the operator/target decides the stop
 		SolverRetryDelayS:   getenvFloat("SOLVER_RETRY_DELAY_SECONDS", 2.0),
 		AllowLocalExec:      getenvBool("ALLOW_LOCAL_EXEC", true),
 
