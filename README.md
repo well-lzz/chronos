@@ -70,7 +70,8 @@ chronos --engagement examples/engagement.example.json --web
 chronos [flags]
   --engagement PATH    一次授权评估（JSON 配置；无平台/调度器）
   --model SPEC         模型规格，可重复（默认 deepseek/deepseek-chat）
-  --no-exec            关闭 run_python
+  --allow-exec         显式允许 run_python（不安全；仅在隔离环境使用）
+  --no-exec            关闭 run_python（兼容参数；默认已关闭）
   --time-limit N       单任务墙钟秒数（默认取配置）
   --max-challenges N   并发窗口（默认取配置，硬上限 3）
   --web                启动 Web 控制台
@@ -96,7 +97,9 @@ chronos [flags]
 | `DEFER_RETRY_COOLDOWN_SECONDS` | `120` | deferred 重试冷却 |
 | `AUTO_RESUME_IDLE_SECONDS` | `240` | 死锁自愈阈值 |
 | `MAX_BUMPS` | `20` | 每个 executor 的硬性 bump 上限（兜底） |
-| `ALLOW_LOCAL_EXEC` | `true` | 是否允许 run_python |
+| `ALLOW_LOCAL_EXEC` | `false` | 是否允许 run_python；仅在 OS/容器隔离中开启 |
+| `TARGET_INSECURE_TLS` | `false` | 是否跳过目标 TLS 证书校验 |
+| `PLATFORM_INSECURE_TLS` | `false` | 是否跳过平台 TLS 证书校验 |
 
 ## 包结构（`internal/`）
 

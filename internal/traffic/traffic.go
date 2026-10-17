@@ -74,7 +74,7 @@ func (l *Log) nextID() string {
 }
 
 // RecordHTTP stores one HTTP exchange and returns its id.
-func (l *Log) RecordHTTP(method, url string, headers map[string]string, body, response, foundBy string) string {
+func (l *Log) RecordHTTP(method, url string, headers map[string]string, body, response, foundBy string) (string, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	id := l.nextID()
@@ -93,12 +93,11 @@ func (l *Log) RecordHTTP(method, url string, headers map[string]string, body, re
 	ex := &Exchange{ID: id, Kind: "http", Target: clip(url, 600), Method: strings.ToUpper(method),
 		Status: status, RequestText: clip(req, 8000), Response: clip(response, 24000),
 		RespLen: len(response), FoundBy: foundBy, TS: now()}
-	l.store(ex)
-	return id
+	return id, l.store(ex)
 }
 
 // RecordTCP stores one TCP exchange and returns its id.
-func (l *Log) RecordTCP(host string, port int, payload, payloadHex, response, foundBy string) string {
+func (l *Log) RecordTCP(host string, port int, payload, payloadHex, response, foundBy string) (string, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	id := l.nextID()
@@ -112,14 +111,16 @@ func (l *Log) RecordTCP(host string, port int, payload, payloadHex, response, fo
 	ex := &Exchange{ID: id, Kind: "tcp", Target: target, Method: "TCP",
 		RequestText: clip(req, 8000), Response: clip(response, 24000),
 		RespLen: len(response), FoundBy: foundBy, TS: now()}
-	l.store(ex)
-	return id
+	return id, l.store(ex)
 }
 
-func (l *Log) store(ex *Exchange) {
+func (l *Log) store(ex *Exchange) error {
+	if err := l.append(ex); err != nil {
+		return err
+	}
 	l.byID[ex.ID] = ex
 	l.order = append(l.order, ex.ID)
-	l.append(ex)
+	return nil
 }
 
 func (l *Log) Exists(id string) bool {
@@ -234,37 +235,47 @@ func (l *Log) Get(id, side string, offset, length int) map[string]any {
 
 // ---------------------------- persistence -----------------------------------
 
-func (l *Log) append(ex *Exchange) {
+func (l *Log) append(ex *Exchange) error {
 	if l.Path == "" {
-		return
+		return nil
 	}
-	_ = os.MkdirAll(filepath.Dir(l.Path), 0o755)
-	f, err := os.OpenFile(l.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err := os.MkdirAll(filepath.Dir(l.Path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(l.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		return
+		return err
 	}
 	defer f.Close()
-	if data, err := json.Marshal(ex); err == nil {
-		_, _ = f.Write(append(data, '\n'))
+	data, err := json.Marshal(ex)
+	if err != nil {
+		return err
 	}
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // LoadOrNew loads a mission's traffic log (JSONL) or starts a fresh one.
-func LoadOrNew(missionID, stateDir string) *Log {
+func LoadOrNew(missionID, stateDir string) (*Log, error) {
 	path := filepath.Join(stateDir, "traffic", slug(missionID)+".jsonl")
 	l := &Log{MissionID: missionID, Path: path, byID: map[string]*Exchange{}}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return l
+		if os.IsNotExist(err) {
+			return l, nil
+		}
+		return nil, err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for lineNo, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		var ex Exchange
-		if json.Unmarshal([]byte(line), &ex) != nil {
-			continue
+		if err := json.Unmarshal([]byte(line), &ex); err != nil {
+			return nil, fmt.Errorf("load traffic %s line %d: %w", path, lineNo+1, err)
 		}
 		l.byID[ex.ID] = &ex
 		l.order = append(l.order, ex.ID)
@@ -272,5 +283,5 @@ func LoadOrNew(missionID, stateDir string) *Log {
 			l.seq = n
 		}
 	}
-	return l
+	return l, nil
 }

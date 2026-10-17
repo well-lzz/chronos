@@ -30,7 +30,8 @@ chronos                               # 默认：对 TSec 平台跑机械调度�
 chronos --web                         # 调度器 + Web 控制台（默认 http://127.0.0.1:8000）
 chronos --engagement <config.json>    # 一次真实授权评估（无平台/调度器）
   --model SPEC         模型规格，可重复（默认 deepseek/deepseek-chat）
-  --no-exec            关闭 run_python
+  --allow-exec         显式允许 run_python（不安全；仅在隔离环境使用）
+  --no-exec            关闭 run_python（兼容参数；默认已关闭）
   --time-limit N       单任务墙钟秒数（默认取配置）
   --max-challenges N   并发窗口（默认取配置，硬上限 3）
   --web-host/--web-port
@@ -52,7 +53,9 @@ chronos --engagement <config.json>    # 一次真实授权评估（无平台/调
 | `CHRONOS_STATE_DIR` | `.chronos-state` | 黑板/流量/报告/工作区根目录 |
 | `MAX_BUMPS` | `20` | 每个 executor 的硬性 bump 上限（兜底） |
 | `CHALLENGE_TIME_LIMIT_SECONDS` | `1800` | 默认墙钟预算 |
-| `ALLOW_LOCAL_EXEC` | `true` | 是否允许 run_python |
+| `ALLOW_LOCAL_EXEC` | `false` | 是否允许 run_python；仅在 OS/容器隔离中开启 |
+| `TARGET_INSECURE_TLS` | `false` | 是否跳过目标 TLS 证书校验 |
+| `PLATFORM_INSECURE_TLS` | `false` | 是否跳过平台 TLS 证书校验 |
 
 ## 包结构（`internal/`）
 

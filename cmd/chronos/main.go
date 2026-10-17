@@ -42,6 +42,7 @@ func main() {
 	var (
 		engPath   string
 		models    modelList
+		allowExec bool
 		noExec    bool
 		timeLimit int
 		webUI     bool
@@ -51,7 +52,8 @@ func main() {
 	)
 	flag.StringVar(&engPath, "engagement", "", "run an Assessment engagement from a scope config (JSON)")
 	flag.Var(&models, "model", "model spec, repeatable (default deepseek/deepseek-chat)")
-	flag.BoolVar(&noExec, "no-exec", false, "disable the run_python tool")
+	flag.BoolVar(&allowExec, "allow-exec", false, "allow model-generated Python on this host (unsafe; opt-in)")
+	flag.BoolVar(&noExec, "no-exec", false, "disable the run_python tool (deprecated; execution is disabled by default)")
 	flag.IntVar(&timeLimit, "time-limit", 0, "per-mission wall-clock seconds (default from config)")
 	flag.BoolVar(&webUI, "web", false, "launch the web console alongside the scheduler")
 	flag.StringVar(&webHost, "web-host", "127.0.0.1", "web console host")
@@ -68,6 +70,9 @@ func main() {
 	}
 
 	cfg := config.Load()
+	if allowExec {
+		cfg.AllowLocalExec = true
+	}
 	if noExec {
 		cfg.AllowLocalExec = false
 	}
@@ -105,7 +110,10 @@ func main() {
 	}
 
 	// Otherwise run the mechanical scheduler against the TSec platform.
-	runScheduler(cfg, specs, llmStore, webUI, webHost, webPort)
+	if err := runScheduler(cfg, specs, llmStore, webUI, webHost, webPort); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 }
 
 // loadDotEnv reads simple KEY=VALUE lines from path and sets any that are not
@@ -141,11 +149,10 @@ func loadDotEnv(path string) {
 	}
 }
 
-func runScheduler(cfg config.Settings, specs []string, llmStore *llmconfig.Store, webUI bool, webHost string, webPort int) {
-	pf, err := platform.New(cfg.PlatformMode, cfg.PlatformBase(), cfg.BenchmarkToken)
+func runScheduler(cfg config.Settings, specs []string, llmStore *llmconfig.Store, webUI bool, webHost string, webPort int) error {
+	pf, err := platform.New(cfg.PlatformMode, cfg.PlatformBase(), cfg.BenchmarkToken, cfg.PlatformInsecureTLS)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		return err
 	}
 	sch := scheduler.New(pf, cfg, specs)
 	sch.LLM = llmStore
@@ -158,12 +165,12 @@ func runScheduler(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 	if webUI {
 		fmt.Printf("Web console → http://%s:%d (Ctrl+C to stop)\n", webHost, webPort)
 		go func() {
-			if err := web.Serve(sch, llmStore, webHost, webPort); err != nil {
+			if err := web.Serve(ctx, sch, llmStore, webHost, webPort); err != nil {
 				fmt.Fprintln(os.Stderr, "web console error:", err)
 			}
 		}()
 	}
-	sch.Run(ctx)
+	return sch.Run(ctx)
 }
 
 func runEngagement(cfg config.Settings, path string, specs []string, llmStore *llmconfig.Store, webUI bool, webHost string, webPort int) error {
@@ -179,8 +186,14 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 	fmt.Println("  Egress is locked to this scope — out-of-scope hosts are blocked.")
 	fmt.Printf("  Models: %s\n\n", strings.Join(specs, ", "))
 
-	bb := blackboard.LoadOrNew(eng.Name, cfg.StateDir)
-	tl := traffic.LoadOrNew(eng.Name, cfg.StateDir)
+	bb, err := blackboard.LoadOrNew(eng.Name, cfg.StateDir)
+	if err != nil {
+		return fmt.Errorf("load blackboard: %w", err)
+	}
+	tl, err := traffic.LoadOrNew(eng.Name, cfg.StateDir)
+	if err != nil {
+		return fmt.Errorf("load traffic log: %w", err)
+	}
 
 	budget := eng.TimeBudgetSeconds
 	if budget <= 0 {
@@ -200,7 +213,7 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 		runner := engrun.New(sw, bb, meta, cancel, deadline)
 		fmt.Printf("Web console → http://%s:%d (findings: confirmed/suspected/failed)\n\n", webHost, webPort)
 		go func() {
-			if err := web.Serve(runner, llmStore, webHost, webPort); err != nil {
+			if err := web.Serve(ctx, runner, llmStore, webHost, webPort); err != nil {
 				fmt.Fprintln(os.Stderr, "web console error:", err)
 			}
 		}()

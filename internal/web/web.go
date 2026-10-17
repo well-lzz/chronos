@@ -6,13 +6,18 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/well-lzz/chronos/internal/console"
@@ -30,7 +35,10 @@ var distFS embed.FS
 // Serve starts the console HTTP server over any console.Source (the scheduler
 // or a single engagement). store, when non-nil, backs the model-settings panel.
 // The caller runs it in a goroutine.
-func Serve(src console.Source, store *llmconfig.Store, host string, port int) error {
+func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host string, port int) error {
+	if !loopbackHost(host) {
+		return fmt.Errorf("web console refuses non-loopback host %q; use 127.0.0.1, ::1, or localhost", host)
+	}
 	mux := http.NewServeMux()
 
 	sub, err := fs.Sub(distFS, "dist")
@@ -83,7 +91,7 @@ func Serve(src console.Source, store *llmconfig.Store, host string, port int) er
 			Model     string `json:"model"`
 			Message   string `json:"message"`
 		}
-		if json.NewDecoder(r.Body).Decode(&c) != nil {
+		if !decodeJSON(w, r, &c) {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
@@ -109,7 +117,7 @@ func Serve(src console.Source, store *llmconfig.Store, host string, port int) er
 			return
 		}
 		var p llmconfig.Profile
-		if json.NewDecoder(r.Body).Decode(&p) != nil {
+		if !decodeJSON(w, r, &p) {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
@@ -123,12 +131,19 @@ func Serve(src console.Source, store *llmconfig.Store, host string, port int) er
 	})
 
 	mux.HandleFunc("/api/llm/test", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
 		if store == nil {
 			writeJSON(w, map[string]any{"ok": false, "error": "settings unavailable"})
 			return
 		}
 		var p llmconfig.Profile
-		_ = json.NewDecoder(r.Body).Decode(&p)
+		if !decodeJSON(w, r, &p) {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
 		// An omitted key means "test the saved one".
 		if p.APIKey == "" {
 			saved := store.Get()
@@ -147,12 +162,59 @@ func Serve(src console.Source, store *llmconfig.Store, host string, port int) er
 		writeJSON(w, map[string]any{"ok": true})
 	})
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	log.Printf("Web console on http://%s", addr)
-	return http.ListenAndServe(addr, mux)
+	server := &http.Server{
+		Addr: addr, Handler: protect(mux), ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
+	}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(dst) == nil
+}
+
+func loopbackHost(host string) bool {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func protect(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Cache-Control", "no-store")
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				u, err := url.Parse(origin)
+				if err != nil || !strings.EqualFold(u.Host, r.Host) {
+					http.Error(w, "cross-origin request blocked", http.StatusForbidden)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }

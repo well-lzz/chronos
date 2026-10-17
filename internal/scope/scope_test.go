@@ -41,3 +41,10 @@ func TestEmptyAllowsNothing(t *testing.T) {
 		t.Fatal("empty scope must allow nothing")
 	}
 }
+
+func TestBracketedIPv6WithPort(t *testing.T) {
+	s := Parse([]string{"[::1]:8443"})
+	if !s.Allows("::1") {
+		t.Fatal("bracketed IPv6 target with port was not normalized")
+	}
+}

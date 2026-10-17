@@ -58,6 +58,7 @@ type Scheduler struct {
 	pending        map[string]bool
 	openContainers map[string]bool
 	spawnFailures  map[string]int
+	pulls          sync.WaitGroup
 
 	cmds chan Command
 }
@@ -86,13 +87,23 @@ func (s *Scheduler) Enqueue(c Command) {
 func (s *Scheduler) Poller() *poller.Poller { return s.poll }
 
 // Run drives the loop until ctx is cancelled or everything is solved.
-func (s *Scheduler) Run(ctx context.Context) {
+func (s *Scheduler) Run(ctx context.Context) error {
+	runCtx := ctx
+	cancel := func() {}
+	if s.cfg.TotalBudgetSeconds > 0 {
+		runCtx, cancel = context.WithDeadline(ctx, s.runStart.Add(time.Duration(s.cfg.TotalBudgetSeconds)*time.Second))
+	}
+	defer cancel()
+
 	pmin, pmax := 5*time.Second, 15*time.Second
 	s.poll = poller.New(s.pf, (pmin+pmax)/2, (pmax-pmin)/2)
-	s.poll.Start(ctx)
+	if err := s.poll.Start(runCtx); err != nil {
+		s.shutdown()
+		return err
+	}
 	log.Printf("Scheduler starting: %d model(s), %d challenges", len(s.specs), len(s.poll.KnownChallenges()))
 
-	s.autoSpawnUnsolved(ctx)
+	s.autoSpawnUnsolved(runCtx)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	lastStatus := time.Now()
@@ -100,24 +111,27 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
+			if ctx.Err() == nil {
+				log.Printf("Global budget exhausted; stopping all active work.")
+			}
 			s.shutdown()
-			return
+			return nil
 		case ev := <-s.poll.Events():
-			s.handleEvent(ctx, ev)
+			s.handleEvent(runCtx, ev)
 		case c := <-s.cmds:
-			s.handleCommand(ctx, c)
+			s.handleCommand(runCtx, c)
 		case <-ticker.C:
 		}
 
-		if s.reapAndRefill(ctx) {
+		if s.reapAndRefill(runCtx) {
 			// slot freed; refill already attempted inside
 		}
 
 		if time.Since(lastStatus) >= 60*time.Second {
 			lastStatus = time.Now()
-			s.autoSpawnUnsolved(ctx)
-			deadlockSince = s.handleDeadlock(ctx, deadlockSince)
+			s.autoSpawnUnsolved(runCtx)
+			deadlockSince = s.handleDeadlock(runCtx, deadlockSince)
 		}
 
 		// Clean termination: everything solved and nothing in flight.
@@ -129,7 +143,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 		if activeOrPending == 0 && len(known) > 0 && len(solved) >= len(known) {
 			log.Printf("All challenges solved; scheduler exiting.")
 			s.shutdown()
-			return
+			return nil
 		}
 	}
 }
@@ -200,6 +214,7 @@ func (s *Scheduler) killSwarm(name string, solved bool) {
 // reapAndRefill removes finished runs (deferring unsolved ones) and refills.
 func (s *Scheduler) reapAndRefill(ctx context.Context) bool {
 	var freed bool
+	var releases []string
 	s.mu.Lock()
 	for name, r := range s.runs {
 		select {
@@ -213,12 +228,15 @@ func (s *Scheduler) reapAndRefill(ctx context.Context) bool {
 			}
 			delete(s.runs, name)
 			delete(s.openContainers, name)
-			s.pf.ReleaseChallenge(name)
+			releases = append(releases, name)
 			freed = true
 		default:
 		}
 	}
 	s.mu.Unlock()
+	for _, name := range releases {
+		s.pf.ReleaseChallenge(name)
+	}
 	if freed {
 		s.autoSpawnUnsolved(ctx)
 	}
@@ -241,8 +259,8 @@ func (s *Scheduler) perChallengeLimit(meta mission.Meta) time.Duration {
 		if int(rg) < limit {
 			limit = int(rg)
 		}
-		if limit < 60 {
-			limit = 60
+		if limit < 1 {
+			limit = 1
 		}
 	}
 	return time.Duration(limit) * time.Second
@@ -307,7 +325,6 @@ func (s *Scheduler) autoSpawnUnsolved(ctx context.Context) {
 				retry = append(retry, c)
 			}
 		}
-		s.mu.Unlock()
 		sort.Slice(retry, func(i, j int) bool {
 			ai, bi := s.attempts[retry[i].Name], s.attempts[retry[j].Name]
 			if ai != bi {
@@ -315,6 +332,7 @@ func (s *Scheduler) autoSpawnUnsolved(ctx context.Context) {
 			}
 			return priorityLess(retry[i], retry[j])
 		})
+		s.mu.Unlock()
 		if len(retry) > remaining {
 			retry = retry[:remaining]
 		}
@@ -367,8 +385,10 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 	s.attempts[name]++
 	s.mu.Unlock()
 
+	s.pulls.Add(1)
 	go func() {
-		meta, err := s.pf.PullChallenge(ch)
+		defer s.pulls.Done()
+		meta, err := s.pf.PullChallenge(ctx, ch)
 		s.mu.Lock()
 		delete(s.pending, name)
 		if err != nil {
@@ -384,11 +404,26 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 		delete(s.spawnFailures, name)
 		s.openContainers[name] = true
 		sctx, cancel := context.WithTimeout(ctx, s.perChallengeLimit(meta))
+		bb, bbErr := blackboard.LoadOrNew(meta.Name, s.cfg.StateDir)
+		tl, tlErr := traffic.LoadOrNew(meta.Name, s.cfg.StateDir)
+		if bbErr != nil || tlErr != nil {
+			cancel()
+			delete(s.openContainers, name)
+			s.deferred[name] = "state load failed"
+			s.deferTime[name] = time.Now()
+			s.mu.Unlock()
+			s.pf.ReleaseChallenge(name)
+			if bbErr != nil {
+				log.Printf("State load failed for %s: %v", name, bbErr)
+			} else {
+				log.Printf("Traffic load failed for %s: %v", name, tlErr)
+			}
+			return
+		}
 		sw := &swarm.Swarm{
 			Meta: meta, Scope: scope.ParseConnInfo(meta.ConnectionInfo), ModelSpecs: s.specs,
 			Settings: s.cfg, Platform: s.pf, LLM: s.LLM,
-			BB: blackboard.LoadOrNew(meta.Name, s.cfg.StateDir),
-			TL: traffic.LoadOrNew(meta.Name, s.cfg.StateDir),
+			BB: bb, TL: tl,
 		}
 		r := &run{sw: sw, cancel: cancel, done: make(chan struct{}), meta: meta}
 		s.runs[name] = r
@@ -409,9 +444,10 @@ func (s *Scheduler) handleDeadlock(ctx context.Context, since time.Time) time.Ti
 	active := len(s.runs) + len(s.pending)
 	unsolved := len(known) - len(solved)
 	deferredAll := len(s.deferred) >= unsolved && unsolved > 0
+	deferredCount := len(s.deferred)
 	s.mu.Unlock()
 	log.Printf("STATUS: %d solved, %d unsolved, %d active, %d deferred",
-		len(solved), unsolved, active, len(s.deferred))
+		len(solved), unsolved, active, deferredCount)
 	if active > 0 || !deferredAll {
 		return time.Time{}
 	}
@@ -445,6 +481,16 @@ func (s *Scheduler) shutdown() {
 		case <-r.done:
 		case <-time.After(10 * time.Second):
 		}
+	}
+	pullsDone := make(chan struct{})
+	go func() {
+		s.pulls.Wait()
+		close(pullsDone)
+	}()
+	select {
+	case <-pullsDone:
+	case <-time.After(10 * time.Second):
+		log.Printf("Timed out waiting for pending platform pulls to stop")
 	}
 	if s.poll != nil {
 		s.poll.Stop()

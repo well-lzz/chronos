@@ -128,17 +128,16 @@ func clip(s string, n int) string {
 
 // ----------------------------- mutations ------------------------------------
 
-func (b *Blackboard) AddFact(statement, evidence, foundBy string) string {
+func (b *Blackboard) AddFact(statement, evidence, foundBy string) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	id := b.nextID("f")
 	b.facts[id] = &Fact{ID: id, Statement: clip(statement, 2000), Evidence: clip(evidence, 2000), FoundBy: foundBy, TS: now()}
 	b.factOrd = append(b.factOrd, id)
-	b.persist()
-	return id
+	return id, b.persist()
 }
 
-func (b *Blackboard) AddFinding(f Finding) string {
+func (b *Blackboard) AddFinding(f Finding) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !severities[f.Severity] {
@@ -162,8 +161,7 @@ func (b *Blackboard) AddFinding(f Finding) string {
 	}
 	b.findings[id] = &f
 	b.findOrd = append(b.findOrd, id)
-	b.persist()
-	return id
+	return id, b.persist()
 }
 
 func dedupRefs(existing []EvidenceRef, add []EvidenceRef) []EvidenceRef {
@@ -184,26 +182,25 @@ func dedupRefs(existing []EvidenceRef, add []EvidenceRef) []EvidenceRef {
 	return existing
 }
 
-func (b *Blackboard) AddEvidenceRefs(findingID string, refs []EvidenceRef) bool {
+func (b *Blackboard) AddEvidenceRefs(findingID string, refs []EvidenceRef) (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	f := b.findings[findingID]
 	if f == nil || len(refs) == 0 {
-		return false
+		return false, nil
 	}
 	f.EvidenceRefs = dedupRefs(f.EvidenceRefs, refs)
-	b.persist()
-	return true
+	return true, b.persist()
 }
 
 // VerifyFinding appends an immutable verification record and updates status to
 // the latest verdict; the finding's original Evidence is never overwritten.
-func (b *Blackboard) VerifyFinding(findingID, verdict, summary, evidence string, refs []EvidenceRef, by string) bool {
+func (b *Blackboard) VerifyFinding(findingID, verdict, summary, evidence string, refs []EvidenceRef, by string) (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	f := b.findings[findingID]
 	if f == nil || !statuses[verdict] {
-		return false
+		return false, nil
 	}
 	f.Verifications = append(f.Verifications, Verification{
 		Verdict: verdict, Summary: clip(summary, 1000), Evidence: clip(evidence, 4000),
@@ -215,31 +212,28 @@ func (b *Blackboard) VerifyFinding(findingID, verdict, summary, evidence string,
 		f.VerifiedTS = &t
 	}
 	f.EvidenceRefs = dedupRefs(f.EvidenceRefs, refs)
-	b.persist()
-	return true
+	return true, b.persist()
 }
 
-func (b *Blackboard) AddSubgoal(desc, createdBy string) string {
+func (b *Blackboard) AddSubgoal(desc, createdBy string) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	id := b.nextID("g")
 	b.subgoals[id] = &SubGoal{ID: id, Description: clip(desc, 500), Status: "open", CreatedBy: createdBy, TS: now()}
 	b.goalOrd = append(b.goalOrd, id)
-	b.persist()
-	return id
+	return id, b.persist()
 }
 
-func (b *Blackboard) ResolveSubgoal(id, outcome string) bool {
+func (b *Blackboard) ResolveSubgoal(id, outcome string) (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	g := b.subgoals[id]
 	if g == nil {
-		return false
+		return false, nil
 	}
 	g.Status = "resolved"
 	g.Outcome = clip(outcome, 1000)
-	b.persist()
-	return true
+	return true, b.persist()
 }
 
 // ------------------------------ reads ---------------------------------------
@@ -484,9 +478,9 @@ type diskModel struct {
 }
 
 // persist assumes the caller holds the lock.
-func (b *Blackboard) persist() {
+func (b *Blackboard) persist() error {
 	if b.Path == "" {
-		return
+		return nil
 	}
 	m := diskModel{MissionID: b.MissionID, Seq: b.seq}
 	for _, id := range b.factOrd {
@@ -500,26 +494,36 @@ func (b *Blackboard) persist() {
 	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.MkdirAll(filepath.Dir(b.Path), 0o755)
+	if err := os.MkdirAll(filepath.Dir(b.Path), 0o700); err != nil {
+		return err
+	}
 	tmp := b.Path + ".tmp"
-	if os.WriteFile(tmp, data, 0o644) == nil {
-		_ = os.Rename(tmp, b.Path)
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
 	}
+	if err := os.Rename(tmp, b.Path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // LoadOrNew loads a mission's blackboard from state_dir, or starts a fresh one.
-func LoadOrNew(missionID, stateDir string) *Blackboard {
+func LoadOrNew(missionID, stateDir string) (*Blackboard, error) {
 	path := filepath.Join(stateDir, "blackboards", slug(missionID)+".json")
 	b := newBoard(missionID, path)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return b
+		if os.IsNotExist(err) {
+			return b, nil
+		}
+		return nil, err
 	}
 	var m diskModel
-	if json.Unmarshal(data, &m) != nil {
-		return newBoard(missionID, path) // corrupt → fresh
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("load blackboard %s: %w", path, err)
 	}
 	b.seq = m.Seq
 	for i := range m.Facts {
@@ -537,5 +541,5 @@ func LoadOrNew(missionID, stateDir string) *Blackboard {
 		b.subgoals[g.ID] = &g
 		b.goalOrd = append(b.goalOrd, g.ID)
 	}
-	return b
+	return b, nil
 }
