@@ -92,6 +92,9 @@ func BuildHeadlessPrompt(m mission.Meta, remainingSeconds int, allowExec bool) s
 	if allowExec {
 		w("- `run_python(code)`: local CPython scratchpad (if available on the host). Its sockets")
 		w("  are scope-locked too.")
+		w("- `run_tool(tool, target, args)`: run an allowlisted external tool (nmap/httpx/nuclei/ffuf,")
+		w("  only those installed) against one in-scope target — deeper service/version scans,")
+		w("  templated vuln checks, content discovery. args are flags only; the target is scope-checked.")
 	}
 	if hasFlags {
 		w("- `submit_flag(flag)`: if the target yields a flag, submit it verbatim; recorded as a")

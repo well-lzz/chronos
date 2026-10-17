@@ -27,6 +27,8 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 		return s.toolTLS(ctx, argsJSON)
 	case "run_python":
 		return s.toolRunPython(ctx, argsJSON)
+	case "run_tool":
+		return s.toolRunTool(ctx, argsJSON)
 	case "add_fact":
 		return s.toolAddFact(argsJSON)
 	case "add_finding":

@@ -105,6 +105,16 @@ func toolDefs(allowExec, hasFlags bool) []openai.Tool {
 			params     map[string]any
 		}{"run_python", "Local CPython scratchpad (if available). Its sockets are scope-locked. print() what you need.",
 			obj(map[string]any{"code": strProp("python source")}, "code")})
+		defs = append(defs, struct {
+			name, desc string
+			params     map[string]any
+		}{"run_tool", "Run an allowlisted external security tool (nmap|httpx|nuclei|ffuf — only those installed) against ONE in-scope target. No shell; the target is scope-checked; args are flags only (no second target, no -iL/-l target-list flags). Returns the tool output and a traffic id.",
+			obj(map[string]any{
+				"tool":            strProp("one of: nmap, httpx, nuclei, ffuf"),
+				"target":          strProp("a single in-scope host or URL (for ffuf, a URL containing FUZZ)"),
+				"args":            map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "extra flags only, e.g. [\"-sV\",\"-p\",\"80,443\"]"},
+				"timeout_seconds": map[string]any{"type": "integer", "description": "optional, default 180, max 300"},
+			}, "tool", "target")})
 	}
 	if hasFlags {
 		defs = append(defs, struct {
