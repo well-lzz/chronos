@@ -150,13 +150,26 @@ func (s *Swarm) Run(ctx context.Context) string {
 }
 
 func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string) string {
-	maxBumps := s.Settings.MaxBumps
-	if maxBumps <= 0 {
-		maxBumps = 20
+	// Stop semantics are mode-aware:
+	//   - benchmark (Platform set): a shared budget spread over many tasks, so an
+	//     executor that stops making progress YIELDS the task to the scheduler to
+	//     maximize coverage; the retry ceiling is only a backstop.
+	//   - engagement (no Platform): one authorized target with an operator present,
+	//     so there is no program-decided early stop — only the operator (kill) or
+	//     the wall-clock budget ends it. (The user-defined termination hook still
+	//     applies in both modes; it defaults to never.)
+	const noProgressYieldLimit = 3
+	benchmark := s.Platform != nil
+	bumpCap := 0 // engagement: unbounded
+	if benchmark {
+		bumpCap = s.Settings.MaxBumps
+		if bumpCap <= 0 {
+			bumpCap = 20
+		}
 	}
 	retry := time.Duration(s.Settings.SolverRetryDelayS * float64(time.Second))
 	started := time.Now()
-	bumps, cycles := 0, 0
+	bumps, cycles, noProgress := 0, 0, 0
 	s.setStatus(spec, "running")
 
 	for {
@@ -219,8 +232,23 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 
 		if res.Status == solver.StatusGaveUp || res.Status == solver.StatusError {
 			bumps++
-			if bumps > maxBumps {
-				log.Printf("[%s/%s] max bumps (%d) reached", s.Meta.Name, spec, maxBumps)
+			// Progress is the shared discovery marker; a sibling's progress counts,
+			// so a task only "stalls" when every executor on it stops advancing.
+			if s.BB.ProgressMarker() > markerBefore {
+				noProgress = 0
+			} else {
+				noProgress++
+			}
+			// Benchmark only: yield a stalled task so the scheduler can spend the
+			// shared budget attempting other challenges.
+			if benchmark && noProgress >= noProgressYieldLimit {
+				log.Printf("[%s/%s] no new progress for %d cycles — yielding task to scheduler", s.Meta.Name, spec, noProgress)
+				s.emit(spec, res.StepCount, "text", "", "No new progress; yielding this task so the scheduler can move on.")
+				s.setStatus(spec, "finished")
+				return ""
+			}
+			if bumpCap > 0 && bumps > bumpCap {
+				log.Printf("[%s/%s] retry ceiling (%d) reached", s.Meta.Name, spec, bumpCap)
 				s.emit(spec, res.StepCount, "text", "", "Executor stopped: retry ceiling reached after repeated failures.")
 				s.setStatus(spec, "finished")
 				return ""
