@@ -64,17 +64,20 @@ func TestDeepSeekSecondEnvironmentKeyReachesRealClientRequests(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	want := []string{
-		"Bearer first-platform-value",
-		"Bearer second-platform-value",
-		"Bearer second-platform-value",
+	// The rotation start is randomized per client, so assert intent rather than a
+	// fixed order: three HTTP calls (one 429 + its failover retry, then one more),
+	// the failover switched to the other key, and BOTH env keys reached the server.
+	if len(authorizations) != 3 {
+		t.Fatalf("authorization calls = %#v, want 3 (429 + failover + second request)", authorizations)
 	}
-	if len(authorizations) != len(want) {
-		t.Fatalf("authorization calls = %#v, want %#v", authorizations, want)
+	if authorizations[0] == authorizations[1] {
+		t.Fatalf("failover did not switch keys: %#v", authorizations)
 	}
-	for i := range want {
-		if authorizations[i] != want[i] {
-			t.Fatalf("authorization[%d] = %q, want %q", i, authorizations[i], want[i])
-		}
+	seen := map[string]bool{}
+	for _, a := range authorizations {
+		seen[a] = true
+	}
+	if !seen["Bearer first-platform-value"] || !seen["Bearer second-platform-value"] {
+		t.Fatalf("both env keys must reach real requests, saw %#v", authorizations)
 	}
 }

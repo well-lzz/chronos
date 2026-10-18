@@ -60,7 +60,8 @@ type Scheduler struct {
 	spawnFailures  map[string]int
 	pulls          sync.WaitGroup
 
-	cmds chan Command
+	cmds              chan Command
+	reconcileRequests chan struct{}
 }
 
 func New(pf platform.Platform, cfg config.Settings, specs []string) *Scheduler {
@@ -73,6 +74,7 @@ func New(pf platform.Platform, cfg config.Settings, specs []string) *Scheduler {
 		runs: map[string]*run{}, deferred: map[string]string{}, attempts: map[string]int{},
 		deferTime: map[string]time.Time{}, pending: map[string]bool{}, openContainers: map[string]bool{},
 		spawnFailures: map[string]int{}, cmds: make(chan Command, 64),
+		reconcileRequests: make(chan struct{}, 1),
 	}
 }
 
@@ -110,6 +112,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	var deadlockSince time.Time
 
 	for {
+		reconcileNow := false
 		select {
 		case <-runCtx.Done():
 			if ctx.Err() == nil {
@@ -121,6 +124,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			s.handleEvent(runCtx, ev)
 		case c := <-s.cmds:
 			s.handleCommand(runCtx, c)
+		case <-s.reconcileRequests:
+			reconcileNow = true
 		case <-ticker.C:
 		}
 
@@ -131,6 +136,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			log.Printf("Benchmark task finished on platform; stopping scheduler cleanly.")
 			s.shutdown()
 			return nil
+		}
+		if reconcileNow {
+			s.reconcileContainers()
+			s.autoSpawnUnsolved(runCtx)
 		}
 
 		if s.reapAndRefill(runCtx) {
@@ -443,11 +452,13 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 			}
 			s.mu.Unlock()
 			log.Printf("Auto-spawn failed for %s: %v", name, err)
-			// "max active instances reached" means a slot is held by a container we
-			// failed to close. Reconcile immediately (reap the stale one) instead of
-			// waiting for the 60s sweep, so the next spawn can succeed.
+			// Schedule reconciliation on the coordinator loop. Running it here can
+			// race with a new spawn and close a container missing from an old snapshot.
 			if platform.IsAtCapacity(err) {
-				s.reconcileContainers()
+				select {
+				case s.reconcileRequests <- struct{}{}:
+				default: // a reconciliation is already queued
+				}
 			}
 			return
 		}
