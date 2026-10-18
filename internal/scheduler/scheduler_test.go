@@ -111,3 +111,28 @@ func TestReconcilePreservesOwnedContainers(t *testing.T) {
 		}
 	}
 }
+
+func TestCapacityFailureQueuesReconciliationOnSchedulerLoop(t *testing.T) {
+	pf := &fakePlatform{pullErr: platform.ErrAtCapacity}
+	s := New(pf, config.Settings{MaxConcurrent: 1}, nil)
+	s.poll = poller.New(pf, time.Hour, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.poll.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.poll.Stop()
+
+	s.spawnOne(ctx, "slow")
+	s.pulls.Wait()
+	if pf.staleKeep != nil {
+		t.Fatal("pull goroutine reconciled containers outside the scheduler loop")
+	}
+	if len(s.reconcileRequests) != 1 {
+		t.Fatal("capacity failure did not queue a reconciliation")
+	}
+	s.reconcileContainers()
+	if pf.staleKeep == nil {
+		t.Fatal("queued reconciliation did not reach the platform")
+	}
+}
