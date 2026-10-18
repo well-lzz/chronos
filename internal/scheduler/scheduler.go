@@ -124,6 +124,15 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 
+		// Terminal platform state: the benchmark task was finished/expired on the
+		// platform. Every start/poll now fails, so stop cleanly instead of churning
+		// deferred retries until the global budget runs out.
+		if s.poll.Terminal() {
+			log.Printf("Benchmark task finished on platform; stopping scheduler cleanly.")
+			s.shutdown()
+			return nil
+		}
+
 		if s.reapAndRefill(runCtx) {
 			// slot freed; refill already attempted inside
 		}
@@ -434,6 +443,12 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 			}
 			s.mu.Unlock()
 			log.Printf("Auto-spawn failed for %s: %v", name, err)
+			// "max active instances reached" means a slot is held by a container we
+			// failed to close. Reconcile immediately (reap the stale one) instead of
+			// waiting for the 60s sweep, so the next spawn can succeed.
+			if platform.IsAtCapacity(err) {
+				s.reconcileContainers()
+			}
 			return
 		}
 		delete(s.spawnFailures, name)

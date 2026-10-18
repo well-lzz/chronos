@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -114,6 +116,39 @@ func TestCapacityErrorSupportsHostedAPIMessage(t *testing.T) {
 	}
 	if isCapacityError([]byte(`{"code":"invalid_state","message":"task expired"}`)) {
 		t.Fatal("task expiration must not be retried as capacity pressure")
+	}
+}
+
+func TestFetchChallengesTerminalStateMapsToSentinel(t *testing.T) {
+	adapter := NewTSec("https://benchmark.example", "test-token", false)
+	adapter.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return testJSONResponse(http.StatusConflict, apiErrorBody{
+			Code: "invalid_state", Message: "task task_S6FnqHpmrvR already finished",
+		}), nil
+	})
+	_, err := adapter.FetchAllChallenges()
+	if err == nil {
+		t.Fatal("expected an error for a finished task")
+	}
+	if !IsTaskNotRunnable(err) {
+		t.Fatalf("finished-task error must satisfy IsTaskNotRunnable, got %v", err)
+	}
+	if IsAtCapacity(err) {
+		t.Fatal("a terminal task must not be classified as a capacity error")
+	}
+}
+
+func TestSentinelClassifiersAreDistinct(t *testing.T) {
+	notRunnable := fmt.Errorf("%w: boom", ErrTaskNotRunnable)
+	capacity := fmt.Errorf("%w: start web-1: %w", ErrAtCapacity, errors.New("HTTP 409"))
+	if !IsTaskNotRunnable(notRunnable) || IsAtCapacity(notRunnable) {
+		t.Fatal("ErrTaskNotRunnable misclassified")
+	}
+	if !IsAtCapacity(capacity) || IsTaskNotRunnable(capacity) {
+		t.Fatal("ErrAtCapacity misclassified")
+	}
+	if IsTaskNotRunnable(errors.New("plain")) || IsAtCapacity(errors.New("plain")) {
+		t.Fatal("plain error must match neither sentinel")
 	}
 }
 
