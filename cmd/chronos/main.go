@@ -23,6 +23,7 @@ import (
 	"github.com/well-lzz/chronos/internal/config"
 	"github.com/well-lzz/chronos/internal/engagement"
 	"github.com/well-lzz/chronos/internal/engrun"
+	"github.com/well-lzz/chronos/internal/llm"
 	"github.com/well-lzz/chronos/internal/llmconfig"
 	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/report"
@@ -143,10 +144,12 @@ func runPreflight(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 	modelLabel, modelBase, modelKeyCount := "", "", 0
 	if llmStore != nil && llmStore.Active() {
 		profile := llmStore.Get()
-		modelLabel, modelBase, modelKeyCount = profile.Label(), profile.BaseURL, 1
+		modelLabel, modelBase = profile.Label(), profile.BaseURL
 		if cfg.TSecBenchHosted {
 			modelBase = config.TSecBenchGatewayURL(modelBase)
 		}
+		// Reflect the real rotation set: a DeepSeek profile pools the env keys too.
+		modelKeyCount = len(llm.ProfileKeys(profile, cfg))
 	} else if len(specs) > 0 {
 		modelLabel = specs[0]
 		provider := strings.SplitN(specs[0], "/", 2)[0]

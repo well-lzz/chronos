@@ -7,7 +7,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -70,9 +72,71 @@ func newClient(baseURL string, keys []string) *openai.Client {
 	oc := openai.DefaultConfig(keys[0])
 	oc.BaseURL = baseURL
 	if len(keys) > 1 {
-		oc.HTTPClient = &keyPoolDoer{base: &http.Client{}, keys: append([]string(nil), keys...)}
+		d := &keyPoolDoer{base: &http.Client{}, keys: append([]string(nil), keys...)}
+		// A fresh client is built each cycle, so starting every one at keys[0] would
+		// skew nearly all first-requests onto one key. Seed the rotation at a random
+		// index so load spreads evenly across the pool from the first call.
+		d.next.Store(uint64(rand.Intn(len(keys))))
+		oc.HTTPClient = d
 	}
 	return openai.NewClientWithConfig(oc)
+}
+
+// ProfileKeys returns the key set a profile-built client rotates over. For a
+// DeepSeek endpoint it pools the profile's own key together with the environment
+// DeepSeek pool (DEEPSEEK_API_KEY / _2 / _KEYS), de-duplicated, so both keys share
+// the load instead of the profile's single key carrying everything. For any other
+// provider it is just the profile key.
+func ProfileKeys(p llmconfig.Profile, cfg config.Settings) []string {
+	base := strings.TrimSpace(p.BaseURL)
+	if cfg.TSecBenchHosted {
+		base = config.TSecBenchGatewayURL(base)
+	}
+	return poolKeys(base, strings.TrimSpace(p.APIKey), cfg)
+}
+
+func poolKeys(base, profileKey string, cfg config.Settings) []string {
+	var keys []string
+	seen := map[string]bool{}
+	add := func(k string) {
+		k = strings.TrimSpace(k)
+		if k != "" && !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	add(profileKey)
+	if isDeepSeekEndpoint(base, cfg) {
+		for _, k := range cfg.DeepSeekKeys {
+			add(k)
+		}
+		add(cfg.DeepSeekKey)
+	}
+	return keys
+}
+
+// isDeepSeekEndpoint reports whether base points at the same host as the
+// configured DeepSeek endpoint (after the hosted gateway rewrite is applied to
+// both), so env DeepSeek keys are only ever pooled onto a DeepSeek endpoint.
+func isDeepSeekEndpoint(base string, cfg config.Settings) bool {
+	ds := strings.TrimSpace(cfg.DeepSeekBaseURL)
+	if ds == "" {
+		ds = "https://api.deepseek.com/v1"
+	}
+	if cfg.TSecBenchHosted {
+		ds = config.TSecBenchGatewayURL(ds)
+	}
+	return sameHost(base, ds)
+}
+
+func sameHost(a, b string) bool {
+	ua, err1 := url.Parse(a)
+	ub, err2 := url.Parse(b)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	ha, hb := ua.Hostname(), ub.Hostname()
+	return ha != "" && strings.EqualFold(ha, hb)
 }
 
 // FromProfile builds a client for any OpenAI-compatible endpoint described by an
@@ -101,7 +165,14 @@ func FromProfileWithSettings(p llmconfig.Profile, cfg config.Settings) (*openai.
 	if model == "" {
 		return nil, "", fmt.Errorf("no model id configured")
 	}
-	return newClient(base, []string{key}), model, nil
+	// Pool the profile key with the env DeepSeek pool when the endpoint is DeepSeek,
+	// so both keys are exercised (and both issue the profile's model) instead of the
+	// single profile key carrying the whole run.
+	keys := poolKeys(base, key, cfg)
+	if len(keys) == 0 {
+		keys = []string{key}
+	}
+	return newClient(base, keys), model, nil
 }
 
 // Ping issues a tiny completion to confirm a profile's base URL, key, and model
