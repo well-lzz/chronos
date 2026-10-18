@@ -258,6 +258,18 @@ func (s *Solver) messageSnapshot() []openai.ChatCompletionMessage {
 	return append([]openai.ChatCompletionMessage(nil), s.messages...)
 }
 
+// compactMessages bounds the executor's growing transcript in place, dropping
+// older cycles while preserving the system prompt and tool-call pairing. The
+// durable facts/findings live on the blackboard and are re-injected each cycle,
+// so older raw exchanges are redundant.
+func (s *Solver) compactMessages() {
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
+	if out, changed := compactWindow(s.messages, contextMaxKeepTurns, contextBudgetChars); changed {
+		s.messages = out
+	}
+}
+
 func (s *Solver) hasHistory() bool {
 	s.messageMu.Lock()
 	defer s.messageMu.Unlock()
@@ -309,6 +321,7 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 		if time.Now().After(s.deadline) {
 			return Result{Status: StatusGaveUp, Findings: "time budget reached", StepCount: s.steps}
 		}
+		s.compactMessages() // bound the growing transcript before re-sending it
 		resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 			Model: model, Messages: s.messageSnapshot(), Tools: tools,
 		})
