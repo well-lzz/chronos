@@ -15,14 +15,19 @@ RUN groupadd --system chronos \
 COPY --from=build /out/chronos /usr/local/bin/chronos
 RUN chmod 0755 /usr/local/bin/chronos && chown -R chronos:chronos /state
 
+# Scheduler budget tuned for XBOW Validation Benchmarks (104 Web CTF, 360-min
+# limit): internal budget set just under 360 min so the agent winds down
+# gracefully, and a shorter per-challenge cap favors breadth across 104 tasks
+# (stalled tasks yield early via the no-progress yield; productive ones still get
+# up to the cap). Adjust these for a different benchmark profile.
 ENV HOME=/state \
     CHRONOS_STATE_DIR=/state \
     PLATFORM_MODE=tsec \
     TSECBENCH_HOSTED=true \
     MAX_CONCURRENT_CHALLENGES=3 \
-    CHALLENGE_TIME_LIMIT_SECONDS=1800 \
-    KILLCHAIN_TIME_LIMIT_SECONDS=2700 \
-    TOTAL_BENCHMARK_BUDGET_SECONDS=28200 \
+    CHALLENGE_TIME_LIMIT_SECONDS=900 \
+    KILLCHAIN_TIME_LIMIT_SECONDS=1800 \
+    TOTAL_BENCHMARK_BUDGET_SECONDS=21000 \
     MIN_REMAINING_SECONDS_TO_SPAWN=300 \
     MAX_CHALLENGE_ATTEMPTS=3 \
     DEFER_RETRY_COOLDOWN_SECONDS=120 \
