@@ -95,6 +95,36 @@ func TestCompactWindowNoopWhenSmall(t *testing.T) {
 	}
 }
 
+// A user message injected mid tool-loop (operator Guide/SetScope lands between an
+// assistant's tool_calls and their results) must NOT be chosen as a cut point —
+// cutting there would orphan a tool result. Compaction must keep pairing valid.
+func TestCompactWindowIgnoresMidToolUserInjection(t *testing.T) {
+	msgs := []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: "SYS"}}
+	for c := 1; c <= 10; c++ {
+		id1 := fmt.Sprintf("a_%d", c)
+		id2 := fmt.Sprintf("b_%d", c)
+		msgs = append(msgs,
+			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: fmt.Sprintf("cycle %d continue", c)},
+			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, ToolCalls: []openai.ToolCall{
+				{ID: id1, Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "t", Arguments: "{}"}},
+				{ID: id2, Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "t", Arguments: "{}"}},
+			}},
+			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: id1, Content: "r1 " + strings.Repeat("y", 2000)},
+			// operator injection landing BETWEEN the two tool results:
+			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: "[Operator instruction] keep going"},
+			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: id2, Content: "r2 " + strings.Repeat("z", 2000)},
+		)
+	}
+	out, changed := compactWindow(msgs, 3, 20_000)
+	if !changed {
+		t.Fatalf("expected compaction")
+	}
+	assertPairingValid(t, out)
+	if !pairingValid(out) {
+		t.Fatalf("runtime pairingValid disagrees with test helper")
+	}
+}
+
 func TestCompactWindowSingleHugeCycleClips(t *testing.T) {
 	// One cycle whose tool result alone blows the budget: no cycle to drop, so
 	// clipOld must shrink it while keeping pairing valid.
