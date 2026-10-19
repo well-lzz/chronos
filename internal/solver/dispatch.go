@@ -19,6 +19,10 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 		return s.toolHTTP(ctx, argsJSON)
 	case "tcp_send":
 		return s.toolTCP(argsJSON)
+	case "werkzeug_pin":
+		return s.toolWerkzeugPin(argsJSON)
+	case "race":
+		return s.toolRace(ctx, argsJSON)
 	case "run_python":
 		return s.toolRunPython(ctx, argsJSON)
 	case "add_fact":
