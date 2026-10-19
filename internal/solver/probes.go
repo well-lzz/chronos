@@ -108,12 +108,14 @@ func (s *Solver) toolXSSProbe(ctx context.Context, argsJSON string) string {
 		return "xss_probe error: url and param are required"
 	}
 	marker := randToken()
-	// Baseline: does the plain marker reflect at all?
+	// Baseline: does the plain marker reflect in the RESPONSE BODY at all? Checking
+	// the body only (not the whole transcript) excludes the echoed request URL,
+	// which always contains the payload and would otherwise be a false positive.
 	baseDisplay, ok, msg := s.probeFire(ctx, a.URL, a.Method, a.Param, marker)
 	if !ok {
 		return msg
 	}
-	reflects := strings.Contains(baseDisplay, marker)
+	reflects := strings.Contains(httpBody(baseDisplay), marker)
 
 	type res struct {
 		Family   string `json:"family"`
@@ -123,12 +125,17 @@ func (s *Solver) toolXSSProbe(ctx context.Context, argsJSON string) string {
 	}
 	var out []res
 	variants := xssVariants(marker)
+	if len(variants) > probeVariantCap {
+		variants = variants[:probeVariantCap]
+	}
 	for _, v := range variants {
 		display, ok, _ := s.probeFire(ctx, a.URL, a.Method, a.Param, v.Wire)
 		if !ok {
 			continue
 		}
-		bypassed := strings.Contains(display, v.Survive)
+		// Bypassed only if the breakout structure survived UNescaped in the response
+		// body — and only meaningful when the param actually reflects there.
+		bypassed := reflects && strings.Contains(httpBody(display), v.Survive)
 		r := res{Family: v.Family, Payload: v.Wire, Bypassed: bypassed}
 		if bypassed {
 			if tid, err := s.tl.RecordHTTP(methodOr(a.Method), a.URL+"?"+a.Param+"=…", nil, "", display, s.ModelSpec); err == nil {
@@ -206,40 +213,56 @@ func (s *Solver) toolSSRFProbe(ctx context.Context, argsJSON string) string {
 	if ok, _ := s.hostAllowed(tu.Hostname()); !ok {
 		return "ssrf_probe refused: target host " + tu.Hostname() + " is outside the authorized scope. SSRF confirmation is only permitted against in-scope internal targets."
 	}
-	// Baseline: an obviously-bogus host should be blocked/fail; compare others to it.
-	blockedSig := ""
-	if d, ok, _ := s.probeFire(ctx, a.URL, a.Method, a.Param, "http://169.254.169.254.invalid/"); ok {
-		blockedSig = raceSignature(d)
+	variants := ssrfVariants(a.Target)
+	if len(variants) > probeVariantCap {
+		variants = variants[:probeVariantCap]
+	}
+
+	// Baseline is the RAW (unencoded) in-scope target — never an out-of-scope host.
+	// If the sink's filter blocks the raw target, a variant whose response differs
+	// has been treated differently by the filter (a likely bypass). The signature
+	// is status + response body only (outcomeSignature), so the per-variant request
+	// URL can't fake a difference.
+	type row struct {
+		family, value, sig, display string
+	}
+	var rows []row
+	baselineSig := ""
+	for _, v := range variants {
+		display, ok, _ := s.probeFire(ctx, a.URL, a.Method, a.Param, v.URL)
+		if !ok {
+			continue
+		}
+		sig := outcomeSignature(display)
+		if v.Family == "raw" {
+			baselineSig = sig
+		}
+		rows = append(rows, row{v.Family, v.URL, sig, display})
 	}
 
 	type res struct {
 		Family   string `json:"family"`
 		Value    string `json:"value"`
-		Changed  bool   `json:"changed_vs_blocked"`
+		Changed  bool   `json:"changed_vs_raw"`
 		Sig      string `json:"signature"`
 		Evidence string `json:"evidence,omitempty"`
 	}
 	var out []res
-	for _, v := range ssrfVariants(a.Target) {
-		display, ok, _ := s.probeFire(ctx, a.URL, a.Method, a.Param, v.URL)
-		if !ok {
-			continue
-		}
-		sig := raceSignature(display)
-		changed := blockedSig != "" && sig != blockedSig
-		r := res{Family: v.Family, Value: v.URL, Changed: changed, Sig: sig}
+	for _, r := range rows {
+		changed := r.family != "raw" && baselineSig != "" && r.sig != baselineSig
+		rr := res{Family: r.family, Value: r.value, Changed: changed, Sig: r.sig}
 		if changed {
-			if tid, err := s.tl.RecordHTTP(methodOr(a.Method), a.URL+"?"+a.Param+"="+v.URL, nil, "", display, s.ModelSpec); err == nil {
-				r.Evidence = tid
+			if tid, err := s.tl.RecordHTTP(methodOr(a.Method), a.URL+"?"+a.Param+"="+r.value, nil, "", r.display, s.ModelSpec); err == nil {
+				rr.Evidence = tid
 			}
 		}
-		out = append(out, r)
+		out = append(out, rr)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Changed && !out[j].Changed })
 	return jsonOut(map[string]any{
-		"blocked_baseline": blockedSig,
-		"results":          out,
-		"note":             "changed_vs_blocked=true means that host encoding produced a DIFFERENT response than a blocked host — a likely filter bypass that reached the internal target. Confirm the exact content with traffic_get. Stays within the authorized scope.",
+		"raw_baseline_signature": baselineSig,
+		"results":                out,
+		"note":                   "changed_vs_raw=true means that host encoding produced a DIFFERENT status/body than the raw target — a likely filter bypass. If the raw target is already allowed there is no filter to bypass. Confirm the fetched content with traffic_get. All requests stay within the authorized scope.",
 	})
 }
 
@@ -300,13 +323,18 @@ func (s *Solver) toolLFIProbe(ctx context.Context, argsJSON string) string {
 		Excerpt  string `json:"excerpt,omitempty"`
 		Evidence string `json:"evidence,omitempty"`
 	}
+	variants := lfiVariants(a.ProbePath, a.Prefix, a.Suffix)
+	if len(variants) > probeVariantCap {
+		variants = variants[:probeVariantCap]
+	}
 	var out []res
-	for _, v := range lfiVariants(a.ProbePath, a.Prefix, a.Suffix) {
+	for _, v := range variants {
 		display, ok, _ := s.probeFire(ctx, a.URL, a.Method, a.Param, v.Wire)
 		if !ok {
 			continue
 		}
-		read, excerpt := lfiSuccess(display, a.ProbePath, a.Base64Decode || strings.Contains(v.Family, "php-filter"))
+		// Scan the response body only (not the echoed request URL/headers).
+		read, excerpt := lfiSuccess(httpBody(display), a.ProbePath, a.Base64Decode || strings.Contains(v.Family, "php-filter"))
 		r := res{Family: v.Family, Payload: v.Wire, Read: read, Excerpt: excerpt}
 		if read {
 			if tid, err := s.tl.RecordHTTP(methodOr(a.Method), a.URL+"?"+a.Param+"="+v.Wire, nil, "", display, s.ModelSpec); err == nil {

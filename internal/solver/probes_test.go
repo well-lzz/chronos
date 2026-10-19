@@ -1,7 +1,13 @@
 package solver
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -118,4 +124,71 @@ func TestSSRFProbeRefusesOutOfScopeTarget(t *testing.T) {
 	if !strings.Contains(out, "refused") || !strings.Contains(out, "scope") {
 		t.Fatalf("ssrf_probe must refuse an out-of-scope target, got %q", out)
 	}
+}
+
+// --- regression tests for the false-positive fixes ---
+
+func TestXSSProbeNoFalsePositiveWhenBodyDoesNotReflect(t *testing.T) {
+	// Server ignores the param and never reflects it; the payload only ever
+	// appears in the request URL (echoed in the transcript). bypassed must be false.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "<html><body>static page, nothing reflected here</body></html>")
+	}))
+	defer srv.Close()
+	host := mustHost(srv.URL)
+	s := &Solver{scope: scope.Parse([]string{host})}
+	out := s.toolXSSProbe(context.Background(), `{"url":"`+srv.URL+`/page","param":"name"}`)
+	var got struct {
+		MarkerReflected bool `json:"marker_reflected"`
+		Results         []struct {
+			Bypassed bool `json:"bypassed"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("not JSON: %v (%s)", err, out)
+	}
+	if got.MarkerReflected {
+		t.Fatal("marker_reflected true though the body never reflects it (URL echo leaked in)")
+	}
+	for i, r := range got.Results {
+		if r.Bypassed {
+			t.Fatalf("result %d reported bypassed with no body reflection — false positive", i)
+		}
+	}
+}
+
+func TestSSRFProbeNoFalsePositiveOnIdenticalBody(t *testing.T) {
+	// Server returns the SAME body regardless of the fetched-URL param. No variant
+	// should be flagged changed, even though each request URL differs in length.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "fixed response body")
+	}))
+	defer srv.Close()
+	host := mustHost(srv.URL)
+	s := &Solver{scope: scope.Parse([]string{host})}
+	// target is in scope (same host); use an IPv4 literal target so encodings generate.
+	args := `{"url":"` + srv.URL + `/fetch","param":"u","target":"http://127.0.0.1:9/"}`
+	out := s.toolSSRFProbe(context.Background(), args)
+	var got struct {
+		Results []struct {
+			Family  string `json:"family"`
+			Changed bool   `json:"changed_vs_raw"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("not JSON: %v (%s)", err, out)
+	}
+	if len(got.Results) == 0 {
+		t.Fatalf("expected variant results, got none (%s)", out)
+	}
+	for _, r := range got.Results {
+		if r.Changed {
+			t.Fatalf("variant %s flagged changed though every response body is identical — false positive", r.Family)
+		}
+	}
+}
+
+func mustHost(rawURL string) string {
+	u, _ := url.Parse(rawURL)
+	return u.Hostname()
 }
