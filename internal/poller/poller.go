@@ -38,6 +38,7 @@ type Poller struct {
 	known     map[string]bool
 	solved    map[string]bool
 	stubs     map[string]platform.Challenge
+	terminal  bool // platform reported the whole task finished/expired
 	events    chan Event
 	stop      chan struct{}
 	stopOnce  sync.Once
@@ -78,6 +79,16 @@ func (p *Poller) seed() error {
 
 func (p *Poller) Stop() { p.stopOnce.Do(func() { close(p.stop) }) }
 
+// Terminal reports whether the platform has finished/expired the whole benchmark
+// task. Once true, no start or poll can ever succeed again, so the scheduler must
+// stop rather than spin — this is what prevents an hour of dead "deferred" churn
+// after the task is reclaimed.
+func (p *Poller) Terminal() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.terminal
+}
+
 // Refresh replaces cached challenge addresses after the scheduler closes stale
 // containers, so the next pull cannot reuse an address that was just closed.
 func (p *Poller) Refresh() { p.pollOnce() }
@@ -115,6 +126,17 @@ func (p *Poller) pollOnce() {
 	defer p.refreshMu.Unlock()
 	chs, solved, err := p.pf.FetchPollState()
 	if err != nil {
+		if platform.IsTaskNotRunnable(err) {
+			p.mu.Lock()
+			already := p.terminal
+			p.terminal = true
+			p.mu.Unlock()
+			if !already {
+				log.Printf("Platform benchmark task is no longer runnable (%v) — stopping poller.", err)
+			}
+			p.Stop()
+			return
+		}
 		log.Printf("Poll error: %v", err)
 		return
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,25 @@ import (
 )
 
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+// ErrTaskNotRunnable marks a terminal benchmark-task state: the platform has
+// finished/expired the whole task (e.g. "task ... already finished",
+// "task_not_found"), so no further start/poll will ever succeed. Callers detect
+// it with IsTaskNotRunnable and stop the run cleanly instead of spinning.
+var ErrTaskNotRunnable = errors.New("TSec task is not runnable")
+
+// ErrAtCapacity marks a transient "max active challenge instances reached"
+// rejection from the platform's start endpoint. It means a slot must be freed
+// (a stale container reaped) before a new start can succeed — not that the task
+// itself is dead.
+var ErrAtCapacity = errors.New("TSec at active-instance capacity")
+
+// IsTaskNotRunnable reports whether err is (or wraps) a terminal task state.
+func IsTaskNotRunnable(err error) bool { return errors.Is(err, ErrTaskNotRunnable) }
+
+// IsAtCapacity reports whether err is (or wraps) an active-instance capacity
+// rejection, which a stale-container reconcile can recover from.
+func IsAtCapacity(err error) bool { return errors.Is(err, ErrAtCapacity) }
 
 // TSec is the TSecBench REST adapter.
 type TSec struct {
@@ -140,7 +160,7 @@ func (t *TSec) FetchAllChallenges() ([]Challenge, error) {
 	if err != nil {
 		body := strings.ToLower(string(data))
 		if strings.Contains(body, "already finished") || strings.Contains(body, "task_not_found") {
-			return nil, fmt.Errorf("TSec task is not runnable: %s", truncate(string(data), 300))
+			return nil, fmt.Errorf("%w: %s", ErrTaskNotRunnable, truncate(string(data), 300))
 		}
 		return nil, fmt.Errorf("TSec fetch challenges: %w", err)
 	}
@@ -305,7 +325,7 @@ func (t *TSec) startChallenge(ctx context.Context, uniqueCode string) ([]string,
 		}
 		return nil, err
 	}
-	return nil, fmt.Errorf("TSec start %s stayed at capacity: %w", uniqueCode, lastErr)
+	return nil, fmt.Errorf("%w: start %s: %w", ErrAtCapacity, uniqueCode, lastErr)
 }
 
 func (t *TSec) closeChallenge(uniqueCode string) error {
