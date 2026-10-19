@@ -69,7 +69,11 @@ func compactWindow(msgs []openai.ChatCompletionMessage, maxKeepTurns, budget int
 	userIdx := cleanUserBoundaries(msgs)
 	if len(userIdx) < 2 {
 		// Nothing safe to drop — only shrink bulky message bodies (pairing intact).
-		return clipOld(msgs, budget), true
+		out, changed := clipOld(msgs, budget)
+		if !pairingValid(out) {
+			return msgs, false
+		}
+		return out, changed
 	}
 
 	for keep := maxKeepTurns; keep >= 1; keep-- {
@@ -82,7 +86,7 @@ func compactWindow(msgs []openai.ChatCompletionMessage, maxKeepTurns, budget int
 		out = append(out, msgs[cut:]...) // last `keep` cycles (starts on a clean boundary)
 		if totalChars(out) <= budget || keep == 1 {
 			if keep == 1 && totalChars(out) > budget {
-				out = clipOld(out, budget)
+				out, _ = clipOld(out, budget) // best effort; dropping cycles already changed it
 			}
 			// Belt-and-suspenders: never emit an invalid sequence. If anything is
 			// off, skip compaction this round rather than risk a 400 on the call.
@@ -138,25 +142,74 @@ func pairingValid(msgs []openai.ChatCompletionMessage) bool {
 	return len(open) == 0
 }
 
-// clipOld shrinks the Content of bulky tool/assistant messages — keeping role and
-// ToolCallID/ToolCalls so pairing stays intact — oldest first, leaving the last
-// few messages at full fidelity, until under budget or nothing is left to clip.
-func clipOld(msgs []openai.ChatCompletionMessage, budget int) []openai.ChatCompletionMessage {
+// clipOld shrinks bulky message bodies (and tool-call arguments) to drive the
+// transcript under budget when no whole cycle can be dropped. It clips the
+// largest message first and repeats, so it actually converges on budget instead
+// of leaving a single oversized cycle untouched. Only the system message is
+// protected; every other message can be shrunk because the full traffic is
+// persisted (retrievable via traffic_get) and durable facts live on the
+// blackboard. It only ever shrinks the text fields — role, ToolCallID and the
+// ToolCalls' ids/names are preserved — so tool-call pairing stays intact. Returns
+// the slice and whether anything was actually clipped.
+func clipOld(msgs []openai.ChatCompletionMessage, budget int) ([]openai.ChatCompletionMessage, bool) {
 	out := append([]openai.ChatCompletionMessage(nil), msgs...)
-	keepFullFrom := len(out) - 6
-	if keepFullFrom < 1 {
-		keepFullFrom = 1
-	}
-	for i := 1; i < keepFullFrom && totalChars(out) > budget; i++ {
-		m := out[i]
-		if (m.Role == openai.ChatMessageRoleTool || m.Role == openai.ChatMessageRoleAssistant) && len(m.Content) > perMsgClip {
-			r := []rune(m.Content)
-			if len(r) > perMsgClip { // clip on rune boundaries to keep valid UTF-8
-				half := perMsgClip / 2
-				m.Content = string(r[:half]) + "\n…[elided to conserve context]…\n" + string(r[len(r)-half:])
-				out[i] = m
+	changed := false
+	for totalChars(out) > budget {
+		// Pick the largest clippable message (never the system prompt at index 0).
+		idx, size := -1, 0
+		for i := 1; i < len(out); i++ {
+			if c := msgChars(out[i]); c > size {
+				idx, size = i, c
 			}
 		}
+		if idx < 0 {
+			break
+		}
+		target := size / 2
+		if target < perMsgClip {
+			target = perMsgClip
+		}
+		if !clipMessage(&out[idx], target) {
+			break // the largest message is already at the floor; nothing more to do
+		}
+		changed = true
 	}
-	return out
+	return out, changed
+}
+
+// clipMessage shrinks one message's Content (and, if still oversized, its
+// tool-call arguments) toward target characters, rune-safely. Returns whether it
+// reduced the message.
+func clipMessage(m *openai.ChatCompletionMessage, target int) bool {
+	before := msgChars(*m)
+	if before <= target {
+		return false
+	}
+	if len(m.Content) > 0 {
+		keep := target
+		if keep < perMsgClip {
+			keep = perMsgClip
+		}
+		m.Content = clipRunes(m.Content, keep)
+	}
+	if msgChars(*m) > target {
+		for i := range m.ToolCalls {
+			m.ToolCalls[i].Function.Arguments = clipRunes(m.ToolCalls[i].Function.Arguments, perMsgClip)
+		}
+	}
+	return msgChars(*m) < before
+}
+
+// clipRunes keeps the head and tail of s (rune-safe) with an elision marker when
+// it exceeds max runes.
+func clipRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	half := max / 2
+	if half < 1 {
+		half = 1
+	}
+	return string(r[:half]) + "\n…[elided to conserve context]…\n" + string(r[len(r)-half:])
 }

@@ -127,11 +127,40 @@ func TestCompactWindowIgnoresMidToolUserInjection(t *testing.T) {
 
 func TestCompactWindowSingleHugeCycleClips(t *testing.T) {
 	// One cycle whose tool result alone blows the budget: no cycle to drop, so
-	// clipOld must shrink it while keeping pairing valid.
+	// clipOld must shrink it while keeping pairing valid AND actually reaching
+	// budget — not just report "compacted".
+	const budget = 50_000
 	msgs := buildConvo(1, 200_000)
-	out, changed := compactWindow(msgs, 3, 50_000)
+	out, changed := compactWindow(msgs, 3, budget)
 	if !changed {
 		t.Fatalf("expected clipping to trigger")
+	}
+	if got := totalChars(out); got > budget {
+		t.Fatalf("compaction reported done but stayed over budget: %d > %d", got, budget)
+	}
+	assertPairingValid(t, out)
+}
+
+func TestCompactWindowClipsWhenRecentCycleIsHuge(t *testing.T) {
+	// A huge tool result in the MOST RECENT cycle (the old "keep last 6 full"
+	// logic would have left it untouched). Compaction must still reach budget.
+	const budget = 40_000
+	msgs := buildConvo(6, 200) // several small cycles...
+	// ...then append one more cycle whose tool result is enormous.
+	id := "call_huge"
+	msgs = append(msgs,
+		openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: "cycle 7: continue"},
+		openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, ToolCalls: []openai.ToolCall{{
+			ID: id, Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "http_request", Arguments: `{"url":"http://t/"}`},
+		}}},
+		openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: id, Content: "HUGE " + strings.Repeat("y", 300_000)},
+	)
+	out, changed := compactWindow(msgs, 3, budget)
+	if !changed {
+		t.Fatal("expected compaction")
+	}
+	if got := totalChars(out); got > budget {
+		t.Fatalf("recent huge cycle left over budget: %d > %d", got, budget)
 	}
 	assertPairingValid(t, out)
 }
