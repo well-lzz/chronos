@@ -155,6 +155,16 @@ func (s *Solver) Guide(message string) {
 	})
 }
 
+// Pivot injects a stall-breaking methodology nudge before the next cycle. It is
+// generic strategy guidance (no target specifics), queued the same way as an
+// operator Guide so the next model turn sees it at a clean message boundary.
+func (s *Solver) Pivot(directive string) {
+	s.appendMessage(openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: "[Strategy check]\n" + strings.TrimSpace(directive),
+	})
+}
+
 // SetScope atomically replaces the egress boundary used by every tool call.
 // A prompt update is also queued for the model, but enforcement does not rely
 // on the model honoring that text.
