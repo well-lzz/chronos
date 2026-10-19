@@ -91,11 +91,11 @@ func pivotDirective(level int) string {
 	switch level {
 	case 1:
 		return "No new facts or findings have been recorded for several cycles — the current approach looks stuck. " +
-			"Switch to a materially different technique for the SAME weakness (a different encoding, filter bypass, or exploitation primitive), " +
+			"Switch to a materially different technique for the SAME weakness (a different encoding, a different way of handling the filter, or a different technique), " +
 			"or re-read the working record for a detail you overlooked. Do not repeat the exact approach that just failed."
 	case 2:
-		return "Still no progress after changing technique. Change the ATTACK SURFACE: enumerate endpoints, parameters, or inputs you have not tried yet, " +
-			"and consider a different vulnerability class than the one you have been pursuing on this target."
+		return "Still no progress after changing technique. Change the INPUT SURFACE: enumerate endpoints, parameters, or inputs you have not tried yet, " +
+			"and consider a different weakness class than the one you have been pursuing on this target."
 	default:
 		return "Repeated approaches have not advanced the working record. Step back and RE-MAP the target from scratch — " +
 			"re-check what the application does, its inputs, and its trust boundaries — then pick the most promising lead you have NOT already tried."
