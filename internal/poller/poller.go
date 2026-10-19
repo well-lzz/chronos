@@ -33,13 +33,14 @@ type Poller struct {
 	interval time.Duration
 	jitter   time.Duration
 
-	mu       sync.Mutex
-	known    map[string]bool
-	solved   map[string]bool
-	stubs    map[string]platform.Challenge
-	events   chan Event
-	stop     chan struct{}
-	stopOnce sync.Once
+	mu        sync.Mutex
+	refreshMu sync.Mutex
+	known     map[string]bool
+	solved    map[string]bool
+	stubs     map[string]platform.Challenge
+	events    chan Event
+	stop      chan struct{}
+	stopOnce  sync.Once
 }
 
 func New(pf platform.Platform, interval, jitter time.Duration) *Poller {
@@ -77,6 +78,10 @@ func (p *Poller) seed() error {
 
 func (p *Poller) Stop() { p.stopOnce.Do(func() { close(p.stop) }) }
 
+// Refresh replaces cached challenge addresses after the scheduler closes stale
+// containers, so the next pull cannot reuse an address that was just closed.
+func (p *Poller) Refresh() { p.pollOnce() }
+
 // Events returns the event channel (new/solved).
 func (p *Poller) Events() <-chan Event { return p.events }
 
@@ -106,6 +111,8 @@ func copySet(mu *sync.Mutex, m map[string]bool) map[string]bool {
 }
 
 func (p *Poller) pollOnce() {
+	p.refreshMu.Lock()
+	defer p.refreshMu.Unlock()
 	chs, solved, err := p.pf.FetchPollState()
 	if err != nil {
 		log.Printf("Poll error: %v", err)

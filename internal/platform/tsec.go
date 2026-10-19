@@ -327,19 +327,46 @@ func (t *TSec) closeChallengeContext(ctx context.Context, uniqueCode string) err
 		lastErr = err
 		body := parseAPIError(data)
 		if status == http.StatusConflict && body.Code == "invalid_state" {
-			t.mu.Lock()
-			delete(t.started, uniqueCode)
-			t.mu.Unlock()
-			return nil
+			closed, checkErr := t.containerClosed(ctx, uniqueCode)
+			if checkErr == nil && closed {
+				t.mu.Lock()
+				delete(t.started, uniqueCode)
+				t.mu.Unlock()
+				return nil
+			}
+			if checkErr != nil {
+				lastErr = fmt.Errorf("%w (container status check: %v)", err, checkErr)
+			}
+		} else if status != 0 && status < 500 {
+			return err
 		}
-		if status != 0 && status < 500 {
-			return err // terminal (e.g. already closed)
+		if attempt == 3 {
+			break
 		}
-		if !sleepContext(ctx, []time.Duration{2, 4, 8}[min(attempt, 2)]*time.Second) {
+		if !sleepContext(ctx, []time.Duration{2, 4, 8}[attempt]*time.Second) {
 			return ctx.Err()
 		}
 	}
 	return fmt.Errorf("TSec close %s failed: %w", uniqueCode, lastErr)
+}
+
+// A 409 can also mean the container is transitioning. Only the platform's
+// observed closed state confirms that it is safe to forget a started container.
+func (t *TSec) containerClosed(ctx context.Context, uniqueCode string) (bool, error) {
+	data, _, err := t.do(ctx, http.MethodGet, "openapi/v1/challenges", nil, nil)
+	if err != nil {
+		return false, err
+	}
+	var challenges []rawChallenge
+	if err := json.Unmarshal(data, &challenges); err != nil {
+		return false, fmt.Errorf("decode challenge status: %w", err)
+	}
+	for _, ch := range challenges {
+		if ch.UniqueCode == uniqueCode {
+			return strings.EqualFold(ch.ContainerStatus, "closed") && len(ch.ContainerAddr) == 0, nil
+		}
+	}
+	return false, fmt.Errorf("challenge %s missing from status response", uniqueCode)
 }
 
 func (t *TSec) ReleaseChallenge(challengeName string) bool {
@@ -357,6 +384,7 @@ func (t *TSec) ReleaseChallenge(challengeName string) bool {
 func (t *TSec) CloseStaleContainers(keep map[string]bool) []string {
 	chs, err := t.FetchAllChallenges()
 	if err != nil {
+		log.Printf("TSec stale-container check failed: %v", err)
 		return nil
 	}
 	var closed []string
@@ -367,6 +395,8 @@ func (t *TSec) CloseStaleContainers(keep map[string]bool) []string {
 		if err := t.closeChallenge(c.UniqueCode); err == nil {
 			closed = append(closed, c.Name)
 			log.Printf("Reaped stale container: %s (%s)", c.Name, c.UniqueCode)
+		} else {
+			log.Printf("TSec stale-container close failed for %s: %v", c.Name, err)
 		}
 	}
 	return closed

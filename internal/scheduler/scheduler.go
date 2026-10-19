@@ -130,6 +130,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 		if time.Since(lastStatus) >= 60*time.Second {
 			lastStatus = time.Now()
+			s.reconcileContainers()
 			s.autoSpawnUnsolved(runCtx)
 			deadlockSince = s.handleDeadlock(runCtx, deadlockSince)
 		}
@@ -238,8 +239,14 @@ func (s *Scheduler) reapAndRefill(ctx context.Context) bool {
 		}
 	}
 	s.mu.Unlock()
+	var closeFailed bool
 	for _, name := range releases {
-		s.pf.ReleaseChallenge(name)
+		if !s.pf.ReleaseChallenge(name) {
+			closeFailed = true
+		}
+	}
+	if closeFailed {
+		s.reconcileContainers()
 	}
 	if freed {
 		s.autoSpawnUnsolved(ctx)
@@ -368,6 +375,26 @@ func (s *Scheduler) retryEligible(name string, now time.Time) bool {
 	return now.Sub(s.deferTime[name]) >= time.Duration(s.cfg.DeferRetryCooldownS)*time.Second
 }
 
+// Reconcile platform containers against work that still owns a slot. This also
+// repairs containers left behind by a failed close or a previous Agent process.
+func (s *Scheduler) reconcileContainers() {
+	s.mu.Lock()
+	keep := make(map[string]bool, len(s.runs)+len(s.pending)+len(s.openContainers))
+	for name := range s.runs {
+		keep[name] = true
+	}
+	for name := range s.pending {
+		keep[name] = true
+	}
+	for name := range s.openContainers {
+		keep[name] = true
+	}
+	s.mu.Unlock()
+	if closed := s.pf.CloseStaleContainers(keep); len(closed) > 0 && s.poll != nil {
+		s.poll.Refresh()
+	}
+}
+
 // spawnOne pulls a challenge and starts its swarm (pull runs in a goroutine, so
 // container startup does not block the loop).
 func (s *Scheduler) spawnOne(ctx context.Context, name string) {
@@ -391,7 +418,6 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 		return
 	}
 	s.pending[name] = true
-	s.attempts[name]++
 	s.mu.Unlock()
 
 	s.pulls.Add(1)
@@ -429,6 +455,9 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 			}
 			return
 		}
+		// Count an attempt only when a solver actually starts. Platform capacity,
+		// container startup and state-load failures must not exhaust this budget.
+		s.attempts[name]++
 		sw := &swarm.Swarm{
 			Meta: meta, Scope: scope.ParseConnInfo(meta.ConnectionInfo), ModelSpecs: s.specs,
 			Settings: s.cfg, Platform: s.pf, LLM: s.LLM,

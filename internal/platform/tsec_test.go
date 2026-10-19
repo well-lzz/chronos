@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -113,5 +114,54 @@ func TestCapacityErrorSupportsHostedAPIMessage(t *testing.T) {
 	}
 	if isCapacityError([]byte(`{"code":"invalid_state","message":"task expired"}`)) {
 		t.Fatal("task expiration must not be retried as capacity pressure")
+	}
+}
+
+func TestCloseConflictDoesNotForgetActiveContainer(t *testing.T) {
+	adapter := NewTSec("https://benchmark.example", "test-token", false)
+	adapter.started["web-1"] = []string{"10.0.0.8:8080"}
+	closeCalls := 0
+	adapter.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/openapi/v1/challenges/close":
+			closeCalls++
+			return testJSONResponse(http.StatusConflict, apiErrorBody{Code: "invalid_state", Message: "container is still active"}), nil
+		case "/openapi/v1/challenges":
+			return testJSONResponse(http.StatusOK, []rawChallenge{{UniqueCode: "web-1", ContainerStatus: "available", ContainerAddr: []string{"10.0.0.8:8080"}}}), nil
+		default:
+			return testJSONResponse(http.StatusNotFound, apiErrorBody{Code: "not_found"}), nil
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := adapter.closeChallengeContext(ctx, "web-1"); err == nil {
+		t.Fatal("active container was incorrectly treated as closed")
+	}
+	if _, ok := adapter.started["web-1"]; !ok {
+		t.Fatal("active container was removed from shutdown tracking")
+	}
+	if closeCalls == 0 {
+		t.Fatal("close endpoint was not called")
+	}
+}
+
+func TestCloseConflictAcceptsConfirmedClosedContainer(t *testing.T) {
+	adapter := NewTSec("https://benchmark.example", "test-token", false)
+	adapter.started["web-1"] = []string{"10.0.0.8:8080"}
+	adapter.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/openapi/v1/challenges/close":
+			return testJSONResponse(http.StatusConflict, apiErrorBody{Code: "invalid_state", Message: "already closed"}), nil
+		case "/openapi/v1/challenges":
+			return testJSONResponse(http.StatusOK, []rawChallenge{{UniqueCode: "web-1", ContainerStatus: "closed"}}), nil
+		default:
+			return testJSONResponse(http.StatusNotFound, apiErrorBody{Code: "not_found"}), nil
+		}
+	})
+	if err := adapter.closeChallengeContext(context.Background(), "web-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := adapter.started["web-1"]; ok {
+		t.Fatal("confirmed closed container remained in shutdown tracking")
 	}
 }
