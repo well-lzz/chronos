@@ -23,6 +23,12 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 		return s.toolWerkzeugPin(argsJSON)
 	case "race":
 		return s.toolRace(ctx, argsJSON)
+	case "xss_probe":
+		return s.toolXSSProbe(ctx, argsJSON)
+	case "ssrf_probe":
+		return s.toolSSRFProbe(ctx, argsJSON)
+	case "lfi_probe":
+		return s.toolLFIProbe(ctx, argsJSON)
 	case "run_python":
 		return s.toolRunPython(ctx, argsJSON)
 	case "add_fact":
