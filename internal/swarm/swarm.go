@@ -157,6 +157,12 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 	retry := time.Duration(s.Settings.SolverRetryDelayS * float64(time.Second))
 	started := time.Now()
 	bumps, cycles := 0, 0
+	// Stall policy: nudge a different approach when the working record stops
+	// advancing, and (benchmark only, where a freed slot helps other challenges)
+	// terminate once every pivot has failed. Keyed off progress, never wall-clock,
+	// so a slow-but-advancing solve is never pivoted or stopped.
+	benchmark := s.Platform != nil
+	stall := termination.NewStallPolicy(termination.StallConfig{})
 	s.setStatus(spec, "running")
 
 	for {
@@ -205,6 +211,16 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 			log.Printf("[%s/%s] termination hook requested stop", s.Meta.Name, spec)
 			s.setStatus(spec, "finished")
 			return ""
+		}
+
+		switch d := stall.Observe(st.MadeProgress()); {
+		case d.Terminate && benchmark:
+			log.Printf("[%s/%s] stalled across every pivot with no new progress — terminating to free the slot", s.Meta.Name, spec)
+			s.setStatus(spec, "finished")
+			return ""
+		case d.Pivot:
+			log.Printf("[%s/%s] no progress — pivoting to a different approach", s.Meta.Name, spec)
+			sv.Pivot(d.Directive)
 		}
 
 		if res.Status == solver.StatusError && res.Findings != "" {
