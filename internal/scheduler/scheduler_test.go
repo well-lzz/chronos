@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -109,5 +110,28 @@ func TestReconcilePreservesOwnedContainers(t *testing.T) {
 		if !pf.staleKeep[name] {
 			t.Fatalf("reconciliation did not protect %s", name)
 		}
+	}
+}
+
+func TestCapacityFailureQueuesReconcileInsteadOfRunningItInPullWorker(t *testing.T) {
+	pf := &fakePlatform{pullErr: fmt.Errorf("platform rejected start: %w", platform.ErrAtCapacity)}
+	s := New(pf, config.Settings{MaxConcurrent: 1}, nil)
+	s.poll = poller.New(pf, time.Hour, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.poll.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.poll.Stop()
+
+	s.spawnOne(ctx, "slow")
+	s.pulls.Wait()
+	if pf.staleKeep != nil {
+		t.Fatal("pull worker reconciled containers outside the coordinator loop")
+	}
+	select {
+	case <-s.reconcileRequests:
+	default:
+		t.Fatal("capacity rejection did not queue reconciliation")
 	}
 }

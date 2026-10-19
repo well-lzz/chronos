@@ -85,21 +85,23 @@ type Solver struct {
 	insecureTLS bool
 	deadline    time.Time
 
-	messages     []openai.ChatCompletionMessage
-	started      bool
-	steps        int
-	tokens       *int64 // shared token counter (mission-wide)
-	notify       func(string)
-	submitFn     SubmitFn
-	record       func(step int, kind, tool, text string)
-	resolve      func() (*openai.Client, string, error)
-	lastFlag     string
-	flagComplete bool
-	messageMu    sync.Mutex
-	scopeMu      sync.RWMutex
-	modelMu      sync.RWMutex
-	chatMu       sync.Mutex
-	chatHistory  []openai.ChatCompletionMessage
+	messages      []openai.ChatCompletionMessage
+	pendingUser   []openai.ChatCompletionMessage
+	openToolCalls int
+	started       bool
+	steps         int
+	tokens        *int64 // shared token counter (mission-wide)
+	notify        func(string)
+	submitFn      SubmitFn
+	record        func(step int, kind, tool, text string)
+	resolve       func() (*openai.Client, string, error)
+	lastFlag      string
+	flagComplete  bool
+	messageMu     sync.Mutex
+	scopeMu       sync.RWMutex
+	modelMu       sync.RWMutex
+	chatMu        sync.Mutex
+	chatHistory   []openai.ChatCompletionMessage
 }
 
 // New builds a solver from Options.
@@ -128,15 +130,13 @@ func (s *Solver) start() {
 	if s.scopeSnapshot().IsEmpty() {
 		sys += "\n\n## SCOPE LOCK — NO TARGET KNOWN\nThe scope is empty; all egress is refused. Report via notify and stop."
 	}
-	s.messages = []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: sys}}
+	s.messages = append([]openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: sys}}, s.messages...)
 	s.started = true
 }
 
 // Bump injects sibling insights and prepares to resume.
 func (s *Solver) Bump(insights string) {
-	s.messageMu.Lock()
-	defer s.messageMu.Unlock()
-	s.messages = append(s.messages, openai.ChatCompletionMessage{
+	s.appendMessage(openai.ChatCompletionMessage{
 		Role: openai.ChatMessageRoleUser,
 		Content: "Your previous attempt did not finish. Insights from other executors (unverified — " +
 			"verify before trusting):\n\n" + insights + "\n\nContinue the search.",
@@ -258,8 +258,24 @@ func (s *Solver) ReplyToOperator(ctx context.Context, message string, paused boo
 
 func (s *Solver) appendMessage(message openai.ChatCompletionMessage) {
 	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
+	// Operator guidance can arrive while a tool is executing. Keep the API's
+	// assistant/tool-result sequence contiguous by delivering user messages only
+	// after every result from the outstanding tool call has been appended.
+	if message.Role == openai.ChatMessageRoleUser && s.openToolCalls > 0 {
+		s.pendingUser = append(s.pendingUser, message)
+		return
+	}
 	s.messages = append(s.messages, message)
-	s.messageMu.Unlock()
+	if message.Role == openai.ChatMessageRoleAssistant {
+		s.openToolCalls += len(message.ToolCalls)
+	} else if message.Role == openai.ChatMessageRoleTool && s.openToolCalls > 0 {
+		s.openToolCalls--
+		if s.openToolCalls == 0 {
+			s.messages = append(s.messages, s.pendingUser...)
+			s.pendingUser = nil
+		}
+	}
 }
 
 func (s *Solver) messageSnapshot() []openai.ChatCompletionMessage {

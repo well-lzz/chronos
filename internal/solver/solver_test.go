@@ -53,6 +53,26 @@ func TestSetScopeReplacesAuthorizationBoundary(t *testing.T) {
 	}
 }
 
+func TestOperatorMessageWaitsForAllToolResults(t *testing.T) {
+	s := &Solver{}
+	s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, ToolCalls: []openai.ToolCall{
+		{ID: "call-1"}, {ID: "call-2"},
+	}})
+	s.Guide("check another input")
+	s.Bump("sibling finding")
+	s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: "call-1", Content: "first"})
+	if got := s.messageSnapshot(); len(got) != 2 {
+		t.Fatalf("user messages interleaved with pending tools: %#v", got)
+	}
+	s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: "call-2", Content: "second"})
+	got := s.messageSnapshot()
+	if len(got) != 5 || got[0].Role != openai.ChatMessageRoleAssistant ||
+		got[1].Role != openai.ChatMessageRoleTool || got[2].Role != openai.ChatMessageRoleTool ||
+		got[3].Role != openai.ChatMessageRoleUser || got[4].Role != openai.ChatMessageRoleUser {
+		t.Fatalf("invalid message order after tool completion: %#v", got)
+	}
+}
+
 func TestReplyToOperatorUsesDedicatedNoToolsTurn(t *testing.T) {
 	var requestBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
