@@ -58,7 +58,7 @@ func TestXSSVariantsCarryDistinctSurvivors(t *testing.T) {
 			t.Fatalf("variant %s wire lacks marker: %q", v.Family, v.Wire)
 		}
 		if !strings.Contains(v.Wire, v.Survive) && v.Survive != "" {
-			// survive must be a structural subset actually present in the payload
+			// survive must be a structural subset actually present in the input
 			t.Fatalf("variant %s: survive %q not contained in wire %q", v.Family, v.Survive, v.Wire)
 		}
 		if seen[v.Family] {
@@ -67,7 +67,7 @@ func TestXSSVariantsCarryDistinctSurvivors(t *testing.T) {
 		seen[v.Family] = true
 	}
 	if len(vs) < 6 {
-		t.Fatalf("expected a breadth of breakout families, got %d", len(vs))
+		t.Fatalf("expected a breadth of context families, got %d", len(vs))
 	}
 }
 
@@ -88,22 +88,22 @@ func TestLFIVariantsIncludeKeyFamilies(t *testing.T) {
 	}
 }
 
-func TestLFISuccessDetectsPasswd(t *testing.T) {
+func TestLFIReadOKDetectsPasswd(t *testing.T) {
 	resp := "HTTP/1.1 200 OK\n\nroot:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:..."
-	ok, ex := lfiSuccess(resp, "/etc/passwd", false)
+	ok, ex := lfiReadOK(resp, "/etc/passwd", false)
 	if !ok || !strings.Contains(ex, "root:") {
 		t.Fatalf("passwd not detected: ok=%v ex=%q", ok, ex)
 	}
-	if ok, _ := lfiSuccess("HTTP/1.1 200 OK\n\nnothing here", "/etc/passwd", false); ok {
+	if ok, _ := lfiReadOK("HTTP/1.1 200 OK\n\nnothing here", "/etc/passwd", false); ok {
 		t.Fatal("false positive on benign body")
 	}
 }
 
-func TestLFISuccessDecodesPHPFilterSource(t *testing.T) {
+func TestLFIReadOKDecodesPHPFilterSource(t *testing.T) {
 	src := "<?php $flag = getenv('FLAG'); echo 'ok'; ?>"
 	b64 := base64.StdEncoding.EncodeToString([]byte(src))
 	resp := "HTTP/1.1 200 OK\n\n" + b64
-	ok, ex := lfiSuccess(resp, "/var/www/app.php", true)
+	ok, ex := lfiReadOK(resp, "/var/www/app.php", true)
 	if !ok || !strings.Contains(ex, "<?php") {
 		t.Fatalf("php source not decoded: ok=%v ex=%q", ok, ex)
 	}
@@ -118,30 +118,30 @@ func TestLooksLikeSource(t *testing.T) {
 	}
 }
 
-func TestSSRFProbeRefusesOutOfScopeTarget(t *testing.T) {
+func TestSSRFCheckRefusesOutOfScopeTarget(t *testing.T) {
 	s := &Solver{scope: scope.Parse([]string{"10.0.0.0/24"})}
-	out := s.toolSSRFProbe(context.Background(), `{"url":"http://10.0.0.9/fetch","param":"u","target":"http://8.8.8.8/"}`)
+	out := s.toolSSRFCheck(context.Background(), `{"url":"http://10.0.0.9/fetch","param":"u","target":"http://8.8.8.8/"}`)
 	if !strings.Contains(out, "refused") || !strings.Contains(out, "scope") {
-		t.Fatalf("ssrf_probe must refuse an out-of-scope target, got %q", out)
+		t.Fatalf("ssrf_check must refuse an out-of-scope target, got %q", out)
 	}
 }
 
 // --- regression tests for the false-positive fixes ---
 
-func TestXSSProbeNoFalsePositiveWhenBodyDoesNotReflect(t *testing.T) {
-	// Server ignores the param and never reflects it; the payload only ever
-	// appears in the request URL (echoed in the transcript). bypassed must be false.
+func TestXSSCheckNoFalsePositiveWhenBodyDoesNotReflect(t *testing.T) {
+	// Server ignores the param and never reflects it; the input only ever
+	// appears in the request URL (echoed in the transcript). unescaped must be false.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "<html><body>static page, nothing reflected here</body></html>")
 	}))
 	defer srv.Close()
 	host := mustHost(srv.URL)
 	s := &Solver{scope: scope.Parse([]string{host})}
-	out := s.toolXSSProbe(context.Background(), `{"url":"`+srv.URL+`/page","param":"name"}`)
+	out := s.toolXSSCheck(context.Background(), `{"url":"`+srv.URL+`/page","param":"name"}`)
 	var got struct {
 		MarkerReflected bool `json:"marker_reflected"`
 		Results         []struct {
-			Bypassed bool `json:"bypassed"`
+			Unescaped bool `json:"unescaped"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
@@ -151,13 +151,13 @@ func TestXSSProbeNoFalsePositiveWhenBodyDoesNotReflect(t *testing.T) {
 		t.Fatal("marker_reflected true though the body never reflects it (URL echo leaked in)")
 	}
 	for i, r := range got.Results {
-		if r.Bypassed {
-			t.Fatalf("result %d reported bypassed with no body reflection — false positive", i)
+		if r.Unescaped {
+			t.Fatalf("result %d reported unescaped with no body reflection — false positive", i)
 		}
 	}
 }
 
-func TestSSRFProbeNoFalsePositiveOnIdenticalBody(t *testing.T) {
+func TestSSRFCheckNoFalsePositiveOnIdenticalBody(t *testing.T) {
 	// Server returns the SAME body regardless of the fetched-URL param. No variant
 	// should be flagged changed, even though each request URL differs in length.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -168,7 +168,7 @@ func TestSSRFProbeNoFalsePositiveOnIdenticalBody(t *testing.T) {
 	s := &Solver{scope: scope.Parse([]string{host})}
 	// target is in scope (same host); use an IPv4 literal target so encodings generate.
 	args := `{"url":"` + srv.URL + `/fetch","param":"u","target":"http://127.0.0.1:9/"}`
-	out := s.toolSSRFProbe(context.Background(), args)
+	out := s.toolSSRFCheck(context.Background(), args)
 	var got struct {
 		Results []struct {
 			Family  string `json:"family"`

@@ -19,11 +19,11 @@ import (
 	"github.com/well-lzz/chronos/internal/nettools"
 )
 
-// Exploitation primitives. These are GENERAL offensive techniques parameterized
-// entirely by what the model observes at runtime — they carry no target-specific
-// data. Every network action is routed through the same scope guard as
-// http_request, so a primitive can never reach a host outside the authorized
-// scope.
+// Assessment primitives. These are GENERAL, reusable security-assessment
+// techniques parameterized entirely by what the model observes at runtime — they
+// carry no target-specific data. Every network action is routed through the same
+// scope guard as http_request, so a primitive can never reach a host outside the
+// authorized scope.
 
 // werkzeugPIN reproduces Werkzeug's debugger-PIN algorithm. The bits are the
 // values the model scrapes from the unauthenticated debugger page / target
