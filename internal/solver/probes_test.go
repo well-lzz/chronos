@@ -120,7 +120,7 @@ func TestLooksLikeSource(t *testing.T) {
 
 func TestSSRFProbeRefusesOutOfScopeTarget(t *testing.T) {
 	s := &Solver{scope: scope.Parse([]string{"10.0.0.0/24"})}
-	out := s.toolSSRFProbe(nil, `{"url":"http://10.0.0.9/fetch","param":"u","target":"http://8.8.8.8/"}`)
+	out := s.toolSSRFProbe(context.Background(), `{"url":"http://10.0.0.9/fetch","param":"u","target":"http://8.8.8.8/"}`)
 	if !strings.Contains(out, "refused") || !strings.Contains(out, "scope") {
 		t.Fatalf("ssrf_probe must refuse an out-of-scope target, got %q", out)
 	}
