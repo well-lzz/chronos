@@ -58,7 +58,12 @@ func NewStallPolicy(cfg StallConfig) *StallPolicy {
 // madeProgress is CycleState.MadeProgress() for the cycle just finished.
 func (p *StallPolicy) Observe(madeProgress bool) Decision {
 	if madeProgress {
-		p.streak = 0 // real progress — never pivot or terminate while advancing
+		// Real progress — the executor is productive. Reset BOTH the stall streak and
+		// the accumulated pivot level, so a task that keeps finding new things earns a
+		// fresh pivot ladder each time and is never fast-tracked to termination by
+		// pivots spent long ago.
+		p.streak = 0
+		p.pivots = 0
 		return Decision{}
 	}
 	p.streak++

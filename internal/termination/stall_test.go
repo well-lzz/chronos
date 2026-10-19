@@ -65,6 +65,30 @@ func TestStallProgressMidRunResetsStreak(t *testing.T) {
 	}
 }
 
+// Intermittent progress must not fast-track termination: after burning some
+// pivots, a progress cycle resets the ladder, so a later stall pivots again
+// instead of terminating.
+func TestStallProgressResetsPivotLadder(t *testing.T) {
+	p := NewStallPolicy(StallConfig{PivotAfter: 2, PivotGrace: 1, MaxPivots: 2})
+	// Drive two pivots (PivotAfter=2 then PivotGrace=1 each).
+	p.Observe(false)
+	if !p.Observe(false).Pivot { // 2 flat -> pivot 1
+		t.Fatal("expected pivot 1")
+	}
+	if !p.Observe(false).Pivot { // 1 flat (grace) -> pivot 2
+		t.Fatal("expected pivot 2")
+	}
+	// A productive cycle now arrives.
+	p.Observe(true)
+	// Subsequent stalls must restart the ladder at pivot 1, NOT terminate.
+	if d := p.Observe(false); d.Terminate {
+		t.Fatal("terminated right after progress — pivot ladder was not reset")
+	}
+	if d := p.Observe(false); !d.Pivot {
+		t.Fatalf("expected a fresh pivot after progress reset, got %+v", d)
+	}
+}
+
 func TestStallDefaultsApplied(t *testing.T) {
 	p := NewStallPolicy(StallConfig{}) // all zero -> defaults 3/2/3
 	flat := 0
