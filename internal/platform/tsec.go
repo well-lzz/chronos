@@ -20,11 +20,11 @@ import (
 
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-// ErrTaskNotRunnable marks a terminal benchmark-task state: the platform has
-// finished/expired the whole task (e.g. "task ... already finished",
-// "task_not_found"), so no further start/poll will ever succeed. Callers detect
-// it with IsTaskNotRunnable and stop the run cleanly instead of spinning.
-var ErrTaskNotRunnable = errors.New("TSec task is not runnable")
+// ErrTaskNotRunnable marks a task-not-runnable response from the platform
+// (e.g. "task ... already finished" or "task_not_found"). A single response
+// may be transient or inconsistent with running challenges; callers must retry
+// and must not treat it as authority to terminate the whole agent.
+var ErrTaskNotRunnable = errors.New("platform task is not runnable")
 
 // ErrAtCapacity marks a transient "max active challenge instances reached"
 // rejection from the platform's start endpoint. It means a slot must be freed
@@ -32,7 +32,7 @@ var ErrTaskNotRunnable = errors.New("TSec task is not runnable")
 // itself is dead.
 var ErrAtCapacity = errors.New("TSec at active-instance capacity")
 
-// IsTaskNotRunnable reports whether err is (or wraps) a terminal task state.
+// IsTaskNotRunnable reports whether err is (or wraps) a task-unavailable response.
 func IsTaskNotRunnable(err error) bool { return errors.Is(err, ErrTaskNotRunnable) }
 
 // IsAtCapacity reports whether err is (or wraps) an active-instance capacity

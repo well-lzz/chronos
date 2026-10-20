@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,20 @@ type fakePlatform struct {
 	pollErr   error
 	pullErr   error
 	staleKeep map[string]bool
+}
+
+type unavailableAfterSeedPlatform struct {
+	fakePlatform
+	seeded chan struct{}
+	calls  atomic.Int32
+}
+
+func (f *unavailableAfterSeedPlatform) FetchPollState() ([]platform.Challenge, map[string]bool, error) {
+	if f.calls.Add(1) == 1 {
+		close(f.seeded)
+		return []platform.Challenge{{Name: "slow"}}, map[string]bool{}, nil
+	}
+	return nil, nil, fmt.Errorf("%w: task already finished", platform.ErrTaskNotRunnable)
 }
 
 func (f *fakePlatform) FetchAllChallenges() ([]platform.Challenge, error) { return nil, f.pollErr }
@@ -66,6 +81,39 @@ func TestInitialPollFailureIsReturned(t *testing.T) {
 	}
 }
 
+func TestRunningSchedulerSurvivesTaskUnavailablePoll(t *testing.T) {
+	pf := &unavailableAfterSeedPlatform{seeded: make(chan struct{})}
+	s := New(pf, config.Settings{MaxConcurrent: 1}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	select {
+	case <-pf.seeded:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial poll did not run")
+	}
+	s.poll.Refresh()
+	if !s.poll.TaskUnavailable() {
+		t.Fatal("terminal-like response did not mark the platform unavailable")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("scheduler exited on one task-unavailable poll: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("scheduler did not exit after explicit cancellation")
+	}
+}
+
 func TestPriorityPrefersReusableContainer(t *testing.T) {
 	ready := platform.Challenge{Name: "ready", Value: 10, ContainerStatus: "available", ContainerAddr: []string{"10.0.0.1:80"}}
 	highScore := platform.Challenge{Name: "new", Value: 1000, ContainerStatus: "closed"}
@@ -96,6 +144,41 @@ func TestPlatformPullFailuresDoNotConsumeSolverAttempts(t *testing.T) {
 	}
 	if s.deferred["slow"] == "" || !s.retryEligible("slow", time.Now().Add(time.Hour)) {
 		t.Fatal("platform failure must remain retryable after cooldown")
+	}
+}
+
+func TestTaskUnavailableDoesNotSpawnOrCancelActiveWork(t *testing.T) {
+	pf := &fakePlatform{}
+	s := New(pf, config.Settings{MaxConcurrent: 2}, nil)
+	s.poll = poller.New(pf, time.Hour, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.poll.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer s.poll.Stop()
+
+	activeCtx, activeCancel := context.WithCancel(ctx)
+	defer activeCancel()
+	s.runs["active"] = &run{cancel: activeCancel}
+	pf.pollErr = fmt.Errorf("%w: task already finished", platform.ErrTaskNotRunnable)
+	s.poll.Refresh()
+	if !s.poll.TaskUnavailable() {
+		t.Fatal("expected the platform-unavailable state")
+	}
+	s.autoSpawnUnsolved(ctx)
+	s.spawnOne(ctx, "slow")
+	if activeCtx.Err() != nil {
+		t.Fatal("platform error cancelled an active challenge")
+	}
+	if len(s.pending) != 0 {
+		t.Fatal("platform error started a new challenge")
+	}
+
+	pf.pollErr = nil
+	s.poll.Refresh()
+	if s.poll.TaskUnavailable() {
+		t.Fatal("healthy poll did not restore availability")
 	}
 }
 

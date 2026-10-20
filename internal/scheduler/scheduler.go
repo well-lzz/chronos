@@ -117,6 +117,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-runCtx.Done():
 			if ctx.Err() == nil {
 				log.Printf("Global budget exhausted; stopping all active work.")
+			} else {
+				log.Printf("Scheduler context cancelled (%v); stopping all active work.", ctx.Err())
 			}
 			s.shutdown()
 			return nil
@@ -129,14 +131,6 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 
-		// Terminal platform state: the benchmark task was finished/expired on the
-		// platform. Every start/poll now fails, so stop cleanly instead of churning
-		// deferred retries until the global budget runs out.
-		if s.poll.Terminal() {
-			log.Printf("Benchmark task finished on platform; stopping scheduler cleanly.")
-			s.shutdown()
-			return nil
-		}
 		if reconcileNow {
 			s.reconcileContainers()
 			s.autoSpawnUnsolved(runCtx)
@@ -174,6 +168,8 @@ func (s *Scheduler) handleEvent(ctx context.Context, ev poller.Event) {
 		s.killSwarm(ev.Name, true)
 	case poller.NewChallenge:
 		s.spawnOne(ctx, ev.Name)
+	case poller.PlatformRecovered:
+		s.autoSpawnUnsolved(ctx)
 	}
 }
 
@@ -321,6 +317,9 @@ func priorityLess(a, b platform.Challenge) bool {
 }
 
 func (s *Scheduler) autoSpawnUnsolved(ctx context.Context) {
+	if s.poll.TaskUnavailable() {
+		return
+	}
 	stubs := s.poll.KnownStubs()
 	solved := s.poll.KnownSolved()
 
@@ -396,6 +395,9 @@ func (s *Scheduler) retryEligible(name string, now time.Time) bool {
 // Reconcile platform containers against work that still owns a slot. This also
 // repairs containers left behind by a failed close or a previous Agent process.
 func (s *Scheduler) reconcileContainers() {
+	if s.poll != nil && s.poll.TaskUnavailable() {
+		return
+	}
 	s.mu.Lock()
 	keep := make(map[string]bool, len(s.runs)+len(s.pending)+len(s.openContainers))
 	for name := range s.runs {
@@ -416,6 +418,9 @@ func (s *Scheduler) reconcileContainers() {
 // spawnOne pulls a challenge and starts its swarm (pull runs in a goroutine, so
 // container startup does not block the loop).
 func (s *Scheduler) spawnOne(ctx context.Context, name string) {
+	if s.poll.TaskUnavailable() {
+		return
+	}
 	stubs := s.poll.KnownStubs()
 	ch, ok := stubs[name]
 	if !ok {

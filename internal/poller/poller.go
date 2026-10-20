@@ -19,8 +19,9 @@ import (
 type EventKind string
 
 const (
-	NewChallenge    EventKind = "new_challenge"
-	ChallengeSolved EventKind = "challenge_solved"
+	NewChallenge      EventKind = "new_challenge"
+	ChallengeSolved   EventKind = "challenge_solved"
+	PlatformRecovered EventKind = "platform_recovered"
 )
 
 type Event struct {
@@ -29,37 +30,52 @@ type Event struct {
 }
 
 type Poller struct {
-	pf       platform.Platform
-	interval time.Duration
-	jitter   time.Duration
+	pf                platform.Platform
+	interval          time.Duration
+	jitter            time.Duration
+	initialRetryDelay time.Duration
 
-	mu        sync.Mutex
-	refreshMu sync.Mutex
-	known     map[string]bool
-	solved    map[string]bool
-	stubs     map[string]platform.Challenge
-	terminal  bool // platform reported the whole task finished/expired
-	events    chan Event
-	stop      chan struct{}
-	stopOnce  sync.Once
+	mu          sync.Mutex
+	refreshMu   sync.Mutex
+	known       map[string]bool
+	solved      map[string]bool
+	stubs       map[string]platform.Challenge
+	unavailable bool // a task-not-runnable response; retry until a valid poll recovers
+	events      chan Event
+	stop        chan struct{}
+	stopOnce    sync.Once
 }
 
 func New(pf platform.Platform, interval, jitter time.Duration) *Poller {
 	return &Poller{
-		pf: pf, interval: interval, jitter: jitter,
+		pf: pf, interval: interval, jitter: jitter, initialRetryDelay: 2 * time.Second,
 		known: map[string]bool{}, solved: map[string]bool{}, stubs: map[string]platform.Challenge{},
 		events: make(chan Event, 256), stop: make(chan struct{}),
 	}
 }
 
-// Start does a silent initial poll, then runs the background loop.
+// Start allows a few initial task-unavailable responses before reporting a
+// startup error. Once work has started, such responses never stop the poller.
 func (p *Poller) Start(ctx context.Context) error {
-	if err := p.seed(); err != nil {
-		return err
+	const maxInitialAttempts = 3
+	for attempt := 1; attempt <= maxInitialAttempts; attempt++ {
+		if err := p.seed(); err != nil {
+			if !platform.IsTaskNotRunnable(err) || attempt == maxInitialAttempts {
+				return err
+			}
+			p.markTaskUnavailable(err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(p.initialRetryDelay):
+			}
+			continue
+		}
+		log.Printf("Poller initialized: %d challenges, %d solved", len(p.known), len(p.solved))
+		go p.loop(ctx)
+		return nil
 	}
-	log.Printf("Poller initialized: %d challenges, %d solved", len(p.known), len(p.solved))
-	go p.loop(ctx)
-	return nil
+	return fmt.Errorf("initial platform poll failed")
 }
 
 func (p *Poller) seed() error {
@@ -69,6 +85,7 @@ func (p *Poller) seed() error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.unavailable = false
 	for _, c := range chs {
 		p.known[c.Name] = true
 		p.stubs[c.Name] = c
@@ -79,14 +96,13 @@ func (p *Poller) seed() error {
 
 func (p *Poller) Stop() { p.stopOnce.Do(func() { close(p.stop) }) }
 
-// Terminal reports whether the platform has finished/expired the whole benchmark
-// task. Once true, no start or poll can ever succeed again, so the scheduler must
-// stop rather than spin — this is what prevents an hour of dead "deferred" churn
-// after the task is reclaimed.
-func (p *Poller) Terminal() bool {
+// TaskUnavailable reports a task-not-runnable response from the last accepted
+// platform state. It is advisory: one error cannot prove the task is permanently
+// gone, and must never terminate active work. Successful polling clears it.
+func (p *Poller) TaskUnavailable() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.terminal
+	return p.unavailable
 }
 
 // Refresh replaces cached challenge addresses after the scheduler closes stale
@@ -121,20 +137,23 @@ func copySet(mu *sync.Mutex, m map[string]bool) map[string]bool {
 	return cp
 }
 
+func (p *Poller) markTaskUnavailable(err error) {
+	p.mu.Lock()
+	already := p.unavailable
+	p.unavailable = true
+	p.mu.Unlock()
+	if !already {
+		log.Printf("Platform reports task unavailable (%v); pausing new pulls and retrying the poll.", err)
+	}
+}
+
 func (p *Poller) pollOnce() {
 	p.refreshMu.Lock()
 	defer p.refreshMu.Unlock()
 	chs, solved, err := p.pf.FetchPollState()
 	if err != nil {
 		if platform.IsTaskNotRunnable(err) {
-			p.mu.Lock()
-			already := p.terminal
-			p.terminal = true
-			p.mu.Unlock()
-			if !already {
-				log.Printf("Platform benchmark task is no longer runnable (%v) — stopping poller.", err)
-			}
-			p.Stop()
+			p.markTaskUnavailable(err)
 			return
 		}
 		log.Printf("Poll error: %v", err)
@@ -146,7 +165,7 @@ func (p *Poller) pollOnce() {
 	}
 	p.mu.Lock()
 	// Sanity: a suspiciously small list is likely a transient API error.
-	if len(p.known) > 0 && len(current) < len(p.known)/2 {
+	if len(p.known) > 0 && len(current)*2 < len(p.known) {
 		p.mu.Unlock()
 		log.Printf("Poll returned suspicious data (%d vs %d known) — skipping", len(current), len(p.known))
 		return
@@ -167,6 +186,8 @@ func (p *Poller) pollOnce() {
 			newSolved = append(newSolved, name)
 		}
 	}
+	recovered := p.unavailable
+	p.unavailable = false
 	p.known = current
 	p.stubs = map[string]platform.Challenge{}
 	for _, c := range chs {
@@ -175,6 +196,10 @@ func (p *Poller) pollOnce() {
 	p.solved = solved
 	p.mu.Unlock()
 
+	if recovered {
+		log.Printf("Platform polling recovered; resuming challenge scheduling.")
+		p.emit(Event{Kind: PlatformRecovered})
+	}
 	for _, n := range newCh {
 		log.Printf("New challenge detected: %s", n)
 		p.emit(Event{NewChallenge, n})

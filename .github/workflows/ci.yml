@@ -48,6 +48,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - run: docker buildx build --platform linux/amd64 --load -f Dockerfile.tsecbench -t chronos-tsecbench:ci .
+      - name: Offline container preflight
+        run: |
+          docker run --rm --network none \
+            -e BENCHMARK_TOKEN=offline-preflight-placeholder \
+            -e DEEPSEEK_API_KEY=offline-key-one \
+            -e DEEPSEEK_API_KEY_2=offline-key-two \
+            chronos-tsecbench:ci --preflight
       - run: |
           mkdir -p dist
           docker save chronos-tsecbench:ci | gzip -9 > dist/chronos-tsecbench-amd64.tar.gz
