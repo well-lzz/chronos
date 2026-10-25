@@ -24,11 +24,12 @@ import (
 
 // Status values for a cycle result.
 const (
-	StatusGaveUp      = "gave_up"
-	StatusError       = "error"
-	StatusConfigError = "config_error" // model misconfigured/unauthorized — recoverable once the operator fixes it
-	StatusCancelled   = "cancelled"
-	StatusFlagFound   = "flag_found"
+	StatusGaveUp         = "gave_up"
+	StatusError          = "error"
+	StatusRetryableError = "retryable_error" // provider/network outage; does not consume exploration bumps
+	StatusConfigError    = "config_error"    // model misconfigured/unauthorized — recoverable once the operator fixes it
+	StatusCancelled      = "cancelled"
+	StatusFlagFound      = "flag_found"
 )
 
 const maxToolCallsPerCycle = 40
@@ -86,6 +87,8 @@ type Solver struct {
 	deadline    time.Time
 
 	messages     []openai.ChatCompletionMessage
+	pendingUser  []openai.ChatCompletionMessage // operator/peer input, inserted only before a model request
+	resumeCycle  bool                           // retry a failed model request without duplicating the cycle prompt
 	started      bool
 	steps        int
 	tokens       *int64 // shared token counter (mission-wide)
@@ -112,8 +115,12 @@ func New(o Options) *Solver {
 }
 
 func (s *Solver) rec(kind, tool, text string) {
+	s.recAt(s.steps, kind, tool, text)
+}
+
+func (s *Solver) recAt(step int, kind, tool, text string) {
 	if s.record != nil {
-		s.record(s.steps, kind, tool, text)
+		s.record(step, kind, tool, text)
 	}
 }
 
@@ -123,20 +130,25 @@ func (s *Solver) start() {
 	if s.started {
 		return
 	}
+	s.messages = []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: s.systemPrompt()}}
+	s.started = true
+}
+
+func (s *Solver) systemPrompt() string {
+	meta := s.meta
+	current := s.scopeSnapshot()
+	meta.ConnectionInfo = strings.Join(current.Entries(), ", ")
 	remaining := int(time.Until(s.deadline).Seconds())
-	sys := prompts.BuildHeadlessPrompt(s.meta, remaining, s.allowExec && pythonAvailable())
-	if s.scopeSnapshot().IsEmpty() {
+	sys := prompts.BuildHeadlessPrompt(meta, remaining, s.allowExec && pythonAvailable())
+	if current.IsEmpty() {
 		sys += "\n\n## SCOPE LOCK — NO TARGET KNOWN\nThe scope is empty; all egress is refused. Report via notify and stop."
 	}
-	s.messages = []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: sys}}
-	s.started = true
+	return sys
 }
 
 // Bump injects sibling insights and prepares to resume.
 func (s *Solver) Bump(insights string) {
-	s.messageMu.Lock()
-	defer s.messageMu.Unlock()
-	s.messages = append(s.messages, openai.ChatCompletionMessage{
+	s.queueUser(openai.ChatCompletionMessage{
 		Role: openai.ChatMessageRoleUser,
 		Content: "Your previous attempt did not finish. Insights from other executors (unverified — " +
 			"verify before trusting):\n\n" + insights + "\n\nContinue the search.",
@@ -147,7 +159,7 @@ func (s *Solver) Bump(insights string) {
 // changing the structural scope lock. The next model turn can act on it only
 // through tools that independently enforce the current scope.
 func (s *Solver) Guide(message string) {
-	s.appendMessage(openai.ChatCompletionMessage{
+	s.queueUser(openai.ChatCompletionMessage{
 		Role: openai.ChatMessageRoleUser,
 		Content: "[Operator instruction]\n" + strings.TrimSpace(message) +
 			"\n\nFollow this instruction only within the currently authorized scope. " +
@@ -165,7 +177,12 @@ func (s *Solver) SetScope(next scope.Scope) {
 	s.chatMu.Lock()
 	s.chatHistory = nil
 	s.chatMu.Unlock()
-	s.appendMessage(openai.ChatCompletionMessage{
+	s.messageMu.Lock()
+	if s.started && len(s.messages) > 0 {
+		s.messages[0].Content = s.systemPrompt()
+	}
+	s.messageMu.Unlock()
+	s.queueUser(openai.ChatCompletionMessage{
 		Role: openai.ChatMessageRoleUser,
 		Content: "[Operator scope update]\nThe authorized scope is now exactly: " + next.Describe() +
 			". Treat all earlier scope descriptions as obsolete. Structural tool guards enforce this boundary.",
@@ -252,6 +269,22 @@ func (s *Solver) appendMessage(message openai.ChatCompletionMessage) {
 	s.messageMu.Unlock()
 }
 
+func (s *Solver) queueUser(message openai.ChatCompletionMessage) {
+	s.messageMu.Lock()
+	s.pendingUser = append(s.pendingUser, message)
+	s.messageMu.Unlock()
+}
+
+// flushUser runs only at a model-request boundary, after all tool results from
+// the previous assistant response have been appended. Operator input can arrive
+// at any time, but must not split a tool-call/result group.
+func (s *Solver) flushUser() {
+	s.messageMu.Lock()
+	s.messages = append(s.messages, s.pendingUser...)
+	s.pendingUser = nil
+	s.messageMu.Unlock()
+}
+
 func (s *Solver) messageSnapshot() []openai.ChatCompletionMessage {
 	s.messageMu.Lock()
 	defer s.messageMu.Unlock()
@@ -263,11 +296,17 @@ func (s *Solver) messageSnapshot() []openai.ChatCompletionMessage {
 // durable facts/findings live on the blackboard and are re-injected each cycle,
 // so older raw exchanges are redundant.
 func (s *Solver) compactMessages() {
+	s.compactMessagesTo(contextBudgetChars, contextMaxKeepTurns)
+}
+
+func (s *Solver) compactMessagesTo(budget, keepTurns int) bool {
 	s.messageMu.Lock()
 	defer s.messageMu.Unlock()
-	if out, changed := compactWindow(s.messages, contextMaxKeepTurns, contextBudgetChars); changed {
+	if out, changed := compactWindow(s.messages, keepTurns, budget); changed {
 		s.messages = out
+		return true
 	}
+	return false
 }
 
 func (s *Solver) hasHistory() bool {
@@ -311,9 +350,13 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 	if sum := s.bb.Summary(); sum != "" {
 		prompt = sum + "\n\n" + prompt
 	}
-	s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: prompt})
+	if !s.resumeCycle {
+		s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: prompt})
+	}
+	s.resumeCycle = false
 
 	calls := 0
+	contextRecoveries := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return Result{Status: StatusCancelled, StepCount: s.steps}
@@ -321,6 +364,7 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 		if time.Now().After(s.deadline) {
 			return Result{Status: StatusGaveUp, Findings: "time budget reached", StepCount: s.steps}
 		}
+		s.flushUser()
 		s.compactMessages() // bound the growing transcript before re-sending it
 		resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 			Model: model, Messages: s.messageSnapshot(), Tools: tools,
@@ -329,12 +373,24 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 			if ctx.Err() != nil {
 				return Result{Status: StatusCancelled, StepCount: s.steps}
 			}
+			if isContextLimitError(err) && contextRecoveries == 0 && s.compactMessagesTo(60_000, 1) {
+				contextRecoveries++
+				continue
+			}
 			// Auth / permission failures are a config problem the operator can fix
 			// live (wrong or expired key, model not enabled) — surface them as such
 			// so the executor waits and recovers instead of burning its retries.
 			var apiErr *openai.APIError
 			if errors.As(err, &apiErr) && (apiErr.HTTPStatusCode == 401 || apiErr.HTTPStatusCode == 403) {
+				s.resumeCycle = true
 				return Result{Status: StatusConfigError, Findings: fmt.Sprintf("LLM auth failed (HTTP %d): %s", apiErr.HTTPStatusCode, err.Error()), StepCount: s.steps}
+			}
+			// A failed request has not advanced the conversation. Reuse this exact
+			// prompt on the next cycle and let the swarm back off separately from
+			// its exploration retry ceiling.
+			s.resumeCycle = true
+			if retryableModelError(err) {
+				return Result{Status: StatusRetryableError, Findings: "LLM temporarily unavailable: " + err.Error(), StepCount: s.steps}
 			}
 			return Result{Status: StatusError, Findings: "LLM error: " + err.Error(), StepCount: s.steps}
 		}
@@ -350,21 +406,40 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 			s.rec("text", "", strings.TrimSpace(msg.Content))
 			return Result{Status: StatusGaveUp, Findings: strings.TrimSpace(msg.Content), StepCount: s.steps}
 		}
-		for _, tc := range msg.ToolCalls {
-			calls++
-			s.steps++
-			s.flagComplete = false
-			s.rec("tool_call", tc.Function.Name, tc.Function.Arguments)
-			result := s.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
-			s.rec("tool_result", tc.Function.Name, result)
-			s.appendMessage(openai.ChatCompletionMessage{
-				Role: openai.ChatMessageRoleTool, ToolCallID: tc.ID, Content: result,
-			})
-			// A confirmed flag that completed the challenge ends this executor
-			// (recorded; does not cancel siblings). The scheduler's poller also
-			// kills the swarm on the platform-confirmed solve.
-			if tc.Function.Name == "submit_flag" && s.flagComplete && s.lastFlag != "" {
-				return Result{Status: StatusFlagFound, Flag: s.lastFlag, StepCount: s.steps, Findings: strings.TrimSpace(msg.Content)}
+		if parallelReadBatch(msg.ToolCalls) {
+			remaining := maxToolCallsPerCycle - calls
+			steps := make([]int, len(msg.ToolCalls))
+			for i, tc := range msg.ToolCalls {
+				calls++
+				s.steps++
+				steps[i] = s.steps
+				s.recAt(steps[i], "tool_call", tc.Function.Name, tc.Function.Arguments)
+			}
+			results := runToolBatch(ctx, msg.ToolCalls, remaining, s.dispatch)
+			for i, tc := range msg.ToolCalls {
+				s.recAt(steps[i], "tool_result", tc.Function.Name, results[i])
+				s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: tc.ID, Content: results[i]})
+			}
+		} else {
+			for _, tc := range msg.ToolCalls {
+				calls++
+				s.steps++
+				s.flagComplete = false
+				s.rec("tool_call", tc.Function.Name, tc.Function.Arguments)
+				result := "tool budget exhausted; call was not executed"
+				if calls <= maxToolCallsPerCycle {
+					result = s.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+				}
+				s.rec("tool_result", tc.Function.Name, result)
+				s.appendMessage(openai.ChatCompletionMessage{
+					Role: openai.ChatMessageRoleTool, ToolCallID: tc.ID, Content: result,
+				})
+				// A confirmed flag that completed the challenge ends this executor
+				// (recorded; does not cancel siblings). The scheduler's poller also
+				// kills the swarm on the platform-confirmed solve.
+				if tc.Function.Name == "submit_flag" && s.flagComplete && s.lastFlag != "" {
+					return Result{Status: StatusFlagFound, Flag: s.lastFlag, StepCount: s.steps, Findings: strings.TrimSpace(msg.Content)}
+				}
 			}
 		}
 		if calls >= maxToolCallsPerCycle {

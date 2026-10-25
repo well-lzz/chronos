@@ -48,6 +48,16 @@ var submissionCooldowns = []time.Duration{0, 30 * time.Second, 2 * time.Minute, 
 
 const submitLockWrongLimit = 4
 
+func providerBackoff(failures int) time.Duration {
+	if failures < 1 {
+		return 0
+	}
+	if failures > 5 {
+		failures = 5
+	}
+	return time.Duration(1<<uint(failures-1)) * time.Second
+}
+
 type Swarm struct {
 	Meta       mission.Meta
 	Scope      scope.Scope
@@ -157,6 +167,7 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 	retry := time.Duration(s.Settings.SolverRetryDelayS * float64(time.Second))
 	started := time.Now()
 	bumps, cycles := 0, 0
+	providerFailures := 0
 	s.setStatus(spec, "running")
 
 	for {
@@ -194,7 +205,22 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 			case <-time.After(3 * time.Second):
 			}
 			continue
+		case solver.StatusRetryableError:
+			// A provider outage is not evidence that the exploration strategy
+			// failed. Keep the conversation intact and retry within the mission
+			// deadline, with bounded exponential backoff.
+			providerFailures++
+			s.emitErrorOnce(spec, res.StepCount, res.Findings)
+			s.setStatus(spec, "waiting-provider")
+			select {
+			case <-ctx.Done():
+				s.setStatus(spec, "cancelled")
+				return ""
+			case <-time.After(providerBackoff(providerFailures)):
+			}
+			continue
 		}
+		providerFailures = 0
 
 		st := termination.CycleState{
 			StepCount: res.StepCount, BumpCount: bumps, Cycles: cycles,
@@ -218,7 +244,14 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 		}
 
 		if res.Status == solver.StatusGaveUp || res.Status == solver.StatusError {
-			bumps++
+			if s.BB.ProgressMarker() > markerBefore {
+				// MAX_BUMPS is a stall ceiling, not a lifetime limit. A long
+				// mission that keeps producing durable findings can use its full
+				// wall-clock budget.
+				bumps = 0
+			} else {
+				bumps++
+			}
 			if bumps > maxBumps {
 				log.Printf("[%s/%s] max bumps (%d) reached", s.Meta.Name, spec, maxBumps)
 				s.emit(spec, res.StepCount, "text", "", "Executor stopped: retry ceiling reached after repeated failures.")

@@ -1,9 +1,11 @@
 package solver
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -127,11 +129,98 @@ func TestCompactWindowIgnoresMidToolUserInjection(t *testing.T) {
 
 func TestCompactWindowSingleHugeCycleClips(t *testing.T) {
 	// One cycle whose tool result alone blows the budget: no cycle to drop, so
-	// clipOld must shrink it while keeping pairing valid.
+	// clipOld must shrink it while keeping pairing valid AND actually reaching
+	// budget — not just report "compacted".
+	const budget = 50_000
 	msgs := buildConvo(1, 200_000)
-	out, changed := compactWindow(msgs, 3, 50_000)
+	out, changed := compactWindow(msgs, 3, budget)
 	if !changed {
 		t.Fatalf("expected clipping to trigger")
+	}
+	if got := totalChars(out); got > budget {
+		t.Fatalf("compaction reported done but stayed over budget: %d > %d", got, budget)
+	}
+	assertPairingValid(t, out)
+}
+
+func TestCompactWindowDenseSingleCycleFitsBudget(t *testing.T) {
+	msgs := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: "SYSTEM PROMPT"},
+		{Role: openai.ChatMessageRoleUser, Content: "Continue solving."},
+	}
+	for i := 0; i < 40; i++ {
+		id := fmt.Sprintf("dense_%d", i)
+		msgs = append(msgs,
+			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, ToolCalls: []openai.ToolCall{{
+				ID: id, Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "http_request", Arguments: `{"url":"http://t/"}`},
+			}}},
+			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: id, Content: strings.Repeat("汉", 8_000)},
+		)
+	}
+	out, changed := compactWindow(msgs, 3, contextBudgetChars)
+	if !changed || totalChars(out) > contextBudgetChars {
+		t.Fatalf("dense cycle did not fit budget: changed=%v chars=%d", changed, totalChars(out))
+	}
+	assertPairingValid(t, out)
+	for _, m := range out {
+		if !utf8.ValidString(m.Content) {
+			t.Fatal("compaction split a UTF-8 rune")
+		}
+	}
+}
+
+func TestCompactWindowClipsMultiCallArgumentsWithoutMutatingInput(t *testing.T) {
+	msgs := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: "SYSTEM"},
+		{Role: openai.ChatMessageRoleUser, Content: "Continue"},
+		{Role: openai.ChatMessageRoleAssistant},
+	}
+	for i := 0; i < 40; i++ {
+		id := fmt.Sprintf("multi_%d", i)
+		msgs[2].ToolCalls = append(msgs[2].ToolCalls, openai.ToolCall{
+			ID: id, Type: openai.ToolTypeFunction,
+			Function: openai.FunctionCall{Name: "run_python", Arguments: `{"code":"` + strings.Repeat("x", 24_000) + `"}`},
+		})
+		msgs = append(msgs, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: id, Content: "done"})
+	}
+	originalSize := totalChars(msgs)
+	out, changed := compactWindow(msgs, 3, contextBudgetChars)
+	if !changed || totalChars(out) > contextBudgetChars {
+		t.Fatalf("multi-call arguments exceeded budget: %d", totalChars(out))
+	}
+	if totalChars(msgs) != originalSize {
+		t.Fatal("compaction mutated the input snapshot's tool calls")
+	}
+	assertPairingValid(t, out)
+	for _, m := range out {
+		for _, call := range m.ToolCalls {
+			if !json.Valid([]byte(call.Function.Arguments)) {
+				t.Fatalf("compaction produced invalid tool arguments: %q", call.Function.Arguments)
+			}
+		}
+	}
+}
+
+func TestCompactWindowClipsWhenRecentCycleIsHuge(t *testing.T) {
+	// A huge tool result in the MOST RECENT cycle (the old "keep last 6 full"
+	// logic would have left it untouched). Compaction must still reach budget.
+	const budget = 40_000
+	msgs := buildConvo(6, 200) // several small cycles...
+	// ...then append one more cycle whose tool result is enormous.
+	id := "call_huge"
+	msgs = append(msgs,
+		openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: "cycle 7: continue"},
+		openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, ToolCalls: []openai.ToolCall{{
+			ID: id, Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "http_request", Arguments: `{"url":"http://t/"}`},
+		}}},
+		openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: id, Content: "HUGE " + strings.Repeat("y", 300_000)},
+	)
+	out, changed := compactWindow(msgs, 3, budget)
+	if !changed {
+		t.Fatal("expected compaction")
+	}
+	if got := totalChars(out); got > budget {
+		t.Fatalf("recent huge cycle left over budget: %d > %d", got, budget)
 	}
 	assertPairingValid(t, out)
 }

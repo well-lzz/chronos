@@ -23,6 +23,8 @@ Agent 的核心循环被建模为「**搜索 + 随手捕获每一个产物**」�
 
 **终止条件由你定义**：见 [`internal/termination/termination.go`](internal/termination/termination.go) 的 `ShouldTerminate(bb, state)` 钩子（默认永不提前终止，只受 `MAX_BUMPS` 步数兜底与墙钟预算约束）。在那里写你的策略——覆盖度、边际收益递减、发现数阈值、确认目标达成等。
 
+Harness 的上下文压缩、模型故障恢复、受控工具并发和后续演进见 [`docs/harness-design.md`](docs/harness-design.md)。
+
 ### 证据即真实流量
 
 每次 `http_request` / `tcp_send` 的响应都带一个 `[traffic tN]` ID，全程记进 per-mission 的流量日志（落盘 JSONL）。`add_finding` / `verify_finding` 用 `evidence_refs=[{ref, role}]` **引用真实的请求/响应对**作为证据（role：`baseline` / `proof` / `verification` / `supporting`），报告里直接带可复现报文，而非散文。`verify_finding` 判决为 `reproduced`（→已验证）/ `refuted` / `inconclusive`（确认不了，保留候选并写明阻塞原因）；验证是**追加**记录，Finding 原始证据不可变。
@@ -108,7 +110,7 @@ chronos [flags]
 | `MAX_CHALLENGE_ATTEMPTS` | `3` | 每题重试次数上限 |
 | `DEFER_RETRY_COOLDOWN_SECONDS` | `120` | deferred 重试冷却 |
 | `AUTO_RESUME_IDLE_SECONDS` | `240` | 死锁自愈阈值 |
-| `MAX_BUMPS` | `20` | 每个 executor 的硬性 bump 上限（兜底） |
+| `MAX_BUMPS` | `20` | 每个 executor 连续无新事实/发现的 bump 上限；有进展时重置 |
 | `ALLOW_LOCAL_EXEC` | `false` | 是否允许 run_python；仅在 OS/容器隔离中开启 |
 | `TARGET_INSECURE_TLS` | `false` | 是否跳过目标 TLS 证书校验 |
 | `PLATFORM_INSECURE_TLS` | `false` | 是否跳过平台 TLS 证书校验 |

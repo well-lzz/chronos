@@ -1,6 +1,8 @@
 package solver
 
 import (
+	"unicode/utf8"
+
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -27,9 +29,9 @@ const (
 	contextBudgetChars = 140_000
 	// contextMaxKeepTurns is the most recent cycle boundaries kept when compacting.
 	contextMaxKeepTurns = 3
-	// perMsgClip bounds a single retained tool/assistant message's content when
-	// even one cycle alone exceeds the budget.
-	perMsgClip = 6_000
+	// minMsgClip protects a little context while permitting dense single cycles
+	// with many tool results to fit the total budget.
+	minMsgClip = 256
 )
 
 func msgChars(m openai.ChatCompletionMessage) int {
@@ -69,7 +71,11 @@ func compactWindow(msgs []openai.ChatCompletionMessage, maxKeepTurns, budget int
 	userIdx := cleanUserBoundaries(msgs)
 	if len(userIdx) < 2 {
 		// Nothing safe to drop — only shrink bulky message bodies (pairing intact).
-		return clipOld(msgs, budget), true
+		out, changed := clipOld(msgs, budget)
+		if !pairingValid(out) {
+			return msgs, false
+		}
+		return out, changed
 	}
 
 	for keep := maxKeepTurns; keep >= 1; keep-- {
@@ -82,7 +88,7 @@ func compactWindow(msgs []openai.ChatCompletionMessage, maxKeepTurns, budget int
 		out = append(out, msgs[cut:]...) // last `keep` cycles (starts on a clean boundary)
 		if totalChars(out) <= budget || keep == 1 {
 			if keep == 1 && totalChars(out) > budget {
-				out = clipOld(out, budget)
+				out, _ = clipOld(out, budget) // best effort; dropping cycles already changed it
 			}
 			// Belt-and-suspenders: never emit an invalid sequence. If anything is
 			// off, skip compaction this round rather than risk a 400 on the call.
@@ -138,25 +144,120 @@ func pairingValid(msgs []openai.ChatCompletionMessage) bool {
 	return len(open) == 0
 }
 
-// clipOld shrinks the Content of bulky tool/assistant messages — keeping role and
-// ToolCallID/ToolCalls so pairing stays intact — oldest first, leaving the last
-// few messages at full fidelity, until under budget or nothing is left to clip.
-func clipOld(msgs []openai.ChatCompletionMessage, budget int) []openai.ChatCompletionMessage {
+// clipOld shrinks bulky message bodies (and tool-call arguments) to drive the
+// transcript under budget when no whole cycle can be dropped. It clips the
+// largest message first and repeats, so it actually converges on budget instead
+// of leaving a single oversized cycle untouched. Only the system message is
+// protected; every other message can be shrunk because the full traffic is
+// persisted (retrievable via traffic_get) and durable facts live on the
+// blackboard. It only ever shrinks the text fields — role, ToolCallID and the
+// ToolCalls' ids/names are preserved — so tool-call pairing stays intact. Returns
+// the slice and whether anything was actually clipped.
+func clipOld(msgs []openai.ChatCompletionMessage, budget int) ([]openai.ChatCompletionMessage, bool) {
 	out := append([]openai.ChatCompletionMessage(nil), msgs...)
-	keepFullFrom := len(out) - 6
-	if keepFullFrom < 1 {
-		keepFullFrom = 1
+	for i := range out {
+		out[i].ToolCalls = append([]openai.ToolCall(nil), msgs[i].ToolCalls...)
 	}
-	for i := 1; i < keepFullFrom && totalChars(out) > budget; i++ {
-		m := out[i]
-		if (m.Role == openai.ChatMessageRoleTool || m.Role == openai.ChatMessageRoleAssistant) && len(m.Content) > perMsgClip {
-			r := []rune(m.Content)
-			if len(r) > perMsgClip { // clip on rune boundaries to keep valid UTF-8
-				half := perMsgClip / 2
-				m.Content = string(r[:half]) + "\n…[elided to conserve context]…\n" + string(r[len(r)-half:])
-				out[i] = m
+	changed := false
+	unclippable := make(map[int]bool)
+	for totalChars(out) > budget {
+		// Pick the largest reducible message (never the system prompt).
+		idx, size := -1, 0
+		for i := 1; i < len(out); i++ {
+			if c := msgChars(out[i]); c > size && c > minMsgClip && !unclippable[i] {
+				idx, size = i, c
+			}
+		}
+		if idx < 0 {
+			break
+		}
+		target := size / 2
+		if target < minMsgClip {
+			target = minMsgClip
+		}
+		if !clipMessage(&out[idx], target) {
+			unclippable[idx] = true // leave metadata intact; try other messages
+			continue
+		}
+		changed = true
+	}
+	return out, changed
+}
+
+// clipMessage shrinks one message's Content (and, if still oversized, its
+// tool-call arguments) toward target characters, rune-safely. Returns whether it
+// reduced the message.
+func clipMessage(m *openai.ChatCompletionMessage, target int) bool {
+	before := msgChars(*m)
+	if before <= target {
+		return false
+	}
+	argSize := 0
+	for _, tc := range m.ToolCalls {
+		argSize += len(tc.Function.Name) + len(tc.Function.Arguments)
+	}
+	if len(m.Content) > 0 {
+		keep := target - argSize
+		if keep < minMsgClip/2 {
+			keep = minMsgClip / 2
+		}
+		m.Content = clipRunes(m.Content, keep)
+	}
+	if msgChars(*m) > target && len(m.ToolCalls) > 0 {
+		remaining := target - len(m.Content)
+		if remaining < 0 {
+			remaining = 0
+		}
+		for i := range m.ToolCalls {
+			// A truncated argument string is often invalid JSON. The call has
+			// already completed, so keep its ID/name for pairing and replace its
+			// historical arguments with a valid, explicit placeholder.
+			if len(m.ToolCalls[i].Function.Arguments) > remaining/len(m.ToolCalls) {
+				m.ToolCalls[i].Function.Arguments = `{"_elided":true}`
 			}
 		}
 	}
-	return out
+	return msgChars(*m) < before
+}
+
+// clipRunes keeps the head and tail of s without splitting UTF-8 runes, while
+// respecting a byte budget (the same unit used by totalChars).
+func clipRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	const marker = "\n…[elided to conserve context]…\n"
+	if max <= 0 {
+		return ""
+	}
+	if max <= len(marker) {
+		i := 0
+		for i < len(s) {
+			_, width := utf8.DecodeRuneInString(s[i:])
+			if i+width > max {
+				break
+			}
+			i += width
+		}
+		return s[:i]
+	}
+	headBudget := (max - len(marker)) / 2
+	tailBudget := max - len(marker) - headBudget
+	head := 0
+	for head < len(s) {
+		_, width := utf8.DecodeRuneInString(s[head:])
+		if head+width > headBudget {
+			break
+		}
+		head += width
+	}
+	tail := len(s)
+	for tail > head {
+		_, width := utf8.DecodeLastRuneInString(s[:tail])
+		if len(s)-tail+width > tailBudget {
+			break
+		}
+		tail -= width
+	}
+	return s[:head] + marker + s[tail:]
 }

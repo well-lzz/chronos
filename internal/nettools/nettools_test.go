@@ -60,3 +60,26 @@ func TestDoTCPSendSupportsIPv6(t *testing.T) {
 		t.Fatalf("IPv6 TCP failed: %s", result)
 	}
 }
+
+func TestDoTCPSendContextCancelsBlockedRead(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback listener unavailable: %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = conn.Read(make([]byte, 1))
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	result := DoTCPSendContext(ctx, "127.0.0.1", listener.Addr().(*net.TCPAddr).Port, nil, 5*time.Second, 5*time.Second)
+	if time.Since(start) > time.Second || !strings.Contains(result, "cancelled") {
+		t.Fatalf("TCP did not cancel promptly: %s", result)
+	}
+}

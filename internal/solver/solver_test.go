@@ -34,6 +34,7 @@ func TestConcurrentBumpAndMessageSnapshot(t *testing.T) {
 
 func TestSetScopeReplacesAuthorizationBoundary(t *testing.T) {
 	s := New(Options{Scope: scope.Parse([]string{"old.example"})})
+	s.start()
 	s.chatHistory = []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleAssistant, Content: "old scope"}}
 	if ok, _ := s.hostAllowed("old.example"); !ok {
 		t.Fatal("initial scope rejected old.example")
@@ -50,6 +51,9 @@ func TestSetScopeReplacesAuthorizationBoundary(t *testing.T) {
 	}
 	if len(s.chatHistory) != 0 {
 		t.Fatal("scope update retained stale chat history")
+	}
+	if got := s.messageSnapshot()[0].Content; strings.Contains(got, "old.example") || !strings.Contains(got, "new.example") {
+		t.Fatalf("system prompt retained stale scope: %s", got)
 	}
 }
 

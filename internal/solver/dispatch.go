@@ -18,7 +18,7 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 	case "http_request":
 		return s.toolHTTP(ctx, argsJSON)
 	case "tcp_send":
-		return s.toolTCP(argsJSON)
+		return s.toolTCP(ctx, argsJSON)
 	case "run_python":
 		return s.toolRunPython(ctx, argsJSON)
 	case "add_fact":
@@ -90,7 +90,7 @@ func (s *Solver) toolHTTP(ctx context.Context, argsJSON string) string {
 	return display + fmt.Sprintf("\n[traffic %s — cite as evidence with add_finding/verify_finding]", tid)
 }
 
-func (s *Solver) toolTCP(argsJSON string) string {
+func (s *Solver) toolTCP(ctx context.Context, argsJSON string) string {
 	var a struct {
 		Host       string `json:"host"`
 		Port       int    `json:"port"`
@@ -107,7 +107,7 @@ func (s *Solver) toolTCP(argsJSON string) string {
 	if err != nil {
 		return "tcp_send error: " + err.Error()
 	}
-	display := nettools.DoTCPSend(a.Host, a.Port, payload, 30*time.Second, 3*time.Second)
+	display := nettools.DoTCPSendContext(ctx, a.Host, a.Port, payload, 30*time.Second, 3*time.Second)
 	tid, err := s.tl.RecordTCP(a.Host, a.Port, a.Payload, a.PayloadHex, display, s.ModelSpec)
 	if err != nil {
 		return display + "\ntraffic persistence error: " + err.Error()

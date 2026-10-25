@@ -90,6 +90,11 @@ func DoRawHTTP(ctx context.Context, url, method string, headers map[string]strin
 
 // DoTCPSend sends one payload over raw TCP and returns the reply.
 func DoTCPSend(host string, port int, payload []byte, readTimeout, silence time.Duration) string {
+	return DoTCPSendContext(context.Background(), host, port, payload, readTimeout, silence)
+}
+
+// DoTCPSendContext makes a slow connect/read respond to mission cancellation.
+func DoTCPSendContext(ctx context.Context, host string, port int, payload []byte, readTimeout, silence time.Duration) string {
 	if strings.TrimSpace(host) == "" {
 		return "tcp_send error: empty host"
 	}
@@ -97,11 +102,13 @@ func DoTCPSend(host string, port int, payload []byte, readTimeout, silence time.
 		return fmt.Sprintf("tcp_send error: invalid port %d", port)
 	}
 	addr := net.JoinHostPort(strings.Trim(strings.TrimSpace(host), "[]"), fmt.Sprintf("%d", port))
-	conn, err := net.DialTimeout("tcp", addr, readTimeout)
+	conn, err := (&net.Dialer{Timeout: readTimeout}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Sprintf("tcp_send error: cannot connect to %s — %v", addr, err)
 	}
 	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	if len(payload) > 0 {
 		_ = conn.SetWriteDeadline(time.Now().Add(readTimeout))
 		if _, err := conn.Write(payload); err != nil {
@@ -117,6 +124,9 @@ func DoTCPSend(host string, port int, payload []byte, readTimeout, silence time.
 			out = append(out, buf[:n]...)
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				return "tcp_send cancelled: " + ctx.Err().Error()
+			}
 			break // timeout (silence window) or EOF — normal end of reply
 		}
 	}
