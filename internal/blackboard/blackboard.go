@@ -131,6 +131,31 @@ func (b *Blackboard) Revision() uint64 {
 	return b.revision
 }
 
+// ArtifactsSince reports new facts/findings authored by a delegated agent or
+// any of its descendants. Revision alone would accidentally attribute writes
+// from concurrently running peer executors to the child.
+func (b *Blackboard) ArtifactsSince(revision uint64, actorPrefix string) (facts, findings []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, id := range b.factOrd {
+		f := b.facts[id]
+		if f.Revision > revision && actorInTree(f.FoundBy, actorPrefix) {
+			facts = append(facts, id)
+		}
+	}
+	for _, id := range b.findOrd {
+		f := b.findings[id]
+		if f.Revision > revision && actorInTree(f.FoundBy, actorPrefix) {
+			findings = append(findings, id)
+		}
+	}
+	return facts, findings
+}
+
+func actorInTree(actor, prefix string) bool {
+	return prefix != "" && (actor == prefix || strings.HasPrefix(actor, prefix+"/sub:"))
+}
+
 func clip(s string, n int) string {
 	if len(s) <= n {
 		return s

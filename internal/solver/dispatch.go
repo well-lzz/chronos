@@ -46,6 +46,10 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 		return "noted."
 	case "submit_flag":
 		return s.toolSubmitFlag(argsJSON)
+	case "delegate":
+		return s.toolDelegate(ctx, argsJSON)
+	case "delegate_resume":
+		return s.toolDelegateResume(ctx, argsJSON)
 	default:
 		return "unknown tool: " + name
 	}

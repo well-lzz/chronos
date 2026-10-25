@@ -36,6 +36,18 @@ func parallelReadBatch(calls []openai.ToolCall) bool {
 	return true
 }
 
+func parallelDelegateBatch(calls []openai.ToolCall) bool {
+	if len(calls) < 2 {
+		return false
+	}
+	for _, call := range calls {
+		if call.Function.Name != "delegate" && call.Function.Name != "delegate_resume" {
+			return false
+		}
+	}
+	return true
+}
+
 // runToolBatch returns one result per tool call in the model's original order.
 // Calls over the cycle budget receive a result but are never executed, keeping
 // the API's tool-call/result pairing valid.
@@ -51,7 +63,7 @@ func runToolBatch(ctx context.Context, calls []openai.ToolCall, remaining int, d
 	for i := limit; i < len(calls); i++ {
 		results[i] = "tool budget exhausted; call was not executed"
 	}
-	if !parallelReadBatch(calls[:limit]) {
+	if !parallelReadBatch(calls[:limit]) && !parallelDelegateBatch(calls[:limit]) {
 		for i := 0; i < limit; i++ {
 			if ctx.Err() != nil {
 				results[i] = "cancelled; call was not executed"

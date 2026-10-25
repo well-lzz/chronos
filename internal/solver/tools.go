@@ -28,7 +28,7 @@ func obj(props map[string]any, required ...string) map[string]any {
 }
 
 // toolDefs returns the function-calling tool set offered to the model.
-func toolDefs(allowExec, hasFlags bool) []openai.Tool {
+func toolDefs(allowExec, hasFlags bool, canDelegate ...bool) []openai.Tool {
 	defs := []struct {
 		name, desc string
 		params     map[string]any
@@ -98,6 +98,32 @@ func toolDefs(allowExec, hasFlags bool) []openai.Tool {
 			params     map[string]any
 		}{"submit_flag", "Submit a captured flag verbatim; recorded as a verified finding.",
 			obj(map[string]any{"flag": strProp("the flag")}, "flag")})
+	}
+	if len(canDelegate) > 0 && canDelegate[0] {
+		defs = append(defs,
+			struct {
+				name, desc string
+				params     map[string]any
+			}{
+				"delegate", "Delegate a bounded, self-contained investigation to a fresh context when its intermediate tool traffic would greatly exceed the value of its conclusion. Include all needed context in task. Keep quick queries, main-line reasoning, and context-dependent work here. Child shares the blackboard and authorized scope; only concise results return. Multiple independent calls may run concurrently within limits.",
+				obj(map[string]any{
+					"task":      strProp("complete stand-alone sub-investigation with target, known facts, exclusions and expected result"),
+					"max_steps": map[string]any{"type": "integer", "description": "requested tool-step budget; harness applies a stricter cap"},
+					"focus":     strProp("optional host/IP/CIDR subset of current authorized scope; never expands scope"),
+				}, "task", "max_steps"),
+			},
+			struct {
+				name, desc string
+				params     map[string]any
+			}{
+				"delegate_resume", "Resume one of your direct unfinished child agents in its original isolated context. Use the returned agent_id; provide a small extra step budget and optional new guidance.",
+				obj(map[string]any{
+					"agent_id":    strProp("direct child handle returned by delegate"),
+					"extra_steps": map[string]any{"type": "integer", "description": "additional requested tool steps, subject to the same hard caps"},
+					"note":        strProp("optional follow-up guidance for the child"),
+				}, "agent_id", "extra_steps"),
+			},
+		)
 	}
 
 	out := make([]openai.Tool, 0, len(defs))

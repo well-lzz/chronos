@@ -31,17 +31,19 @@ const (
 	StatusConfigError    = "config_error"    // model misconfigured/unauthorized — recoverable once the operator fixes it
 	StatusCancelled      = "cancelled"
 	StatusFlagFound      = "flag_found"
+	StatusStepBudget     = "step_budget"
 )
 
 const maxToolCallsPerCycle = 40
 
 // Result is one RunUntilDoneOrGaveUp outcome.
 type Result struct {
-	Status    string
-	Findings  string
-	StepCount int
-	Flag      string
-	Tokens    int
+	Status     string
+	Findings   string
+	StepCount  int
+	Flag       string
+	Tokens     int
+	StopReason string
 }
 
 // SubmitFn submits a flag through the platform (dedup/cooldown handled by the
@@ -69,7 +71,18 @@ type Options struct {
 	Record        func(step int, kind, tool, text string)
 	RecordContext func(ContextEvent)
 	// ContextWindow resolves the active model's configured token window each cycle.
-	ContextWindow func(model string) int
+	ContextWindow       func(model string) int
+	Depth               int
+	MaxDelegateDepth    int
+	MaxDelegateChildren int
+	MaxDelegateSteps    int
+	MinRemainingToSpawn time.Duration
+	GlobalRemaining     func() float64
+	SubagentRoot        string
+	AgentID             string
+	ParentID            string
+	StepLimit           int
+	RecordChildEvent    func(ChildEvent)
 	// SessionPath enables append-only transcript recovery for this executor.
 	SessionPath string
 	// Resolve, when set, supplies the client+model at the start of each cycle so
@@ -92,37 +105,81 @@ type Solver struct {
 	insecureTLS bool
 	deadline    time.Time
 
-	messages         []openai.ChatCompletionMessage
-	pendingUser      []openai.ChatCompletionMessage // operator/peer input, inserted only before a model request
-	resumeCycle      bool                           // retry a failed model request without duplicating the cycle prompt
-	started          bool
-	steps            int
-	tokens           *int64 // shared token counter (mission-wide)
-	notify           func(string)
-	submitFn         SubmitFn
-	record           func(step int, kind, tool, text string)
-	recordContext    func(ContextEvent)
-	contextWindow    func(model string) int
-	lastPromptTokens int
-	lastPromptChars  int
-	resolve          func() (*openai.Client, string, error)
-	lastFlag         string
-	flagComplete     bool
-	messageMu        sync.Mutex
-	scopeMu          sync.RWMutex
-	modelMu          sync.RWMutex
-	chatMu           sync.Mutex
-	chatHistory      []openai.ChatCompletionMessage
-	sessionPath      string
+	messages            []openai.ChatCompletionMessage
+	pendingUser         []openai.ChatCompletionMessage // operator/peer input, inserted only before a model request
+	resumeCycle         bool                           // retry a failed model request without duplicating the cycle prompt
+	started             bool
+	steps               int
+	tokens              *int64 // shared token counter (mission-wide)
+	notify              func(string)
+	submitFn            SubmitFn
+	record              func(step int, kind, tool, text string)
+	recordContext       func(ContextEvent)
+	contextWindow       func(model string) int
+	lastPromptTokens    int
+	lastPromptChars     int
+	depth               int
+	maxDelegateDepth    int
+	maxDelegateChildren int
+	maxDelegateSteps    int
+	minRemainingToSpawn time.Duration
+	globalRemaining     func() float64
+	subagentRoot        string
+	agentID             string
+	parentID            string
+	stepLimit           int
+	recordChildEvent    func(ChildEvent)
+	delegateMu          sync.Mutex
+	children            map[string]*delegatedChild
+	activeChildren      int
+	delegateStepPool    int
+	cycleRemaining      int
+	cycleDelegatedSteps int
+	delegatedStepsTotal int
+	resolve             func() (*openai.Client, string, error)
+	lastFlag            string
+	flagComplete        bool
+	messageMu           sync.Mutex
+	scopeMu             sync.RWMutex
+	modelMu             sync.RWMutex
+	chatMu              sync.Mutex
+	chatHistory         []openai.ChatCompletionMessage
+	sessionPath         string
 }
 
 // New builds a solver from Options.
 func New(o Options) *Solver {
+	if o.MaxDelegateDepth < 1 {
+		o.MaxDelegateDepth = 1
+	}
+	if o.MaxDelegateDepth > 2 {
+		o.MaxDelegateDepth = 2
+	}
+	if o.Depth == 0 && o.MaxDelegateDepth == 2 && !o.Meta.IsKillchain() {
+		o.MaxDelegateDepth = 1
+	}
+	if o.MaxDelegateChildren < 1 {
+		o.MaxDelegateChildren = 3
+	}
+	if o.MaxDelegateChildren > 8 {
+		o.MaxDelegateChildren = 8
+	}
+	if o.MaxDelegateSteps < 1 {
+		o.MaxDelegateSteps = 20
+	}
+	if o.MaxDelegateSteps > 40 {
+		o.MaxDelegateSteps = 40
+	}
 	return &Solver{
 		ModelSpec: o.ModelSpec, Model: o.Model, client: o.Client, meta: o.Meta, scope: o.Scope,
 		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, insecureTLS: o.InsecureTLS, deadline: o.Deadline, tokens: o.Tokens,
 		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record, recordContext: o.RecordContext,
 		contextWindow: o.ContextWindow, resolve: o.Resolve, sessionPath: o.SessionPath,
+		depth: o.Depth, maxDelegateDepth: o.MaxDelegateDepth, maxDelegateChildren: o.MaxDelegateChildren,
+		maxDelegateSteps: o.MaxDelegateSteps, minRemainingToSpawn: o.MinRemainingToSpawn,
+		globalRemaining: o.GlobalRemaining, subagentRoot: o.SubagentRoot, agentID: o.AgentID,
+		parentID: o.ParentID, stepLimit: o.StepLimit, recordChildEvent: o.RecordChildEvent,
+		children: map[string]*delegatedChild{},
 	}
 }
 
@@ -188,6 +245,9 @@ func (s *Solver) systemPrompt() string {
 	current := s.scopeSnapshot()
 	meta.ConnectionInfo = strings.Join(current.Entries(), ", ")
 	sys := prompts.BuildHeadlessPrompt(meta, 0, s.allowExec && pythonAvailable())
+	if s.agentID != "" {
+		sys += "\n\n## Delegated investigation\nInvestigate only the delegated task. Record evidence and findings on the shared blackboard, then return a concise conclusion. Your tool activity is reported in your own child stream."
+	}
 	if current.IsEmpty() {
 		sys += "\n\n## SCOPE LOCK — NO TARGET KNOWN\nThe scope is empty; all egress is refused. Report via notify and stop."
 	}
@@ -220,6 +280,10 @@ func (s *Solver) Guide(message string) {
 // on the model honoring that text.
 func (s *Solver) SetScope(next scope.Scope) {
 	s.scopeMu.Lock()
+	if s.agentID != "" {
+		// Delegated agents may only lose authority, even if scope updates race.
+		next = s.scope.Within(next)
+	}
 	s.scope = next
 	s.scopeMu.Unlock()
 	s.chatMu.Lock()
@@ -235,6 +299,7 @@ func (s *Solver) SetScope(next scope.Scope) {
 		Content: "[Operator scope update]\nThe authorized scope is now exactly: " + next.Describe() +
 			". Treat all earlier scope descriptions as obsolete. Structural tool guards enforce this boundary.",
 	})
+	s.narrowChildren(next)
 }
 
 func (s *Solver) scopeSnapshot() scope.Scope {
@@ -472,7 +537,7 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 		return Result{Status: StatusConfigError, Findings: "model not configured: open 模型设置 in the console", StepCount: s.steps}
 	}
 
-	tools := toolDefs(s.allowExec && pythonAvailable(), s.meta.HasFlags())
+	tools := toolDefs(s.allowExec && pythonAvailable(), s.meta.HasFlags(), s.canDelegate())
 
 	// Prompt for this cycle, with the blackboard summary injected.
 	prompt := "Solve this task."
@@ -497,13 +562,25 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 	s.resumeCycle = false
 
 	calls := 0
+	s.delegateMu.Lock()
+	s.delegateStepPool = maxToolCallsPerCycle / 2
+	s.cycleDelegatedSteps = 0
+	s.cycleRemaining = maxToolCallsPerCycle
+	if s.stepLimit > 0 {
+		s.cycleRemaining = min(s.cycleRemaining, max(0, s.stepLimit-s.steps-s.delegatedStepsTotal))
+		s.delegateStepPool = min(s.delegateStepPool, s.cycleRemaining/2)
+	}
+	s.delegateMu.Unlock()
 	contextRecoveries := 0
 	for {
+		if s.stepLimit > 0 && s.steps+s.delegatedStepsTotal >= s.stepLimit {
+			return Result{Status: StatusStepBudget, StopReason: "max_steps", StepCount: s.steps}
+		}
 		if err := ctx.Err(); err != nil {
-			return Result{Status: StatusCancelled, StepCount: s.steps}
+			return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
 		}
 		if time.Now().After(s.deadline) {
-			return Result{Status: StatusGaveUp, Findings: "time budget reached", StepCount: s.steps}
+			return Result{Status: StatusGaveUp, Findings: "time budget reached", StopReason: "deadline", StepCount: s.steps}
 		}
 		s.flushUser()
 		s.compactMessages() // bound the growing transcript before re-sending it
@@ -565,10 +642,10 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 		if len(msg.ToolCalls) == 0 {
 			// Final text, no tool calls: this cycle is done.
 			s.rec("text", "", strings.TrimSpace(msg.Content))
-			return Result{Status: StatusGaveUp, Findings: strings.TrimSpace(msg.Content), StepCount: s.steps}
+			return Result{Status: StatusGaveUp, Findings: strings.TrimSpace(msg.Content), StopReason: "done", StepCount: s.steps}
 		}
-		if parallelReadBatch(msg.ToolCalls) {
-			remaining := maxToolCallsPerCycle - calls
+		if parallelReadBatch(msg.ToolCalls) || parallelDelegateBatch(msg.ToolCalls) {
+			remaining := s.setCycleRemaining(maxToolCallsPerCycle - calls)
 			steps := make([]int, len(msg.ToolCalls))
 			for i, tc := range msg.ToolCalls {
 				calls++
@@ -583,12 +660,13 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 			}
 		} else {
 			for _, tc := range msg.ToolCalls {
+				remaining := s.setCycleRemaining(maxToolCallsPerCycle - calls)
 				calls++
 				s.steps++
 				s.flagComplete = false
 				s.rec("tool_call", tc.Function.Name, tc.Function.Arguments)
 				result := "tool budget exhausted; call was not executed"
-				if calls <= maxToolCallsPerCycle {
+				if remaining > 0 && calls <= maxToolCallsPerCycle && (s.stepLimit == 0 || s.steps+s.delegatedStepsTotal <= s.stepLimit) {
 					result = s.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
 				}
 				s.rec("tool_result", tc.Function.Name, result)
@@ -603,8 +681,11 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 				}
 			}
 		}
-		if calls >= maxToolCallsPerCycle {
-			return Result{Status: StatusGaveUp, Findings: "max tool calls per cycle reached", StepCount: s.steps}
+		if s.stepLimit > 0 && s.steps+s.delegatedStepsTotal >= s.stepLimit {
+			return Result{Status: StatusStepBudget, StopReason: "max_steps", StepCount: s.steps}
+		}
+		if calls+s.cycleDelegatedSteps >= maxToolCallsPerCycle {
+			return Result{Status: StatusGaveUp, Findings: "max tool calls per cycle reached", StopReason: "max_cycle_steps", StepCount: s.steps}
 		}
 	}
 }

@@ -28,6 +28,7 @@ const PRESETS = [
 const KIND_LABEL = {
   operator: "操作员", assistant: "Agent 回复", status: "状态", text: "推理",
   tool_call: "调用", tool_result: "结果", error: "错误", context: "上下文边界",
+  delegate_spawn: "委派", delegate_resume: "恢复子任务", delegate_return: "子任务返回", notify: "子任务通知",
 };
 
 const OPERATOR_TOKEN_KEY = "chronos.operator.token";
@@ -69,6 +70,56 @@ function Tile({ label, value, kind, onClick }) {
     <div className={className}>
       <b>{value ?? 0}</b>
       <span>{label}</span>
+    </div>
+  );
+}
+
+function ChildStream({ challenge, agentId, depth = 1 }) {
+  const [expanded, setExpanded] = useState(false);
+  const [events, setEvents] = useState([]);
+  const afterRef = useRef(0);
+
+  useEffect(() => {
+    if (!expanded || !challenge || !agentId) return;
+    let alive = true;
+    let timer;
+    const tick = async () => {
+      try {
+        const url = `/api/activity?challenge=${encodeURIComponent(challenge)}&model=${encodeURIComponent(agentId)}&after=${afterRef.current}`;
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const next = data.events || [];
+        if (alive && next.length) {
+          afterRef.current = Math.max(afterRef.current, ...next.map((event) => event.seq || 0));
+          setEvents((previous) => [...previous, ...next]);
+        }
+      } catch {}
+      if (alive) timer = setTimeout(tick, 1000);
+    };
+    tick();
+    return () => { alive = false; clearTimeout(timer); };
+  }, [expanded, challenge, agentId]);
+
+  return (
+    <div className={s.childStream}>
+      <button type="button" className={s.childToggle} onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}>
+        {expanded ? "▾" : "▸"} 子任务 {agentId} {expanded ? `· ${events.length} 条活动` : "· 展开活动"}
+      </button>
+      {expanded && <div className={s.childEvents}>
+        {events.length === 0 && <div className={s.empty}>等待子任务活动…</div>}
+        {events.map((event, index) => <div key={event.seq || index} className={s.childEvent}>
+          <div className={s.turnHead}>
+            <span className={`${s.badge} ${s[`b_${event.kind}`] || ""}`}>{KIND_LABEL[event.kind] || event.kind}</span>
+            {event.tool && <span className={s.toolTag}>{event.tool}</span>}
+            <span className={s.who}>step {event.step}</span>
+          </div>
+          <div className={s.bubble}>{event.text}</div>
+          {event.kind === "delegate_spawn" && event.agent_id && depth < 2 &&
+            <ChildStream challenge={challenge} agentId={event.agent_id} depth={depth + 1} />}
+        </div>)}
+      </div>}
     </div>
   );
 }
@@ -353,6 +404,8 @@ export default function Console() {
                     {op ? <span className={s.who}>你</span> : <span className={s.who}>{watch.m}</span>}
                   </div>
                   <div className={`${s.bubble} ${e.kind === "error" ? s.errBubble : ""}`}>{e.text}</div>
+                  {e.kind === "delegate_spawn" && e.agent_id &&
+                    <ChildStream challenge={watch.c} agentId={e.agent_id} />}
                 </div>
               );
             })}

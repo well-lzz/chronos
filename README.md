@@ -112,12 +112,17 @@ chronos [flags]
 | `DEFER_RETRY_COOLDOWN_SECONDS` | `120` | deferred 重试冷却 |
 | `AUTO_RESUME_IDLE_SECONDS` | `240` | 死锁自愈阈值 |
 | `MAX_BUMPS` | `20` | 每个 executor 连续无新事实/发现的 bump 上限；有进展时重置 |
+| `MAX_DELEGATE_DEPTH` | `1` | 子 Agent 最大委派深度；最高 2，且仅多阶段任务可启用 2 |
+| `MAX_DELEGATE_CHILDREN` | `3` | 每个 Agent 同时运行的子 Agent 上限（最高 8） |
+| `MAX_DELEGATE_STEPS` | `20` | 单次子 Agent 执行或续跑可获工具步数上限（最高 40） |
 | `ALLOW_LOCAL_EXEC` | `false` | 是否允许 run_python；仅在 OS/容器隔离中开启 |
 | `TARGET_INSECURE_TLS` | `false` | 是否跳过目标 TLS 证书校验 |
 
 ### 上下文管理
 
 执行器按模型窗口分别分配 transcript（55%）与黑板摘要（12%）预算，另留空间给工具定义和模型输出；收到提供商的 `PromptTokens` 后会用实测值调整字符到 token 的估算。控制台的模型设置可以覆盖该模型的窗口大小。黑板重注入始终保留 verified 与 critical/high finding，其余 candidate/inconclusive 按配额和预算选取；超额项以计数提示，必保项超预算会产生可见事件。长 cycle 内的黑板变更按修订号增量注入。压缩和重注入事件写入 executor session journal，并显示在控制台时间线。
+
+执行器还可自主调用 `delegate(task, max_steps, focus?)`，用独立上下文处理有界子调查。子 Agent 继承或收窄授权 Scope，共享黑板、流量日志和 token 计数；父 Agent 只收到简短结论与新建 Fact/Finding ID。未完成的直接子 Agent 可用 `delegate_resume(agent_id, extra_steps, note?)` 在原会话续跑。每轮的子任务总步数不超过父执行器该轮工具预算的一半；预算告急时拒绝新委派。子会话与元数据保存在 `CHRONOS_STATE_DIR/subagents/<mission>/<agent_id>/`，控制台可展开查看活动；目前只支持同进程续跑。
 | `PLATFORM_INSECURE_TLS` | `false` | 是否跳过平台 TLS 证书校验 |
 
 ## 包结构（`internal/`）

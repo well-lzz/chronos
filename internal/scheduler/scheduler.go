@@ -296,13 +296,7 @@ func (s *Scheduler) perChallengeLimit(meta mission.Meta) time.Duration {
 }
 
 func guessKillchain(m mission.Meta) bool {
-	blob := strings.ToLower(m.Category + " " + m.Description + " " + m.Name)
-	for _, k := range []string{"killchain", "渗透", "横向", "内网", "多阶段", "跳板", "kill chain"} {
-		if strings.Contains(blob, k) {
-			return true
-		}
-	}
-	return false
+	return m.IsKillchain()
 }
 
 func priorityLess(a, b platform.Challenge) bool {
@@ -488,6 +482,7 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 			Meta: meta, Scope: scope.ParseConnInfo(meta.ConnectionInfo), ModelSpecs: s.specs,
 			Settings: s.cfg, Platform: s.pf, LLM: s.LLM,
 			BB: bb, TL: tl,
+			GlobalRemaining: s.remainingGlobal,
 		}
 		r := &run{sw: sw, cancel: cancel, done: make(chan struct{}), meta: meta}
 		s.runs[name] = r

@@ -96,6 +96,42 @@ func (s Scope) Entries() []string {
 	return append([]string(nil), s.raw...)
 }
 
+// SubsetOf checks the entire child scope, including CIDR ranges, against an
+// authorization scope. A child may narrow a network but never widen it.
+func (s Scope) SubsetOf(parent Scope) bool {
+	for host := range s.hosts {
+		if !parent.Allows(host) {
+			return false
+		}
+	}
+	for _, child := range s.nets {
+		allowed := false
+		for _, p := range parent.nets {
+			if p.Contains(child.Addr()) && child.Bits() >= p.Bits() {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
+// Within returns only entries of s still wholly authorized by parent. It is
+// used when an operator narrows scope while a delegated child is running.
+func (s Scope) Within(parent Scope) Scope {
+	var entries []string
+	for _, entry := range s.raw {
+		candidate := Parse([]string{entry})
+		if !candidate.IsEmpty() && candidate.SubsetOf(parent) {
+			entries = append(entries, entry)
+		}
+	}
+	return Parse(entries)
+}
+
 // CIDRStrings returns the authorized networks as strings.
 func (s Scope) CIDRStrings() []string {
 	out := make([]string, 0, len(s.nets))

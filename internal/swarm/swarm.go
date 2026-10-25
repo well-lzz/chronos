@@ -38,12 +38,15 @@ import (
 // a per-swarm monotonic cursor (covers operator messages too, which have no
 // solver step), so the chat/stream orders human and agent messages together.
 type ActEvent struct {
-	Seq     int64                `json:"seq"`
-	Step    int                  `json:"step"`
-	Kind    string               `json:"kind"` // tool_call | tool_result | text | operator | assistant | status
-	Tool    string               `json:"tool,omitempty"`
-	Text    string               `json:"text"`
-	Context *solver.ContextEvent `json:"context,omitempty"`
+	Seq         int64                `json:"seq"`
+	Step        int                  `json:"step"`
+	Kind        string               `json:"kind"` // tool_call | tool_result | text | operator | assistant | status
+	Tool        string               `json:"tool,omitempty"`
+	Text        string               `json:"text"`
+	Context     *solver.ContextEvent `json:"context,omitempty"`
+	AgentID     string               `json:"agent_id,omitempty"`
+	ParentID    string               `json:"parent_id,omitempty"`
+	ParentModel string               `json:"parent_model,omitempty"`
 }
 
 const activityRing = 300
@@ -72,15 +75,25 @@ func (s *Swarm) sessionPath(spec string) string {
 	return filepath.Join(root, "sessions", mission, hex.EncodeToString(sum[:8])+".jsonl")
 }
 
+func (s *Swarm) subagentRoot() string {
+	if s.BB == nil || s.BB.Path == "" {
+		return ""
+	}
+	root := filepath.Dir(filepath.Dir(s.BB.Path))
+	mission := strings.TrimSuffix(filepath.Base(s.BB.Path), filepath.Ext(s.BB.Path))
+	return filepath.Join(root, "subagents", mission)
+}
+
 type Swarm struct {
-	Meta       mission.Meta
-	Scope      scope.Scope
-	ModelSpecs []string
-	Settings   config.Settings
-	BB         *blackboard.Blackboard
-	TL         *traffic.Log
-	Platform   platform.Platform // nil = engagement (no oracle, record-only)
-	LLM        *llmconfig.Store  // operator-editable model profile; nil = env/flag only
+	Meta            mission.Meta
+	Scope           scope.Scope
+	ModelSpecs      []string
+	Settings        config.Settings
+	BB              *blackboard.Blackboard
+	TL              *traffic.Log
+	Platform        platform.Platform // nil = engagement (no oracle, record-only)
+	LLM             *llmconfig.Store  // operator-editable model profile; nil = env/flag only
+	GlobalRemaining func() float64    // negative = no global budget
 
 	Tokens int64 // shared, mission-wide
 
@@ -168,6 +181,11 @@ func (s *Swarm) Run(ctx context.Context) string {
 			Tokens: &s.Tokens, Notify: func(m string) { log.Printf("[%s/%s] %s", s.Meta.Name, sp, m) },
 			SubmitFn: submitFn, Record: s.recorder(spec), RecordContext: s.contextRecorder(spec),
 			ContextWindow: contextWindow, Resolve: resolve, SessionPath: s.sessionPath(spec),
+			MaxDelegateDepth: s.Settings.MaxDelegateDepth, MaxDelegateChildren: s.Settings.MaxDelegateChildren,
+			MaxDelegateSteps:    s.Settings.MaxDelegateSteps,
+			MinRemainingToSpawn: time.Duration(s.Settings.MinRemainingToSpawnS) * time.Second,
+			GlobalRemaining:     s.GlobalRemaining, SubagentRoot: s.subagentRoot(),
+			RecordChildEvent: s.childRecorder(spec),
 		})
 		s.mu.Lock()
 		s.solvers[spec] = sv
@@ -402,6 +420,29 @@ func (s *Swarm) emitContext(spec string, event solver.ContextEvent, text string)
 	s.mu.Unlock()
 }
 
+func (s *Swarm) childRecorder(rootSpec string) func(solver.ChildEvent) {
+	return func(event solver.ChildEvent) {
+		seq := atomic.AddInt64(&s.evSeq, 1)
+		value := event.Text
+		if len(value) > 4000 {
+			value = value[:4000]
+		}
+		linkedAgent, linkedParent := event.AgentID, event.ParentID
+		if strings.HasPrefix(event.Kind, "delegate_") {
+			linkedAgent, linkedParent = event.Tool, event.AgentID
+		}
+		s.mu.Lock()
+		buf := append(s.activity[event.AgentID], ActEvent{Seq: seq, Step: event.Step, Kind: event.Kind,
+			Tool: event.Tool, Text: value, Context: event.Context, AgentID: linkedAgent,
+			ParentID: linkedParent, ParentModel: rootSpec})
+		if len(buf) > activityRing {
+			buf = buf[len(buf)-activityRing:]
+		}
+		s.activity[event.AgentID] = buf
+		s.mu.Unlock()
+	}
+}
+
 // emit appends an event to an executor's ring with a monotonic Seq.
 func (s *Swarm) emit(spec string, step int, kind, tool, text string) {
 	if len(text) > 4000 {
@@ -409,7 +450,11 @@ func (s *Swarm) emit(spec string, step int, kind, tool, text string) {
 	}
 	seq := atomic.AddInt64(&s.evSeq, 1)
 	s.mu.Lock()
-	buf := append(s.activity[spec], ActEvent{Seq: seq, Step: step, Kind: kind, Tool: tool, Text: text})
+	event := ActEvent{Seq: seq, Step: step, Kind: kind, Tool: tool, Text: text}
+	if strings.HasPrefix(kind, "delegate_") {
+		event.AgentID = tool
+	}
+	buf := append(s.activity[spec], event)
 	if len(buf) > activityRing {
 		buf = buf[len(buf)-activityRing:]
 	}

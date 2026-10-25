@@ -44,6 +44,9 @@ type Settings struct {
 	GLMBaseURL          string
 	GLMModelID          string
 	ContextWindowTokens int
+	MaxDelegateDepth    int
+	MaxDelegateChildren int
+	MaxDelegateSteps    int
 }
 
 func getenv(key, def string) string {
@@ -123,6 +126,9 @@ func Load() Settings {
 		GLMBaseURL:          getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
 		GLMModelID:          getenv("GLM_MODEL_ID", "glm-4-plus"),
 		ContextWindowTokens: getenvInt("MODEL_CONTEXT_WINDOW_TOKENS", 0),
+		MaxDelegateDepth:    getenvInt("MAX_DELEGATE_DEPTH", 1),
+		MaxDelegateChildren: getenvInt("MAX_DELEGATE_CHILDREN", 3),
+		MaxDelegateSteps:    getenvInt("MAX_DELEGATE_STEPS", 20),
 
 		PlatformMode:         getenv("PLATFORM_MODE", "tsec"),
 		PlatformURL:          getenv("PLATFORM_URL", ""),
