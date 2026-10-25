@@ -99,6 +99,7 @@ chronos [flags]
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | |
 | `QWEN_API_KEY` / `QWEN_BASE_URL` | — / dashscope 兼容端点 | |
 | `GLM_API_KEY` / `GLM_BASE_URL` / `GLM_MODEL_ID` | — / bigmodel v4 / `glm-4-plus` | |
+| `MODEL_CONTEXT_WINDOW_TOKENS` | 自动识别；未知模型为 `16000` | 环境模型的上下文窗口；控制台模型可单独设置并优先于此值 |
 | `PLATFORM_MODE` | `tsec` | 平台适配器(内置仅 TSecBench;可自行扩展) |
 | `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN` | TSecBench / — | TSecBench 适配器的地址与令牌 |
 | `TSECBENCH_HOSTED` | `false` | 托管模式下自动把模型 Base URL 改写到 `*.tsecbench.gw` |
@@ -113,6 +114,10 @@ chronos [flags]
 | `MAX_BUMPS` | `20` | 每个 executor 连续无新事实/发现的 bump 上限；有进展时重置 |
 | `ALLOW_LOCAL_EXEC` | `false` | 是否允许 run_python；仅在 OS/容器隔离中开启 |
 | `TARGET_INSECURE_TLS` | `false` | 是否跳过目标 TLS 证书校验 |
+
+### 上下文管理
+
+执行器按模型窗口分别分配 transcript（55%）与黑板摘要（12%）预算，另留空间给工具定义和模型输出；收到提供商的 `PromptTokens` 后会用实测值调整字符到 token 的估算。控制台的模型设置可以覆盖该模型的窗口大小。黑板重注入始终保留 verified 与 critical/high finding，其余 candidate/inconclusive 按配额和预算选取；超额项以计数提示，必保项超预算会产生可见事件。长 cycle 内的黑板变更按修订号增量注入。压缩和重注入事件写入 executor session journal，并显示在控制台时间线。
 | `PLATFORM_INSECURE_TLS` | `false` | 是否跳过平台 TLS 证书校验 |
 
 ## 包结构（`internal/`）

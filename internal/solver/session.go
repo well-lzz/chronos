@@ -17,6 +17,7 @@ type sessionEvent struct {
 	Message  *openai.ChatCompletionMessage  `json:"message,omitempty"`
 	Messages []openai.ChatCompletionMessage `json:"messages,omitempty"`
 	Step     int                            `json:"step"`
+	Context  *ContextEvent                  `json:"context,omitempty"`
 }
 
 type sessionState struct {
@@ -86,6 +87,8 @@ func loadSession(path string) (sessionState, error) {
 			state.pending = nil
 		case "compact":
 			state.messages = event.Messages
+		case "context":
+			// Audit-only event; no effect on active model state.
 		default:
 			return sessionState{}, fmt.Errorf("unknown session event %q", event.Type)
 		}

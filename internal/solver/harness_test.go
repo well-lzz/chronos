@@ -65,6 +65,40 @@ func TestRetryableModelErrorResumesWithoutDuplicatePrompt(t *testing.T) {
 	}
 }
 
+func TestLongCycleInjectsBlackboardDelta(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		requests = append(requests, body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(requests) == 1 {
+			_, _ = w.Write([]byte(`{"id":"chat","object":"chat.completion","created":1,"model":"test","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"add_fact","arguments":"{\"statement\":\"new inner-cycle fact\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"total_tokens":110}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"chat","object":"chat.completion","created":1,"model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"total_tokens":125}}`))
+	}))
+	defer server.Close()
+	cfg := openai.DefaultConfig("test")
+	cfg.BaseURL = server.URL + "/v1"
+	bb, _ := blackboard.LoadOrNew("delta-test", t.TempDir())
+	_, _ = bb.AddFact("initial fact", "", "x")
+	tokens := int64(0)
+	s := New(Options{Model: "test", Client: openai.NewClientWithConfig(cfg), BB: bb, Deadline: time.Now().Add(time.Minute), Tokens: &tokens})
+	if result := s.RunUntilDoneOrGaveUp(context.Background()); result.Status != StatusGaveUp {
+		t.Fatalf("status: %+v", result)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests: %d", len(requests))
+	}
+	second, _ := json.Marshal(requests[1]["messages"])
+	if !strings.Contains(string(second), "blackboard changes") || !strings.Contains(string(second), "new inner-cycle fact") {
+		t.Fatalf("missing delta: %s", second)
+	}
+}
+
 func TestContextOverflowCompactsAndRetriesOnce(t *testing.T) {
 	var sizes []int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

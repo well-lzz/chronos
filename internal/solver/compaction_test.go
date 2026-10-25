@@ -10,6 +10,8 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
+const contextBudgetChars = 140_000 // fixture for compaction algorithm tests
+
 // buildConvo makes a system prompt plus n cycles, each: a user prompt, an
 // assistant message with one tool call, and the matching tool result. big pads
 // each tool result so the transcript is large.

@@ -66,7 +66,10 @@ type Options struct {
 	// SubmitFn, when set, makes submit_flag go to the platform; nil = record-only.
 	SubmitFn SubmitFn
 	// Record, when set, receives each step for live observation (web console).
-	Record func(step int, kind, tool, text string)
+	Record        func(step int, kind, tool, text string)
+	RecordContext func(ContextEvent)
+	// ContextWindow resolves the active model's configured token window each cycle.
+	ContextWindow func(model string) int
 	// SessionPath enables append-only transcript recovery for this executor.
 	SessionPath string
 	// Resolve, when set, supplies the client+model at the start of each cycle so
@@ -89,24 +92,28 @@ type Solver struct {
 	insecureTLS bool
 	deadline    time.Time
 
-	messages     []openai.ChatCompletionMessage
-	pendingUser  []openai.ChatCompletionMessage // operator/peer input, inserted only before a model request
-	resumeCycle  bool                           // retry a failed model request without duplicating the cycle prompt
-	started      bool
-	steps        int
-	tokens       *int64 // shared token counter (mission-wide)
-	notify       func(string)
-	submitFn     SubmitFn
-	record       func(step int, kind, tool, text string)
-	resolve      func() (*openai.Client, string, error)
-	lastFlag     string
-	flagComplete bool
-	messageMu    sync.Mutex
-	scopeMu      sync.RWMutex
-	modelMu      sync.RWMutex
-	chatMu       sync.Mutex
-	chatHistory  []openai.ChatCompletionMessage
-	sessionPath  string
+	messages         []openai.ChatCompletionMessage
+	pendingUser      []openai.ChatCompletionMessage // operator/peer input, inserted only before a model request
+	resumeCycle      bool                           // retry a failed model request without duplicating the cycle prompt
+	started          bool
+	steps            int
+	tokens           *int64 // shared token counter (mission-wide)
+	notify           func(string)
+	submitFn         SubmitFn
+	record           func(step int, kind, tool, text string)
+	recordContext    func(ContextEvent)
+	contextWindow    func(model string) int
+	lastPromptTokens int
+	lastPromptChars  int
+	resolve          func() (*openai.Client, string, error)
+	lastFlag         string
+	flagComplete     bool
+	messageMu        sync.Mutex
+	scopeMu          sync.RWMutex
+	modelMu          sync.RWMutex
+	chatMu           sync.Mutex
+	chatHistory      []openai.ChatCompletionMessage
+	sessionPath      string
 }
 
 // New builds a solver from Options.
@@ -114,7 +121,8 @@ func New(o Options) *Solver {
 	return &Solver{
 		ModelSpec: o.ModelSpec, Model: o.Model, client: o.Client, meta: o.Meta, scope: o.Scope,
 		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, insecureTLS: o.InsecureTLS, deadline: o.Deadline, tokens: o.Tokens,
-		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record, resolve: o.Resolve, sessionPath: o.SessionPath,
+		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record, recordContext: o.RecordContext,
+		contextWindow: o.ContextWindow, resolve: o.Resolve, sessionPath: o.SessionPath,
 	}
 }
 
@@ -156,8 +164,15 @@ func (s *Solver) start() {
 		s.messages = append(s.messages, message)
 		s.journal(sessionEvent{Type: "message", Message: &message, Step: s.steps})
 	}
-	if last := s.messages[len(s.messages)-1]; last.Role == openai.ChatMessageRoleUser {
-		s.resumeCycle = true
+	for i := len(s.messages) - 1; i > 0; i-- {
+		m := s.messages[i]
+		if m.Role != openai.ChatMessageRoleUser {
+			break
+		}
+		if strings.Contains(m.Content, "Solve this task.") || strings.Contains(m.Content, "Continue solving.") {
+			s.resumeCycle = true
+			break
+		}
 	}
 	s.started = true
 }
@@ -172,8 +187,7 @@ func (s *Solver) systemPrompt() string {
 	meta := s.meta
 	current := s.scopeSnapshot()
 	meta.ConnectionInfo = strings.Join(current.Entries(), ", ")
-	remaining := int(time.Until(s.deadline).Seconds())
-	sys := prompts.BuildHeadlessPrompt(meta, remaining, s.allowExec && pythonAvailable())
+	sys := prompts.BuildHeadlessPrompt(meta, 0, s.allowExec && pythonAvailable())
 	if current.IsEmpty() {
 		sys += "\n\n## SCOPE LOCK — NO TARGET KNOWN\nThe scope is empty; all egress is refused. Report via notify and stop."
 	}
@@ -337,15 +351,91 @@ func (s *Solver) messageSnapshot() []openai.ChatCompletionMessage {
 // durable facts/findings live on the blackboard and are re-injected each cycle,
 // so older raw exchanges are redundant.
 func (s *Solver) compactMessages() {
-	s.compactMessagesTo(contextBudgetChars, contextMaxKeepTurns)
+	s.compactMessagesTo(s.transcriptBudgetChars(), contextMaxKeepTurns)
 }
 
 func (s *Solver) compactMessagesTo(budget, keepTurns int) bool {
 	s.messageMu.Lock()
-	defer s.messageMu.Unlock()
+	before := s.messages
+	beforeChars := totalChars(before)
 	if out, changed := compactWindow(s.messages, keepTurns, budget); changed {
 		s.messages = out
 		s.journal(sessionEvent{Type: "compact", Messages: out, Step: s.steps})
+		s.messageMu.Unlock()
+		clipped := 0
+		var clippedIDs, droppedIDs []string
+		cut := len(before) - len(out)
+		for i := 1; i <= cut && i < len(before); i++ {
+			droppedIDs = append(droppedIDs, messageLabel(i, before[i]))
+		}
+		for i := len(out) - 1; i > 0 && i < len(before); i-- {
+			j := cut + i
+			if j > 0 && j < len(before) && msgChars(out[i]) < msgChars(before[j]) {
+				clipped++
+				clippedIDs = append(clippedIDs, messageLabel(j, before[j]))
+			}
+		}
+		s.contextEvent(ContextEvent{Phase: "compact", BudgetChars: budget, BeforeChars: beforeChars,
+			AfterChars: totalChars(out), DroppedCycles: max(0, countCyclePrompts(before)-countCyclePrompts(out)),
+			ClippedMessages: clipped, Dropped: droppedIDs, Clipped: clippedIDs})
+		return true
+	}
+	s.messageMu.Unlock()
+	return false
+}
+
+func countCyclePrompts(messages []openai.ChatCompletionMessage) int {
+	n := 0
+	for _, m := range messages {
+		if m.Role == openai.ChatMessageRoleUser &&
+			(strings.Contains(m.Content, "Solve this task.") || strings.Contains(m.Content, "Continue solving.")) {
+			n++
+		}
+	}
+	return n
+}
+
+func messageLabel(index int, message openai.ChatCompletionMessage) string {
+	if message.Role == openai.ChatMessageRoleTool {
+		return fmt.Sprintf("%d:tool:%s", index, message.ToolCallID)
+	}
+	if len(message.ToolCalls) > 0 {
+		return fmt.Sprintf("%d:assistant:%d calls", index, len(message.ToolCalls))
+	}
+	return fmt.Sprintf("%d:%s", index, message.Role)
+}
+
+func (s *Solver) hasFullSummary() bool {
+	for _, m := range s.messageSnapshot() {
+		if m.Role == openai.ChatMessageRoleUser && strings.Contains(m.Content, "## working record (blackboard)") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Solver) remainingTimeLine() string {
+	remaining := time.Until(s.deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return fmt.Sprintf("[Current time budget] %d seconds remain.", int(remaining.Seconds()))
+}
+
+func (s *Solver) refreshCyclePrompt(prompt string) bool {
+	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
+	for i := len(s.messages) - 1; i > 0; i-- {
+		m := s.messages[i]
+		if m.Role == openai.ChatMessageRoleAssistant {
+			break
+		}
+		if m.Role != openai.ChatMessageRoleUser ||
+			(!strings.Contains(m.Content, "Solve this task.") && !strings.Contains(m.Content, "Continue solving.")) {
+			continue
+		}
+		s.messages[i].Content = prompt
+		s.journal(sessionEvent{Type: "compact", Messages: s.messages, Step: s.steps})
 		return true
 	}
 	return false
@@ -389,11 +479,20 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 	if s.hasHistory() {
 		prompt = "Continue solving."
 	}
-	if sum := s.bb.Summary(); sum != "" {
+	seenRevision := s.bb.Revision()
+	if sum, stats := s.bb.SummaryWithBudget(s.summaryBudgetChars()); sum != "" {
 		prompt = sum + "\n\n" + prompt
+		s.contextEvent(ContextEvent{Phase: "reinject", Reason: "cycle", BudgetChars: s.summaryBudgetChars(), Summary: stats})
 	}
+	prompt = s.remainingTimeLine() + "\n" + prompt
 	if !s.resumeCycle {
 		s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: prompt})
+	} else {
+		// The request was journaled before a provider failure. Refresh the
+		// same prompt in place, including current time and blackboard state.
+		if !s.refreshCyclePrompt(prompt) {
+			s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: prompt})
+		}
 	}
 	s.resumeCycle = false
 
@@ -408,14 +507,30 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 		}
 		s.flushUser()
 		s.compactMessages() // bound the growing transcript before re-sending it
+		if s.bb.Revision() > 0 && !s.hasFullSummary() {
+			sum, stats := s.bb.SummaryWithBudget(s.summaryBudgetChars())
+			if sum != "" {
+				s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: sum})
+				s.contextEvent(ContextEvent{Phase: "reinject", Reason: "summary_evicted", BudgetChars: s.summaryBudgetChars(), Summary: stats})
+				seenRevision = stats.Revision
+			}
+		} else if revision := s.bb.Revision(); revision > seenRevision {
+			delta, stats := s.bb.DeltaSince(seenRevision, s.deltaBudgetChars())
+			if delta != "" {
+				s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: delta})
+				s.contextEvent(ContextEvent{Phase: "reinject", Reason: "blackboard_delta", BudgetChars: s.deltaBudgetChars(), Summary: stats})
+			}
+			seenRevision = stats.Revision
+		}
+		requestMessages := s.messageSnapshot()
 		resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-			Model: model, Messages: s.messageSnapshot(), Tools: tools,
+			Model: model, Messages: requestMessages, Tools: tools,
 		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return Result{Status: StatusCancelled, StepCount: s.steps}
 			}
-			if isContextLimitError(err) && contextRecoveries == 0 && s.compactMessagesTo(60_000, 1) {
+			if isContextLimitError(err) && contextRecoveries == 0 && s.compactMessagesTo(s.transcriptBudgetChars()/2, 1) {
 				contextRecoveries++
 				continue
 			}
@@ -437,6 +552,10 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 			return Result{Status: StatusError, Findings: "LLM error: " + err.Error(), StepCount: s.steps}
 		}
 		atomic.AddInt64(s.tokens, int64(resp.Usage.TotalTokens))
+		if resp.Usage.PromptTokens > 0 {
+			s.lastPromptChars = totalChars(requestMessages)
+			s.lastPromptTokens = resp.Usage.PromptTokens
+		}
 		if len(resp.Choices) == 0 {
 			return Result{Status: StatusError, Findings: "empty LLM response", StepCount: s.steps}
 		}

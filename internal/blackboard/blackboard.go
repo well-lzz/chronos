@@ -64,6 +64,7 @@ type Fact struct {
 	Evidence  string  `json:"evidence,omitempty"`
 	FoundBy   string  `json:"found_by,omitempty"`
 	TS        float64 `json:"ts"`
+	Revision  uint64  `json:"revision,omitempty"`
 }
 
 type Finding struct {
@@ -81,6 +82,7 @@ type Finding struct {
 	VerifiedTS    *float64       `json:"verified_ts,omitempty"`
 	EvidenceRefs  []EvidenceRef  `json:"evidence_refs,omitempty"`
 	Verifications []Verification `json:"verifications,omitempty"`
+	Revision      uint64         `json:"revision,omitempty"`
 }
 
 type SubGoal struct {
@@ -90,6 +92,7 @@ type SubGoal struct {
 	Outcome     string  `json:"outcome,omitempty"`
 	CreatedBy   string  `json:"created_by,omitempty"`
 	TS          float64 `json:"ts"`
+	Revision    uint64  `json:"revision,omitempty"`
 }
 
 // Blackboard is the shared Fact/Finding/Sub-Goal store for one mission.
@@ -99,6 +102,7 @@ type Blackboard struct {
 
 	mu       sync.Mutex
 	seq      int
+	revision uint64
 	facts    map[string]*Fact
 	findings map[string]*Finding
 	subgoals map[string]*SubGoal
@@ -119,11 +123,26 @@ func (b *Blackboard) nextID(prefix string) string {
 	return fmt.Sprintf("%s%d", prefix, b.seq)
 }
 
+func (b *Blackboard) nextRevision() uint64 { b.revision++; return b.revision }
+
+func (b *Blackboard) Revision() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.revision
+}
+
 func clip(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n]
+	end := 0
+	for i := range s {
+		if i > n {
+			break
+		}
+		end = i
+	}
+	return s[:end]
 }
 
 // ----------------------------- mutations ------------------------------------
@@ -132,7 +151,7 @@ func (b *Blackboard) AddFact(statement, evidence, foundBy string) (string, error
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	id := b.nextID("f")
-	b.facts[id] = &Fact{ID: id, Statement: clip(statement, 2000), Evidence: clip(evidence, 2000), FoundBy: foundBy, TS: now()}
+	b.facts[id] = &Fact{ID: id, Statement: clip(statement, 2000), Evidence: clip(evidence, 2000), FoundBy: foundBy, TS: now(), Revision: b.nextRevision()}
 	b.factOrd = append(b.factOrd, id)
 	return id, b.persist()
 }
@@ -155,6 +174,7 @@ func (b *Blackboard) AddFinding(f Finding) (string, error) {
 	f.Reproduction = clip(f.Reproduction, 4000)
 	f.Remediation = clip(f.Remediation, 2000)
 	f.TS = now()
+	f.Revision = b.nextRevision()
 	if f.Status == Verified {
 		t := now()
 		f.VerifiedTS = &t
@@ -189,7 +209,12 @@ func (b *Blackboard) AddEvidenceRefs(findingID string, refs []EvidenceRef) (bool
 	if f == nil || len(refs) == 0 {
 		return false, nil
 	}
+	before := len(f.EvidenceRefs)
 	f.EvidenceRefs = dedupRefs(f.EvidenceRefs, refs)
+	if len(f.EvidenceRefs) == before {
+		return false, nil
+	}
+	f.Revision = b.nextRevision()
 	return true, b.persist()
 }
 
@@ -212,6 +237,7 @@ func (b *Blackboard) VerifyFinding(findingID, verdict, summary, evidence string,
 		f.VerifiedTS = &t
 	}
 	f.EvidenceRefs = dedupRefs(f.EvidenceRefs, refs)
+	f.Revision = b.nextRevision()
 	return true, b.persist()
 }
 
@@ -219,7 +245,7 @@ func (b *Blackboard) AddSubgoal(desc, createdBy string) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	id := b.nextID("g")
-	b.subgoals[id] = &SubGoal{ID: id, Description: clip(desc, 500), Status: "open", CreatedBy: createdBy, TS: now()}
+	b.subgoals[id] = &SubGoal{ID: id, Description: clip(desc, 500), Status: "open", CreatedBy: createdBy, TS: now(), Revision: b.nextRevision()}
 	b.goalOrd = append(b.goalOrd, id)
 	return id, b.persist()
 }
@@ -233,6 +259,7 @@ func (b *Blackboard) ResolveSubgoal(id, outcome string) (bool, error) {
 	}
 	g.Status = "resolved"
 	g.Outcome = clip(outcome, 1000)
+	g.Revision = b.nextRevision()
 	return true, b.persist()
 }
 
@@ -290,59 +317,10 @@ func (b *Blackboard) Counts() map[string]int {
 	return c
 }
 
-// Summary is the compact text view injected into an executor's context.
+// Summary is the budgeted working record injected into an executor's context.
 func (b *Blackboard) Summary() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.facts) == 0 && len(b.findings) == 0 && len(b.subgoals) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	sb.WriteString("## working record (blackboard)\n")
-	var open []*SubGoal
-	for _, id := range b.goalOrd {
-		if g := b.subgoals[id]; g != nil && g.Status == "open" {
-			open = append(open, g)
-		}
-	}
-	if len(open) > 0 {
-		sb.WriteString("open sub-goals:\n")
-		for i, g := range open {
-			if i >= 20 {
-				break
-			}
-			fmt.Fprintf(&sb, "- [%s] %s\n", g.ID, g.Description)
-		}
-	}
-	if len(b.findOrd) > 0 {
-		sb.WriteString("findings:\n")
-		for _, id := range tail(b.findOrd, 25) {
-			f := b.findings[id]
-			refs := ""
-			if len(f.EvidenceRefs) > 0 {
-				refs = fmt.Sprintf(" evidence:%d", len(f.EvidenceRefs))
-			}
-			at := ""
-			if f.Target != "" {
-				at = " @ " + f.Target
-			}
-			fmt.Fprintf(&sb, "- [%s] (%s/%s) %s%s%s\n", f.ID, f.Status, f.Severity, f.Title, at, refs)
-		}
-	}
-	if len(b.factOrd) > 0 {
-		sb.WriteString("confirmed facts:\n")
-		for _, id := range tail(b.factOrd, 25) {
-			fmt.Fprintf(&sb, "- %s\n", b.facts[id].Statement)
-		}
-	}
-	return strings.TrimRight(sb.String(), "\n")
-}
-
-func tail(ids []string, n int) []string {
-	if len(ids) <= n {
-		return ids
-	}
-	return ids[len(ids)-n:]
+	text, _ := b.SummaryWithBudget(12_000)
+	return text
 }
 
 // FindingsSorted returns findings severity-first (critical→info), then
@@ -483,6 +461,7 @@ func (b *Blackboard) SubgoalsPublic() []SubgoalRow {
 type diskModel struct {
 	MissionID string    `json:"mission_id"`
 	Seq       int       `json:"seq"`
+	Revision  uint64    `json:"revision,omitempty"`
 	Facts     []Fact    `json:"facts"`
 	Findings  []Finding `json:"findings"`
 	Subgoals  []SubGoal `json:"subgoals"`
@@ -493,7 +472,7 @@ func (b *Blackboard) persist() error {
 	if b.Path == "" {
 		return nil
 	}
-	m := diskModel{MissionID: b.MissionID, Seq: b.seq}
+	m := diskModel{MissionID: b.MissionID, Seq: b.seq, Revision: b.revision}
 	for _, id := range b.factOrd {
 		m.Facts = append(m.Facts, *b.facts[id])
 	}
@@ -537,6 +516,7 @@ func LoadOrNew(missionID, stateDir string) (*Blackboard, error) {
 		return nil, fmt.Errorf("load blackboard %s: %w", path, err)
 	}
 	b.seq = m.Seq
+	b.revision = m.Revision
 	for i := range m.Facts {
 		fc := m.Facts[i]
 		b.facts[fc.ID] = &fc
@@ -551,6 +531,20 @@ func LoadOrNew(missionID, stateDir string) (*Blackboard, error) {
 		g := m.Subgoals[i]
 		b.subgoals[g.ID] = &g
 		b.goalOrd = append(b.goalOrd, g.ID)
+	}
+	// Legacy boards had no revision stamps. Treat their contents as one initial
+	// revision so a newly resumed executor can still receive a full snapshot.
+	if b.revision == 0 && b.seq > 0 {
+		b.revision = 1
+		for _, f := range b.facts {
+			f.Revision = 1
+		}
+		for _, f := range b.findings {
+			f.Revision = 1
+		}
+		for _, g := range b.subgoals {
+			g.Revision = 1
+		}
 	}
 	return b, nil
 }

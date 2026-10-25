@@ -27,7 +27,7 @@ const PRESETS = [
 ];
 const KIND_LABEL = {
   operator: "操作员", assistant: "Agent 回复", status: "状态", text: "推理",
-  tool_call: "调用", tool_result: "结果", error: "错误",
+  tool_call: "调用", tool_result: "结果", error: "错误", context: "上下文边界",
 };
 
 const OPERATOR_TOKEN_KEY = "chronos.operator.token";
@@ -312,7 +312,7 @@ export default function Console() {
             </div>
             {behavior.total > 0 && (
               <div className={s.kinds}>
-                {["assistant", "status", "text", "tool_call", "tool_result", "operator"].map((k) =>
+                {["assistant", "status", "text", "tool_call", "tool_result", "operator", "context"].map((k) =>
                   behavior.kinds[k] ? <span key={k} className={s[`k_${k}`]}>{KIND_LABEL[k]} {behavior.kinds[k]}</span> : null
                 )}
               </div>
@@ -565,6 +565,7 @@ function SettingsModal({ initial, onClose, onSaved }) {
   const [provider, setProvider] = useState(match.id);
   const [baseURL, setBaseURL] = useState(initial?.base_url || match.base);
   const [model, setModel] = useState(initial?.model || match.model);
+	const [contextWindow, setContextWindow] = useState(initial?.context_window_tokens || "");
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState(null); // {ok,error}
@@ -576,7 +577,7 @@ function SettingsModal({ initial, onClose, onSaved }) {
     if (p.id !== "custom") { setBaseURL(p.base); if (!model) setModel(p.model); }
   };
 
-  const body = () => ({ provider, base_url: baseURL.trim(), model: model.trim(), api_key: apiKey });
+  const body = () => ({ provider, base_url: baseURL.trim(), model: model.trim(), api_key: apiKey, context_window_tokens: Number(contextWindow) || 0 });
 
   const save = async () => {
     setBusy(true); setTest(null);
@@ -619,6 +620,9 @@ function SettingsModal({ initial, onClose, onSaved }) {
         </label>
         <label className={s.field}><span>模型 Model</span>
           <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="deepseek-chat" />
+        </label>
+        <label className={s.field}><span>上下文窗口（tokens）</span>
+          <input type="number" min="4096" value={contextWindow} onChange={(e) => setContextWindow(e.target.value)} placeholder={`自动 ${initial?.effective_context_window_tokens || 16000}；可按模型文档覆盖`} />
         </label>
         <label className={s.field}><span>API Key</span>
           <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}

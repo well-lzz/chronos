@@ -35,14 +35,15 @@ type Settings struct {
 	AutoResumeIdleS      int
 
 	// LLM providers (OpenAI-compatible). Base URLs have defaults; keys from env.
-	DeepSeekKey     string
-	DeepSeekKeys    []string
-	DeepSeekBaseURL string
-	QwenKey         string
-	QwenBaseURL     string
-	GLMKey          string
-	GLMBaseURL      string
-	GLMModelID      string
+	DeepSeekKey         string
+	DeepSeekKeys        []string
+	DeepSeekBaseURL     string
+	QwenKey             string
+	QwenBaseURL         string
+	GLMKey              string
+	GLMBaseURL          string
+	GLMModelID          string
+	ContextWindowTokens int
 }
 
 func getenv(key, def string) string {
@@ -113,14 +114,15 @@ func Load() Settings {
 		AllowLocalExec:      getenvBool("ALLOW_LOCAL_EXEC", false),
 		TargetInsecureTLS:   getenvBool("TARGET_INSECURE_TLS", false),
 
-		DeepSeekKey:     deepSeekKey,
-		DeepSeekKeys:    deepSeekKeys,
-		DeepSeekBaseURL: getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-		QwenKey:         os.Getenv("QWEN_API_KEY"),
-		QwenBaseURL:     getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-		GLMKey:          os.Getenv("GLM_API_KEY"),
-		GLMBaseURL:      getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
-		GLMModelID:      getenv("GLM_MODEL_ID", "glm-4-plus"),
+		DeepSeekKey:         deepSeekKey,
+		DeepSeekKeys:        deepSeekKeys,
+		DeepSeekBaseURL:     getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+		QwenKey:             os.Getenv("QWEN_API_KEY"),
+		QwenBaseURL:         getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+		GLMKey:              os.Getenv("GLM_API_KEY"),
+		GLMBaseURL:          getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
+		GLMModelID:          getenv("GLM_MODEL_ID", "glm-4-plus"),
+		ContextWindowTokens: getenvInt("MODEL_CONTEXT_WINDOW_TOKENS", 0),
 
 		PlatformMode:         getenv("PLATFORM_MODE", "tsec"),
 		PlatformURL:          getenv("PLATFORM_URL", ""),

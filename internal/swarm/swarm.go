@@ -38,11 +38,12 @@ import (
 // a per-swarm monotonic cursor (covers operator messages too, which have no
 // solver step), so the chat/stream orders human and agent messages together.
 type ActEvent struct {
-	Seq  int64  `json:"seq"`
-	Step int    `json:"step"`
-	Kind string `json:"kind"` // tool_call | tool_result | text | operator | assistant | status
-	Tool string `json:"tool,omitempty"`
-	Text string `json:"text"`
+	Seq     int64                `json:"seq"`
+	Step    int                  `json:"step"`
+	Kind    string               `json:"kind"` // tool_call | tool_result | text | operator | assistant | status
+	Tool    string               `json:"tool,omitempty"`
+	Text    string               `json:"text"`
+	Context *solver.ContextEvent `json:"context,omitempty"`
 }
 
 const activityRing = 300
@@ -145,6 +146,18 @@ func (s *Swarm) Run(ctx context.Context) string {
 			}
 			return llm.Resolve(sp, s.Settings)
 		}
+		contextWindow := func(model string) int {
+			if s.LLM != nil && s.LLM.Active() {
+				p := s.LLM.Get()
+				if p.Model == model && p.ContextWindowTokens > 0 {
+					return p.ContextWindowTokens
+				}
+			}
+			if s.Settings.ContextWindowTokens > 0 {
+				return s.Settings.ContextWindowTokens
+			}
+			return llmconfig.KnownContextWindowTokens(model)
+		}
 		var submitFn solver.SubmitFn
 		if s.Platform != nil {
 			submitFn = func(fl string) (string, bool, bool) { return s.trySubmit(fl, sp) }
@@ -153,7 +166,8 @@ func (s *Swarm) Run(ctx context.Context) string {
 			ModelSpec: spec, Meta: s.Meta, Scope: s.Scope,
 			BB: s.BB, TL: s.TL, AllowExec: s.Settings.AllowLocalExec, InsecureTLS: s.Settings.TargetInsecureTLS, Deadline: deadline,
 			Tokens: &s.Tokens, Notify: func(m string) { log.Printf("[%s/%s] %s", s.Meta.Name, sp, m) },
-			SubmitFn: submitFn, Record: s.recorder(spec), Resolve: resolve, SessionPath: s.sessionPath(spec),
+			SubmitFn: submitFn, Record: s.recorder(spec), RecordContext: s.contextRecorder(spec),
+			ContextWindow: contextWindow, Resolve: resolve, SessionPath: s.sessionPath(spec),
 		})
 		s.mu.Lock()
 		s.solvers[spec] = sv
@@ -345,6 +359,47 @@ func (s *Swarm) recorder(spec string) func(step int, kind, tool, text string) {
 	return func(step int, kind, tool, text string) {
 		s.emit(spec, step, kind, tool, text)
 	}
+}
+
+func (s *Swarm) contextRecorder(spec string) func(solver.ContextEvent) {
+	return func(event solver.ContextEvent) {
+		text := fmt.Sprintf("%s: %d → %d chars, dropped %d cycles, clipped %d messages; kept %d mandatory + %d quota findings, %d omitted (revision %d)",
+			event.Phase, event.BeforeChars, event.AfterChars, event.DroppedCycles, event.ClippedMessages,
+			event.Summary.MandatoryFindings, event.Summary.QuotaFindings, event.Summary.OmittedFindings, event.Summary.Revision)
+		if event.Phase == "reinject" {
+			text = fmt.Sprintf("blackboard %s: kept %d mandatory + %d quota findings; %d findings, %d facts, %d goals summarized (revision %d, %d/%d chars)",
+				event.Reason, event.Summary.MandatoryFindings, event.Summary.QuotaFindings,
+				event.Summary.OmittedFindings, event.Summary.OmittedFacts, event.Summary.OmittedGoals,
+				event.Summary.Revision, event.Summary.ActualChars, event.BudgetChars)
+		} else {
+			if len(event.Dropped) > 0 {
+				text += "; dropped: " + briefContextIDs(event.Dropped)
+			}
+			if len(event.Clipped) > 0 {
+				text += "; clipped: " + briefContextIDs(event.Clipped)
+			}
+		}
+		s.emitContext(spec, event, text)
+	}
+}
+
+func briefContextIDs(ids []string) string {
+	const maxShown = 12
+	if len(ids) <= maxShown {
+		return strings.Join(ids, ", ")
+	}
+	return fmt.Sprintf("%s (+%d more)", strings.Join(ids[:maxShown], ", "), len(ids)-maxShown)
+}
+
+func (s *Swarm) emitContext(spec string, event solver.ContextEvent, text string) {
+	seq := atomic.AddInt64(&s.evSeq, 1)
+	s.mu.Lock()
+	buf := append(s.activity[spec], ActEvent{Seq: seq, Step: 0, Kind: "context", Text: text, Context: &event})
+	if len(buf) > activityRing {
+		buf = buf[len(buf)-activityRing:]
+	}
+	s.activity[spec] = buf
+	s.mu.Unlock()
 }
 
 // emit appends an event to an executor's ring with a monotonic Seq.

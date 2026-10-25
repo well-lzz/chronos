@@ -15,10 +15,11 @@ import (
 
 // Profile is the active model configuration.
 type Profile struct {
-	Provider string `json:"provider"` // display label / preset id (e.g. "deepseek", "openai", "custom")
-	Model    string `json:"model"`    // concrete model id, e.g. "deepseek-chat"
-	BaseURL  string `json:"base_url"` // OpenAI-compatible base, e.g. "https://api.deepseek.com/v1"
-	APIKey   string `json:"api_key"`  // provider key (stored locally, 0600)
+	Provider            string `json:"provider"`                        // display label / preset id (e.g. "deepseek", "openai", "custom")
+	Model               string `json:"model"`                           // concrete model id, e.g. "deepseek-chat"
+	BaseURL             string `json:"base_url"`                        // OpenAI-compatible base, e.g. "https://api.deepseek.com/v1"
+	APIKey              string `json:"api_key"`                         // provider key (stored locally, 0600)
+	ContextWindowTokens int    `json:"context_window_tokens,omitempty"` // operator-confirmed model window; 0 = conservative fallback
 }
 
 // Active reports whether the profile has enough to build a client.
@@ -37,6 +38,26 @@ func (p Profile) Label() string {
 		m = "model"
 	}
 	return prov + "/" + m
+}
+
+// KnownContextWindowTokens is a small model catalog for common exact IDs.
+// Unknown/custom IDs use the operator's per-profile value or the conservative
+// solver fallback. Values should be reviewed as providers revise aliases.
+func KnownContextWindowTokens(model string) int {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "deepseek-flash", "deepseek-v4-pro":
+		return 1_048_576 // https://api-docs.deepseek.com/api/list-models/
+	case "deepseek-chat", "deepseek-reasoner":
+		return 64_000 // conservative floor for the legacy aliases
+	case "gpt-4o":
+		return 128_000 // https://developers.openai.com/api/docs/models/gpt-4o
+	case "claude-sonnet-4-5":
+		return 200_000 // https://docs.anthropic.com/en/api/claude-on-amazon-bedrock
+	case "moonshot-v1-8k":
+		return 8_192
+	default:
+		return 0
+	}
 }
 
 // Store holds the profile and persists it to <stateDir>/llm.json.
@@ -79,6 +100,9 @@ func (s *Store) Set(p Profile) error {
 	p.Provider = strings.TrimSpace(p.Provider)
 	p.Model = strings.TrimSpace(p.Model)
 	p.BaseURL = strings.TrimSpace(p.BaseURL)
+	if p.ContextWindowTokens < 4096 || p.ContextWindowTokens > 2_000_000 {
+		p.ContextWindowTokens = 0
+	}
 	if strings.TrimSpace(p.APIKey) == "" {
 		p.APIKey = s.p.APIKey // preserve existing secret
 	}
@@ -121,6 +145,16 @@ func (s *Store) Public() map[string]any {
 	}
 	return map[string]any{
 		"provider": p.Provider, "model": p.Model, "base_url": p.BaseURL,
+		"context_window_tokens": p.ContextWindowTokens,
+		"effective_context_window_tokens": func() int {
+			if p.ContextWindowTokens > 0 {
+				return p.ContextWindowTokens
+			}
+			if n := KnownContextWindowTokens(p.Model); n > 0 {
+				return n
+			}
+			return 16_000
+		}(),
 		"has_key": p.APIKey != "", "key_hint": hint, "active": p.Active(),
 	}
 }

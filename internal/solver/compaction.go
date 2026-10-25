@@ -1,6 +1,7 @@
 package solver
 
 import (
+	"strings"
 	"unicode/utf8"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -24,9 +25,6 @@ import (
 // valid on its own.
 
 const (
-	// contextBudgetChars triggers compaction (≈ 4 chars per token). Set well under
-	// the model's context window so re-sent history stays cheap.
-	contextBudgetChars = 140_000
 	// contextMaxKeepTurns is the most recent cycle boundaries kept when compacting.
 	contextMaxKeepTurns = 3
 	// minMsgClip protects a little context while permitting dense single cycles
@@ -160,11 +158,22 @@ func clipOld(msgs []openai.ChatCompletionMessage, budget int) ([]openai.ChatComp
 	}
 	changed := false
 	unclippable := make(map[int]bool)
+	// Blackboard snapshots and deltas can carry mandatory findings. Whole
+	// segments may be dropped at safe user boundaries and then reinjected, but
+	// clipping their text would silently lose findings inside a live cycle.
+	protected := make(map[int]bool)
+	for i := 1; i < len(out); i++ {
+		if out[i].Role == openai.ChatMessageRoleUser &&
+			(strings.Contains(out[i].Content, "## working record (blackboard)") ||
+				strings.Contains(out[i].Content, "## blackboard changes (revision")) {
+			protected[i] = true
+		}
+	}
 	for totalChars(out) > budget {
 		// Pick the largest reducible message (never the system prompt).
 		idx, size := -1, 0
 		for i := 1; i < len(out); i++ {
-			if c := msgChars(out[i]); c > size && c > minMsgClip && !unclippable[i] {
+			if c := msgChars(out[i]); c > size && c > minMsgClip && !unclippable[i] && !protected[i] {
 				idx, size = i, c
 			}
 		}
