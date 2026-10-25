@@ -10,8 +10,11 @@ package swarm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +59,16 @@ func providerBackoff(failures int) time.Duration {
 		failures = 5
 	}
 	return time.Duration(1<<uint(failures-1)) * time.Second
+}
+
+func (s *Swarm) sessionPath(spec string) string {
+	if s.BB == nil || s.BB.Path == "" {
+		return ""
+	}
+	root := filepath.Dir(filepath.Dir(s.BB.Path))
+	mission := strings.TrimSuffix(filepath.Base(s.BB.Path), filepath.Ext(s.BB.Path))
+	sum := sha256.Sum256([]byte(spec))
+	return filepath.Join(root, "sessions", mission, hex.EncodeToString(sum[:8])+".jsonl")
 }
 
 type Swarm struct {
@@ -140,7 +153,7 @@ func (s *Swarm) Run(ctx context.Context) string {
 			ModelSpec: spec, Meta: s.Meta, Scope: s.Scope,
 			BB: s.BB, TL: s.TL, AllowExec: s.Settings.AllowLocalExec, InsecureTLS: s.Settings.TargetInsecureTLS, Deadline: deadline,
 			Tokens: &s.Tokens, Notify: func(m string) { log.Printf("[%s/%s] %s", s.Meta.Name, sp, m) },
-			SubmitFn: submitFn, Record: s.recorder(spec), Resolve: resolve,
+			SubmitFn: submitFn, Record: s.recorder(spec), Resolve: resolve, SessionPath: s.sessionPath(spec),
 		})
 		s.mu.Lock()
 		s.solvers[spec] = sv

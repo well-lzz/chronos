@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,8 @@ type Options struct {
 	SubmitFn SubmitFn
 	// Record, when set, receives each step for live observation (web console).
 	Record func(step int, kind, tool, text string)
+	// SessionPath enables append-only transcript recovery for this executor.
+	SessionPath string
 	// Resolve, when set, supplies the client+model at the start of each cycle so
 	// an operator who fixes the LLM config mid-run is picked up without a restart.
 	// Takes precedence over Client.
@@ -103,6 +106,7 @@ type Solver struct {
 	modelMu      sync.RWMutex
 	chatMu       sync.Mutex
 	chatHistory  []openai.ChatCompletionMessage
+	sessionPath  string
 }
 
 // New builds a solver from Options.
@@ -110,7 +114,7 @@ func New(o Options) *Solver {
 	return &Solver{
 		ModelSpec: o.ModelSpec, Model: o.Model, client: o.Client, meta: o.Meta, scope: o.Scope,
 		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, insecureTLS: o.InsecureTLS, deadline: o.Deadline, tokens: o.Tokens,
-		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record, resolve: o.Resolve,
+		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record, resolve: o.Resolve, sessionPath: o.SessionPath,
 	}
 }
 
@@ -130,8 +134,38 @@ func (s *Solver) start() {
 	if s.started {
 		return
 	}
-	s.messages = []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: s.systemPrompt()}}
+	if s.sessionPath != "" {
+		state, err := loadSession(s.sessionPath)
+		if err != nil {
+			log.Printf("session recovery failed (%s): %v", s.sessionPath, err)
+			s.sessionPath = ""
+		} else {
+			s.messages, s.pendingUser, s.steps = state.messages, state.pending, state.step
+		}
+	}
+	if len(s.messages) == 0 || s.messages[0].Role != openai.ChatMessageRoleSystem {
+		s.messages = []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: s.systemPrompt()}}
+		s.journal(sessionEvent{Type: "message", Message: &s.messages[0], Step: s.steps})
+	} else {
+		// Authorization and time budget are always rebuilt from live state.
+		s.messages[0].Content = s.systemPrompt()
+	}
+	for _, id := range interruptedCalls(s.messages) {
+		message := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: id,
+			Content: "interrupted before completion; result unknown. Check the traffic log before retrying any action."}
+		s.messages = append(s.messages, message)
+		s.journal(sessionEvent{Type: "message", Message: &message, Step: s.steps})
+	}
+	if last := s.messages[len(s.messages)-1]; last.Role == openai.ChatMessageRoleUser {
+		s.resumeCycle = true
+	}
 	s.started = true
+}
+
+func (s *Solver) journal(event sessionEvent) {
+	if err := appendSessionEvent(s.sessionPath, event); err != nil {
+		log.Printf("session journal write failed (%s): %v", s.sessionPath, err)
+	}
 }
 
 func (s *Solver) systemPrompt() string {
@@ -266,12 +300,14 @@ func (s *Solver) ReplyToOperator(ctx context.Context, message string, paused boo
 func (s *Solver) appendMessage(message openai.ChatCompletionMessage) {
 	s.messageMu.Lock()
 	s.messages = append(s.messages, message)
+	s.journal(sessionEvent{Type: "message", Message: &message, Step: s.steps})
 	s.messageMu.Unlock()
 }
 
 func (s *Solver) queueUser(message openai.ChatCompletionMessage) {
 	s.messageMu.Lock()
 	s.pendingUser = append(s.pendingUser, message)
+	s.journal(sessionEvent{Type: "queue", Message: &message})
 	s.messageMu.Unlock()
 }
 
@@ -280,8 +316,13 @@ func (s *Solver) queueUser(message openai.ChatCompletionMessage) {
 // at any time, but must not split a tool-call/result group.
 func (s *Solver) flushUser() {
 	s.messageMu.Lock()
+	if len(s.pendingUser) == 0 {
+		s.messageMu.Unlock()
+		return
+	}
 	s.messages = append(s.messages, s.pendingUser...)
 	s.pendingUser = nil
+	s.journal(sessionEvent{Type: "flush", Step: s.steps})
 	s.messageMu.Unlock()
 }
 
@@ -304,6 +345,7 @@ func (s *Solver) compactMessagesTo(budget, keepTurns int) bool {
 	defer s.messageMu.Unlock()
 	if out, changed := compactWindow(s.messages, keepTurns, budget); changed {
 		s.messages = out
+		s.journal(sessionEvent{Type: "compact", Messages: out, Step: s.steps})
 		return true
 	}
 	return false

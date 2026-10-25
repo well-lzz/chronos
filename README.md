@@ -128,7 +128,7 @@ chronos [flags]
 | `report` | JSON + Markdown + 自包含 HTML（含证据流量、验证历史） |
 | `nettools` | DoRawHTTP / DoTCPSend（纯 IO，不走代理） |
 | `llm` | 模型规格 → go-openai 客户端 + 模型 id（DeepSeek/Qwen/GLM） |
-| `solver` | 单 executor 的工具循环（function calling）：http/tcp/run_python + 黑板/流量工具 |
+| `solver` | 单 executor 的工具循环；上下文压缩、会话日志恢复、模型故障重试与受控工具并发 |
 | `swarm` | 并行协作 executor（不竞速、互不取消）；平台模式下 submit 去重/冷却/熔断 |
 | `platform` | 可插拔平台工作源接口 + `New(mode,…)` 工厂；内置 TSecBench REST 适配器(其一) |
 | `poller` | 后台轮询，发 new/solved 事件 |
@@ -137,7 +137,7 @@ chronos [flags]
 | `engrun` | 让 engagement 模式也能开 `--web`（单 mission 的发现视图 + 算子操作） |
 | `web` | 内嵌控制台后端（net/http + SSE，无 websocket 依赖）；前端是 `web/` 的 Next.js 应用，静态导出后嵌入二进制；UI 以发现判定(确认/疑似/失败)为中心 |
 
-运行态目录（默认 `.chronos-state/`）：`blackboards/`、`traffic/`、`reports/`。
+运行态目录（默认 `.chronos-state/`）：`blackboards/`、`traffic/`、`sessions/`、`reports/`。
 
 ## 平台规则适配（调度器模式）
 

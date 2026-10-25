@@ -6,7 +6,7 @@ Chronos 的领域能力仍是「授权范围内搜索，并把事实、发现和
 
 | 来源 | 可借鉴的机制 | Chronos 的落点 |
 | --- | --- | --- |
-| [Pi 的 compaction](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/compaction.md) 与 [sessions](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/sessions.md) | 历史可追溯，模型上下文按阈值缩短，溢出后重试 | 当前保留黑板与流量作为持久证据，压缩仅作用于模型消息；完整会话日志与跨进程恢复列为下一阶段 |
+| [Pi 的 compaction](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/compaction.md) 与 [sessions](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/sessions.md) | 历史可追溯，模型上下文按阈值缩短，溢出后重试 | 黑板与流量保存证据；逐事件 JSONL 保存完整对话；压缩只作用于模型的活动窗口 |
 | [Codex agent loop](https://openai.com/index/unrolling-the-codex-agent-loop/) | 工具结果进入下一轮推理；上下文预算和溢出恢复属于执行循环 | 在请求前压缩；上下文长度错误时进一步缩短并重试一次；工具调用和结果严格配对 |
 | [Claude 长任务 harness](https://www.anthropic.com/research/effective-harnesses-for-long-running-agents) | 长任务靠外化状态与可恢复的增量进展，而非无限延长单个提示词 | 黑板保存事实、发现和子目标；只有连续无进展才耗尽 `MAX_BUMPS` |
 
@@ -17,12 +17,13 @@ Chronos 的领域能力仍是「授权范围内搜索，并把事实、发现和
 3. **工具并发**：一组全为无 body 的 GET/HEAD 请求时，最多同时执行 3 个；结果按模型原始顺序回填。写黑板、提交 flag、Python、TCP 和混合调用依次执行。每回合最多执行 40 个工具调用，超额调用收到明确的未执行结果，保证消息配对。
 4. **长任务**：`MAX_BUMPS` 是连续无新事实/发现的上限；发现新进展就重置计数。任务仍受墙钟预算约束。TCP 连接和读取响应任务取消，不再等待完整网络超时。Scope 锁仍在每次出网工具调用处生效。
 5. **操作员输入**：指令与 Scope 更新先排队，在下一次模型请求前、上一组工具结果完整写入后才进入消息序列。Scope 后端约束立即更新。
+6. **跨进程恢复**：每个 mission/executor 的消息、排队指令和压缩快照追加到私有权限的 `sessions/` JSONL。重启时重建当前窗口与最新系统 Scope；崩溃时未完成的 tool call 收到“结果未知”占位结果，不自动重放任何工具。末尾损坏的半条记录会被舍弃。日志保留完整历史，可能包含目标返回的敏感内容，应按证据日志一样管理。
 
 ## 仍需完成的能力
 
 以下是下一阶段的独立工作，不把它们伪装成现有能力：
 
-- **完整会话日志与跨进程恢复**：为每个 executor 记录追加式消息/压缩事件，重启时只从完整的 tool-call/result 边界恢复；保留黑板和流量的引用，不重复执行可能有副作用的工具。需要崩溃注入测试。
+- **恢复覆盖率**：当前有未完成 tool call 与 JSONL 半条记录的测试；还需进程级崩溃注入、跨版本日志迁移及日志保留/清理策略。
 - **可托管的长进程**：若未来需要后台脚本，应提供 start/status/cancel/reap 生命周期、并发配额和操作系统级隔离。当前 `run_python` 是最多 60 秒的同步工具，且默认关闭。
 - **可观测性与评估**：记录每次请求的输入/输出 token、压缩次数、提供商等待时长、工具排队时长、并发峰值和发现率。用同一批授权离线任务做 A/B 对照，以单位 token 的验证发现数、完成率和恢复成功率判定收益。
 - **并发策略**：当前平台任务并发上限仍是 3。跨任务队列的公平性、背压和全局模型请求限速需要用实际负载数据设计，不能把并发数简单调大。
