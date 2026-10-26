@@ -19,16 +19,21 @@ import (
 )
 
 type Runner struct {
-	sw       *swarm.Swarm
-	bb       *blackboard.Blackboard
-	meta     mission.Meta
-	cancel   context.CancelFunc
-	deadline time.Time
-	mu       sync.RWMutex
+	sw           *swarm.Swarm
+	bb           *blackboard.Blackboard
+	meta         mission.Meta
+	cancel       context.CancelFunc
+	deadline     time.Time
+	mu           sync.RWMutex
+	persistScope func(scope.Scope) error
 }
 
-func New(sw *swarm.Swarm, bb *blackboard.Blackboard, meta mission.Meta, cancel context.CancelFunc, deadline time.Time) *Runner {
-	return &Runner{sw: sw, bb: bb, meta: meta, cancel: cancel, deadline: deadline}
+func New(sw *swarm.Swarm, bb *blackboard.Blackboard, meta mission.Meta, cancel context.CancelFunc, deadline time.Time, persistScope ...func(scope.Scope) error) *Runner {
+	r := &Runner{sw: sw, bb: bb, meta: meta, cancel: cancel, deadline: deadline}
+	if len(persistScope) > 0 {
+		r.persistScope = persistScope[0]
+	}
+	return r
 }
 
 func (r *Runner) Snapshot() map[string]any {
@@ -61,6 +66,7 @@ func (r *Runner) Snapshot() map[string]any {
 		subgoals = append(subgoals, map[string]any{
 			"id": g.ID, "description": g.Description, "status": g.Status,
 			"outcome": g.Outcome, "done": g.Done, "mission": meta.Name,
+			"kind": g.Kind, "finding_id": g.FindingID, "assigned_to": g.AssignedTo,
 		})
 	}
 	var trafficRows []map[string]any
@@ -88,6 +94,7 @@ func (r *Runner) Snapshot() map[string]any {
 		"subgoals": subgoals,
 		"traffic":  trafficRows,
 		"swarms":   map[string]any{meta.Name: r.sw.Status()},
+		"claims":   r.bb.ActiveLeases(),
 		"engagement": map[string]any{
 			"name": meta.Name, "scope": meta.ConnectionInfo,
 			"targets": r.sw.CurrentScope().Entries(), "scope_editable": true,
@@ -142,6 +149,11 @@ func (r *Runner) UpdateScope(targets []string) error {
 	next := scope.Parse(clean)
 	if next.IsEmpty() {
 		return fmt.Errorf("scope parsed to no usable targets")
+	}
+	if r.persistScope != nil {
+		if err := r.persistScope(next); err != nil {
+			return err
+		}
 	}
 	r.mu.Lock()
 	r.meta.ConnectionInfo = next.Describe()

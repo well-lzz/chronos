@@ -239,6 +239,7 @@ func (s *Solver) toolDelegate(ctx context.Context, argsJSON string) string {
 			s.childEvent(ChildEvent{AgentID: id, ParentID: s.agentID, Kind: "context", Text: fmt.Sprintf("%s: %d/%d chars", event.Phase, event.Summary.ActualChars, event.BudgetChars), Context: &event})
 		},
 		RecordChildEvent: s.recordChildEvent,
+		VerificationPeer: s.verificationPeer,
 		Notify: func(message string) {
 			log.Printf("[%s/sub:%s] %s", s.meta.Name, id, message)
 			s.childEvent(ChildEvent{AgentID: id, ParentID: s.agentID, Kind: "notify", Text: message})
@@ -340,6 +341,7 @@ func (s *Solver) childEvent(event ChildEvent) {
 
 func (s *Solver) runChild(ctx context.Context, record *delegatedChild) string {
 	defer s.releaseChild()
+	defer func() { _ = s.bb.ReleaseOwner(record.actor) }()
 	childCtx, cancel := context.WithDeadline(ctx, record.solver.deadline)
 	defer cancel()
 	res := record.solver.RunUntilDoneOrGaveUp(childCtx)

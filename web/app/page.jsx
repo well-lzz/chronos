@@ -29,6 +29,7 @@ const KIND_LABEL = {
   operator: "操作员", assistant: "Agent 回复", status: "状态", text: "推理",
   tool_call: "调用", tool_result: "结果", error: "错误", context: "上下文边界",
   delegate_spawn: "委派", delegate_resume: "恢复子任务", delegate_return: "子任务返回", notify: "子任务通知",
+  claim: "认领", release: "释放", verify_assign: "验证分派", verify_task: "独立验证", pivot: "调整方向", handoff: "接力", terminate: "结束",
 };
 
 const OPERATOR_TOKEN_KEY = "chronos.operator.token";
@@ -231,6 +232,8 @@ export default function Console() {
   const findings = state.findings || [];
   const subgoals = state.subgoals || [];
   const traffic = state.traffic || [];
+  const claims = state.claims || [];
+  const orchestration = state.orchestration || [];
   const modeLabel = state.mode === "engagement" ? "assessment" : state.mode === "scheduler" ? "scheduler" : "—";
   const scope = state.engagement?.scope || "";
   const cur = agents.find((a) => a.challenge === watch.c && a.model === watch.m);
@@ -344,10 +347,27 @@ export default function Console() {
                 <div key={g.id} className={`${s.check} ${g.done ? s.done : ""}`}>
                   <span className={s.box}>{g.done ? "✓" : "○"}</span>
                   <span className={s.ckText}>{g.description}</span>
+                  {g.assigned_to && <span className={s.assignment}>→ {g.assigned_to}</span>}
                 </div>
               ))}
             </div>
           </div>
+
+          {(claims.length > 0 || orchestration.length > 0) && <div className={s.panel}>
+            <h2>编排 Orchestration</h2>
+            {claims.length > 0 && <div className={s.orchestrationList}>
+              {claims.map((claim) => <div key={`${claim.mission || ""}/${claim.surface}/${claim.owner}`} className={s.orchestrationRow}>
+                <b>认领</b> {claim.mission ? `${claim.mission} · ` : ""}{claim.surface}
+                <small>{claim.owner} · 到期 {fmtTime(claim.expires_at)}</small>
+              </div>)}
+            </div>}
+            {orchestration.length > 0 && <div className={s.orchestrationList}>
+              {[...orchestration].reverse().slice(0, 30).map((event) => <div key={event.seq} className={s.orchestrationRow}>
+                <b>{event.kind}</b> {event.mission || "全局"} · {event.reason}
+                <small>{fmtTime(event.time)} {event.detail}</small>
+              </div>)}
+            </div>}
+          </div>}
 
           <div className={s.panel}>
             <h2>行为 Behavior</h2>

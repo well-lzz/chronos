@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // SummaryStats makes every reinjection decision inspectable by the executor.
@@ -17,6 +18,7 @@ type SummaryStats struct {
 	OmittedFacts      int    `json:"omitted_facts"`
 	OmittedGoals      int    `json:"omitted_goals"`
 	BudgetOverflow    bool   `json:"budget_overflow"`
+	ActiveClaims      int    `json:"active_claims"`
 }
 
 const (
@@ -45,13 +47,15 @@ func (b *Blackboard) summarySince(since uint64, budget int, delta bool) (string,
 	allFindings := b.FindingsSorted() // shared severity-first ordering used by reports
 	facts := b.FactsOrdered()
 	allGoals := b.SubgoalsOrdered()
+	leases := b.ActiveLeases()
+	leaseEvents := b.LeaseEventsSince(since)
 	findings, goals := allFindings, allGoals
 	if delta {
 		findings = filterFindings(findings, since)
 		facts = filterFacts(facts, since)
 		goals = filterGoals(goals, since)
 	}
-	if len(findings)+len(facts)+len(goals) == 0 {
+	if len(findings)+len(facts)+len(goals) == 0 && ((!delta && len(leases) == 0) || (delta && len(leaseEvents) == 0)) {
 		return "", stats
 	}
 
@@ -67,6 +71,19 @@ func (b *Blackboard) summarySince(since uint64, budget int, delta bool) (string,
 		}
 		out.WriteString(line)
 		return true
+	}
+	if !delta && len(leases) > 0 {
+		out.WriteString("active claims (avoid overlapping state-changing work):\n")
+		for _, lease := range leases {
+			out.WriteString(fmt.Sprintf("- %s owned by %s until %s\n", lease.Surface, lease.Owner, time.Unix(int64(lease.ExpiresAt), 0).UTC().Format(time.RFC3339)))
+			stats.ActiveClaims++
+		}
+	}
+	if delta && len(leaseEvents) > 0 {
+		out.WriteString("claim changes:\n")
+		for _, event := range leaseEvents {
+			out.WriteString(fmt.Sprintf("- %s %s by %s\n", event.Surface, event.Action, event.Owner))
+		}
 	}
 	mandatory := make([]Finding, 0)
 	optional := make([]Finding, 0)
@@ -100,7 +117,11 @@ func (b *Blackboard) summarySince(since uint64, budget int, delta bool) (string,
 			if !delta && g.Status != "open" {
 				continue
 			}
-			line := fmt.Sprintf("- [%s] %s: %s\n", g.ID, g.Status, clip(g.Description, 180))
+			line := fmt.Sprintf("- [%s] %s: %s", g.ID, g.Status, clip(g.Description, 180))
+			if g.AssignedTo != "" {
+				line += " (assigned to " + g.AssignedTo + ")"
+			}
+			line += "\n"
 			if !appendLine(line) {
 				stats.OmittedGoals++
 			}

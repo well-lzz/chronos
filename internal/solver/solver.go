@@ -83,6 +83,7 @@ type Options struct {
 	ParentID            string
 	StepLimit           int
 	RecordChildEvent    func(ChildEvent)
+	VerificationPeer    func(origin, findingID string) string
 	// SessionPath enables append-only transcript recovery for this executor.
 	SessionPath string
 	// Resolve, when set, supplies the client+model at the start of each cycle so
@@ -118,6 +119,9 @@ type Solver struct {
 	contextWindow       func(model string) int
 	lastPromptTokens    int
 	lastPromptChars     int
+	compactedThisCycle  bool
+	compactAfterChars   int
+	saturationCycles    int
 	depth               int
 	maxDelegateDepth    int
 	maxDelegateChildren int
@@ -129,6 +133,7 @@ type Solver struct {
 	parentID            string
 	stepLimit           int
 	recordChildEvent    func(ChildEvent)
+	verificationPeer    func(origin, findingID string) string
 	delegateMu          sync.Mutex
 	children            map[string]*delegatedChild
 	activeChildren      int
@@ -179,7 +184,8 @@ func New(o Options) *Solver {
 		maxDelegateSteps: o.MaxDelegateSteps, minRemainingToSpawn: o.MinRemainingToSpawn,
 		globalRemaining: o.GlobalRemaining, subagentRoot: o.SubagentRoot, agentID: o.AgentID,
 		parentID: o.ParentID, stepLimit: o.StepLimit, recordChildEvent: o.RecordChildEvent,
-		children: map[string]*delegatedChild{},
+		verificationPeer: o.VerificationPeer,
+		children:         map[string]*delegatedChild{},
 	}
 }
 
@@ -308,6 +314,8 @@ func (s *Solver) scopeSnapshot() scope.Scope {
 	return s.scope
 }
 
+func (s *Solver) Deadline() time.Time { return s.deadline }
+
 // ReplyToOperator runs a separate no-tools conversation turn so every operator
 // message receives a direct answer even while the autonomous execution loop is
 // paused or busy. The same message is independently queued through Guide for
@@ -425,6 +433,8 @@ func (s *Solver) compactMessagesTo(budget, keepTurns int) bool {
 	beforeChars := totalChars(before)
 	if out, changed := compactWindow(s.messages, keepTurns, budget); changed {
 		s.messages = out
+		s.compactedThisCycle = true
+		s.compactAfterChars = totalChars(out)
 		s.journal(sessionEvent{Type: "compact", Messages: out, Step: s.steps})
 		s.messageMu.Unlock()
 		clipped := 0
@@ -515,6 +525,9 @@ func (s *Solver) hasHistory() bool {
 // RunUntilDoneOrGaveUp runs the tool loop until the model stops calling tools
 // (one cycle), the per-cycle cap is hit, or the context/deadline ends.
 func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
+	s.compactedThisCycle = false
+	s.compactAfterChars = 0
+	defer s.finishSaturationCycle()
 	s.start()
 
 	// Resolve the live model config for this cycle. If the operator hasn't

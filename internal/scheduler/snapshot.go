@@ -18,6 +18,7 @@ func (s *Scheduler) Snapshot() map[string]any {
 	}
 	active := len(s.runs)
 	preparing := len(s.pending)
+	orchestration := append([]OrchestrationEvent(nil), s.events...)
 	s.mu.Unlock()
 
 	confirmed, suspected, failed, facts, tokens := 0, 0, 0, 0, 0
@@ -25,6 +26,7 @@ func (s *Scheduler) Snapshot() map[string]any {
 	var findings []map[string]any
 	var subgoals []map[string]any
 	var trafficRows []map[string]any
+	var claims []map[string]any
 	swarms := map[string]any{}
 	for _, r := range runs {
 		if r.sw == nil {
@@ -33,6 +35,9 @@ func (s *Scheduler) Snapshot() map[string]any {
 		swarms[r.meta.Name] = r.sw.Status()
 		tokens += r.sw.TotalTokens()
 		if bb := r.sw.BB; bb != nil {
+			for _, lease := range bb.ActiveLeases() {
+				claims = append(claims, map[string]any{"mission": r.meta.Name, "surface": lease.Surface, "owner": lease.Owner, "expires_at": lease.ExpiresAt, "subgoal_id": lease.SubgoalID})
+			}
 			vc := bb.VerdictCounts()
 			confirmed += vc["confirmed"]
 			suspected += vc["suspected"]
@@ -48,6 +53,7 @@ func (s *Scheduler) Snapshot() map[string]any {
 				subgoals = append(subgoals, map[string]any{
 					"id": r.meta.Name + "/" + g.ID, "description": g.Description,
 					"status": g.Status, "outcome": g.Outcome, "done": g.Done, "mission": r.meta.Name,
+					"kind": g.Kind, "finding_id": g.FindingID, "assigned_to": g.AssignedTo,
 				})
 			}
 		}
@@ -73,10 +79,12 @@ func (s *Scheduler) Snapshot() map[string]any {
 			"active": active, "preparing": preparing, "tokens": tokens, "budget_left_min": budget,
 			"goals_open": goalsOpen, "goals_total": goalsTotal, "goals_done": goalsTotal - goalsOpen,
 		},
-		"findings": findings,
-		"subgoals": subgoals,
-		"traffic":  trafficRows,
-		"swarms":   swarms,
+		"findings":      findings,
+		"subgoals":      subgoals,
+		"traffic":       trafficRows,
+		"swarms":        swarms,
+		"claims":        claims,
+		"orchestration": orchestration,
 	}
 }
 

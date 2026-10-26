@@ -93,6 +93,9 @@ type SubGoal struct {
 	CreatedBy   string  `json:"created_by,omitempty"`
 	TS          float64 `json:"ts"`
 	Revision    uint64  `json:"revision,omitempty"`
+	Kind        string  `json:"kind,omitempty"` // verification for independent finding checks
+	FindingID   string  `json:"finding_id,omitempty"`
+	AssignedTo  string  `json:"assigned_to,omitempty"`
 }
 
 // Blackboard is the shared Fact/Finding/Sub-Goal store for one mission.
@@ -109,12 +112,14 @@ type Blackboard struct {
 	factOrd  []string
 	findOrd  []string
 	goalOrd  []string
+	leases   map[string]Lease
+	leaseLog []LeaseEvent
 }
 
 func newBoard(missionID, path string) *Blackboard {
 	return &Blackboard{
 		MissionID: missionID, Path: path,
-		facts: map[string]*Fact{}, findings: map[string]*Finding{}, subgoals: map[string]*SubGoal{},
+		facts: map[string]*Fact{}, findings: map[string]*Finding{}, subgoals: map[string]*SubGoal{}, leases: map[string]Lease{},
 	}
 }
 
@@ -128,6 +133,9 @@ func (b *Blackboard) nextRevision() uint64 { b.revision++; return b.revision }
 func (b *Blackboard) Revision() uint64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.expireLeasesLocked() {
+		_ = b.persist()
+	}
 	return b.revision
 }
 
@@ -206,6 +214,12 @@ func (b *Blackboard) AddFinding(f Finding) (string, error) {
 	}
 	b.findings[id] = &f
 	b.findOrd = append(b.findOrd, id)
+	if f.Status == Candidate {
+		goalID := b.nextID("g")
+		b.subgoals[goalID] = &SubGoal{ID: goalID, Description: "Independently reproduce or refute finding " + id + ": " + clip(f.Title, 200),
+			Status: "open", CreatedBy: f.FoundBy, TS: now(), Revision: b.nextRevision(), Kind: "verification", FindingID: id}
+		b.goalOrd = append(b.goalOrd, goalID)
+	}
 	return id, b.persist()
 }
 
@@ -263,6 +277,15 @@ func (b *Blackboard) VerifyFinding(findingID, verdict, summary, evidence string,
 	}
 	f.EvidenceRefs = dedupRefs(f.EvidenceRefs, refs)
 	f.Revision = b.nextRevision()
+	if verdict == Verified || verdict == Refuted {
+		for _, goal := range b.subgoals {
+			if goal.Kind == "verification" && goal.FindingID == findingID && goal.Status == "open" {
+				goal.Status = "resolved"
+				goal.Outcome = verdict + " by " + by
+				goal.Revision = b.nextRevision()
+			}
+		}
+	}
 	return true, b.persist()
 }
 
@@ -282,9 +305,13 @@ func (b *Blackboard) ResolveSubgoal(id, outcome string) (bool, error) {
 	if g == nil {
 		return false, nil
 	}
+	if g.Kind == "verification" {
+		return false, fmt.Errorf("verification sub-goal %s resolves only through verify_finding", id)
+	}
 	g.Status = "resolved"
 	g.Outcome = clip(outcome, 1000)
 	g.Revision = b.nextRevision()
+	b.releaseSubgoalLocked(id)
 	return true, b.persist()
 }
 
@@ -296,7 +323,8 @@ func (b *Blackboard) OpenSubgoals() []*SubGoal {
 	var out []*SubGoal
 	for _, id := range b.goalOrd {
 		if g := b.subgoals[id]; g != nil && g.Status == "open" {
-			out = append(out, g)
+			copy := *g
+			out = append(out, &copy)
 		}
 	}
 	return out
@@ -457,6 +485,9 @@ type SubgoalRow struct {
 	Status      string `json:"status"` // open | resolved
 	Outcome     string `json:"outcome,omitempty"`
 	Done        bool   `json:"done"`
+	Kind        string `json:"kind,omitempty"`
+	FindingID   string `json:"finding_id,omitempty"`
+	AssignedTo  string `json:"assigned_to,omitempty"`
 }
 
 // SubgoalsPublic returns the coverage checklist as light rows for a snapshot:
@@ -471,7 +502,8 @@ func (b *Blackboard) SubgoalsPublic() []SubgoalRow {
 		if g == nil {
 			continue
 		}
-		row := SubgoalRow{ID: g.ID, Description: g.Description, Status: g.Status, Outcome: g.Outcome, Done: g.Status == "resolved"}
+		row := SubgoalRow{ID: g.ID, Description: g.Description, Status: g.Status, Outcome: g.Outcome, Done: g.Status == "resolved",
+			Kind: g.Kind, FindingID: g.FindingID, AssignedTo: g.AssignedTo}
 		if row.Done {
 			done = append(done, row)
 		} else {
@@ -484,12 +516,14 @@ func (b *Blackboard) SubgoalsPublic() []SubgoalRow {
 // ---------------------------- persistence -----------------------------------
 
 type diskModel struct {
-	MissionID string    `json:"mission_id"`
-	Seq       int       `json:"seq"`
-	Revision  uint64    `json:"revision,omitempty"`
-	Facts     []Fact    `json:"facts"`
-	Findings  []Finding `json:"findings"`
-	Subgoals  []SubGoal `json:"subgoals"`
+	MissionID string       `json:"mission_id"`
+	Seq       int          `json:"seq"`
+	Revision  uint64       `json:"revision,omitempty"`
+	Facts     []Fact       `json:"facts"`
+	Findings  []Finding    `json:"findings"`
+	Subgoals  []SubGoal    `json:"subgoals"`
+	Leases    []Lease      `json:"leases,omitempty"`
+	LeaseLog  []LeaseEvent `json:"lease_log,omitempty"`
 }
 
 // persist assumes the caller holds the lock.
@@ -507,6 +541,10 @@ func (b *Blackboard) persist() error {
 	for _, id := range b.goalOrd {
 		m.Subgoals = append(m.Subgoals, *b.subgoals[id])
 	}
+	for _, lease := range b.leases {
+		m.Leases = append(m.Leases, lease)
+	}
+	m.LeaseLog = append(m.LeaseLog, b.leaseLog...)
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
@@ -556,6 +594,15 @@ func LoadOrNew(missionID, stateDir string) (*Blackboard, error) {
 		g := m.Subgoals[i]
 		b.subgoals[g.ID] = &g
 		b.goalOrd = append(b.goalOrd, g.ID)
+	}
+	for _, lease := range m.Leases {
+		b.leases[lease.Surface] = lease
+	}
+	b.leaseLog = m.LeaseLog
+	if b.expireLeasesLocked() {
+		if err := b.persist(); err != nil {
+			return nil, err
+		}
 	}
 	// Legacy boards had no revision stamps. Treat their contents as one initial
 	// revision so a newly resumed executor can still receive a full snapshot.

@@ -28,6 +28,7 @@ import (
 	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/report"
 	"github.com/well-lzz/chronos/internal/scheduler"
+	"github.com/well-lzz/chronos/internal/scope"
 	"github.com/well-lzz/chronos/internal/swarm"
 	"github.com/well-lzz/chronos/internal/traffic"
 	"github.com/well-lzz/chronos/internal/web"
@@ -289,6 +290,18 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 	}
 	meta := eng.ToMeta()
 	sc := eng.Scope()
+	runtimeID := eng.Name + "\x00" + eng.Goal
+	previous, err := engagement.LoadRuntime(cfg.StateDir, runtimeID)
+	if err != nil {
+		return fmt.Errorf("load engagement runtime: %w", err)
+	}
+	if !previous.Started.IsZero() && len(previous.Scope) > 0 {
+		sc = scope.Parse(previous.Scope).Within(sc)
+		if sc.IsEmpty() {
+			return fmt.Errorf("saved engagement scope is no longer authorized by the config")
+		}
+		meta.ConnectionInfo = sc.Describe()
+	}
 
 	fmt.Printf("Engagement: %s  (assessment, no flag oracle)\n", eng.Name)
 	fmt.Printf("  Authorized scope: %s\n", sc.Describe())
@@ -309,9 +322,18 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 		budget = cfg.ChallengeTimeLimitS
 	}
 	started := time.Now()
+	if !previous.Started.IsZero() {
+		started = previous.Started
+	}
 	base, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	deadline := started.Add(time.Duration(budget) * time.Second)
+	if !previous.Deadline.IsZero() && previous.Deadline.Before(deadline) {
+		deadline = previous.Deadline
+	}
+	if err := engagement.SaveRuntime(cfg.StateDir, runtimeID, started, deadline, sc); err != nil {
+		return fmt.Errorf("save engagement runtime: %w", err)
+	}
 	ctx, cancel := context.WithDeadline(base, deadline)
 	defer cancel()
 
@@ -322,7 +344,9 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 		// Web engagements are operator-led: configure/review Scope and converse
 		// while paused, then explicitly resume autonomous execution.
 		sw.Pause()
-		runner := engrun.New(sw, bb, meta, cancel, deadline)
+		runner := engrun.New(sw, bb, meta, cancel, deadline, func(next scope.Scope) error {
+			return engagement.SaveRuntime(cfg.StateDir, runtimeID, started, deadline, next)
+		})
 		fmt.Printf("Web console → http://%s:%d (findings: confirmed/suspected/failed)\n\n", webHost, webPort)
 		go func() {
 			if err := web.Serve(ctx, runner, llmStore, webHost, webPort); err != nil {
@@ -331,6 +355,11 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 		}()
 	}
 	sw.Run(ctx)
+	if base.Err() == nil {
+		if err := engagement.ClearRuntime(cfg.StateDir, runtimeID); err != nil {
+			return fmt.Errorf("clear engagement runtime: %w", err)
+		}
+	}
 
 	c := bb.Counts()
 	fmt.Println("\nAssessment complete")

@@ -25,7 +25,7 @@ func truncate(s string) string {
 }
 
 // DoRawHTTP sends a full-control HTTP request and returns a verbatim transcript.
-func DoRawHTTP(ctx context.Context, url, method string, headers map[string]string, body string, timeout time.Duration, hostAllowed func(string) bool, insecureTLS bool) string {
+func DoRawHTTP(ctx context.Context, url, method string, headers map[string]string, body string, timeout time.Duration, hostAllowed func(string) bool, insecureTLS bool, redirectGuard ...func(*http.Request) error) string {
 	url = strings.TrimSpace(url)
 	if url == "" {
 		return "http_request error: empty url"
@@ -55,6 +55,11 @@ func DoRawHTTP(ctx context.Context, url, method string, headers map[string]strin
 			}
 			if hostAllowed == nil || !hostAllowed(req.URL.Hostname()) {
 				return fmt.Errorf("redirect blocked by scope lock: %q is not authorized", req.URL.Hostname())
+			}
+			if len(redirectGuard) > 0 && redirectGuard[0] != nil {
+				if err := redirectGuard[0](req); err != nil {
+					return err
+				}
 			}
 			return nil
 		},

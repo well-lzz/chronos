@@ -103,7 +103,7 @@ chronos [flags]
 | `PLATFORM_MODE` | `tsec` | 平台适配器(内置仅 TSecBench;可自行扩展) |
 | `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN` | TSecBench / — | TSecBench 适配器的地址与令牌 |
 | `TSECBENCH_HOSTED` | `false` | 托管模式下自动把模型 Base URL 改写到 `*.tsecbench.gw` |
-| `CHRONOS_STATE_DIR` | `.chronos-state` | 黑板 / 流量 / 报告 / 工作区根目录 |
+| `CHRONOS_STATE_DIR` | `.chronos-state` | 黑板 / 流量 / 报告 / 会话 / 编排检查点根目录 |
 | `MAX_CONCURRENT_CHALLENGES` | `3` | 并发窗口（硬上限 3） |
 | `CHALLENGE_TIME_LIMIT_SECONDS` | `1800` | 默认单任务墙钟预算 |
 | `KILLCHAIN_TIME_LIMIT_SECONDS` | `2700` | 多阶段渗透题放宽的墙钟 |
@@ -115,15 +115,25 @@ chronos [flags]
 | `MAX_DELEGATE_DEPTH` | `1` | 子 Agent 最大委派深度；最高 2，且仅多阶段任务可启用 2 |
 | `MAX_DELEGATE_CHILDREN` | `3` | 每个 Agent 同时运行的子 Agent 上限（最高 8） |
 | `MAX_DELEGATE_STEPS` | `20` | 单次子 Agent 执行或续跑可获工具步数上限（最高 40） |
+| `MAX_HANDOFFS` | `2` | 长 engagement 中单个 executor 的最多干净会话接力次数；设为 `0` 可关闭 |
+| `ENGAGEMENT_QUIET_CYCLES` | `3` | 明确覆盖完成后，连续无新发现的终止阈值 |
 | `ALLOW_LOCAL_EXEC` | `false` | 是否允许 run_python；仅在 OS/容器隔离中开启 |
 | `TARGET_INSECURE_TLS` | `false` | 是否跳过目标 TLS 证书校验 |
+| `PLATFORM_INSECURE_TLS` | `false` | 是否跳过平台 TLS 证书校验 |
 
 ### 上下文管理
 
 执行器按模型窗口分别分配 transcript（55%）与黑板摘要（12%）预算，另留空间给工具定义和模型输出；收到提供商的 `PromptTokens` 后会用实测值调整字符到 token 的估算。控制台的模型设置可以覆盖该模型的窗口大小。黑板重注入始终保留 verified 与 critical/high finding，其余 candidate/inconclusive 按配额和预算选取；超额项以计数提示，必保项超预算会产生可见事件。长 cycle 内的黑板变更按修订号增量注入。压缩和重注入事件写入 executor session journal，并显示在控制台时间线。
 
 执行器还可自主调用 `delegate(task, max_steps, focus?)`，用独立上下文处理有界子调查。子 Agent 继承或收窄授权 Scope，共享黑板、流量日志和 token 计数；父 Agent 只收到简短结论与新建 Fact/Finding ID。未完成的直接子 Agent 可用 `delegate_resume(agent_id, extra_steps, note?)` 在原会话续跑。每轮的子任务总步数不超过父执行器该轮工具预算的一半；预算告急时拒绝新委派。子会话与元数据保存在 `CHRONOS_STATE_DIR/subagents/<mission>/<agent_id>/`，控制台可展开查看活动；目前只支持同进程续跑。
-| `PLATFORM_INSECURE_TLS` | `false` | 是否跳过平台 TLS 证书校验 |
+
+### 横向编排
+
+对等 executor 通过黑板上的 `claim_surface` / `release_surface` 租约协调目标写操作。HTTP 非 GET/HEAD（以及带请求体的 GET/HEAD）、TCP 和本地 Python 在执行前会检查持有权；认领可针对 `host:port`、HTTP(S) URL 的首段路径，或 Python 所需的 `mission:*`。租约有效期为 30–300 秒，支持绑定未解决的子目标；完成、过期或 executor 退出后释放。当前认领和变更进入黑板重注入与控制台。
+
+`add_finding` 先记为 candidate 并创建验证子目标；多 executor 时优先交给另一位执行器独立检查。确认或驳回必须在 `verify_finding` 中引用真实流量，验证结果保留原证据并完成对应子目标。调度器状态、executor 消息窗口和运行计数会保存到 `CHRONOS_STATE_DIR`，进程重启后恢复未完成窗口及剩余时间；子 Agent 的跨进程续跑仍不在本版范围。
+
+长 engagement 在连续两轮压缩仍接近上下文预算时，最多进行两次干净会话接力，由新窗口读取共享黑板继续未决工作。所有明确子目标和验证已完成、且连续三轮没有新 Fact/Finding 时，engagement 可在时限前结束。调度器和 executor 的分派、延期、重试、认领、接力及停止事件可在控制台查看。
 
 ## 包结构（`internal/`）
 
@@ -134,7 +144,7 @@ chronos [flags]
 | `traffic` | per-mission 流量日志（真实请求/响应对作证据），JSONL 落盘 |
 | `engagement` | JSON 配置加载 + 空 scope 拒绝 + ToMeta |
 | `prompts` | 统一中性契约（Finding 为核心；带 flag 才出现 submit_flag） |
-| `termination` | `ShouldTerminate(bb, state)` 用户钩子（默认永不提前停） |
+| `termination` | `ShouldTerminate(bb, state)`：明确覆盖完成后判断 engagement 是否提前结束 |
 | `report` | JSON + Markdown + 自包含 HTML（含证据流量、验证历史） |
 | `nettools` | DoRawHTTP / DoTCPSend（纯 IO，不走代理） |
 | `llm` | 模型规格 → go-openai 客户端 + 模型 id（DeepSeek/Qwen/GLM） |

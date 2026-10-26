@@ -120,6 +120,10 @@
 .childToggle { border: 0; background: none; color: var(--accent); cursor: pointer; font: 11px/1.5 var(--mono); padding: .2rem 0; text-align: left; }
 .childEvents { display: flex; flex-direction: column; gap: .45rem; padding: .35rem 0; }
 .childEvent { max-width: 100%; }
+.assignment { color: var(--accent); font: 10px/1.4 var(--mono); white-space: nowrap; }
+.orchestrationList { display: flex; flex-direction: column; gap: .35rem; max-height: 12rem; overflow: auto; margin-top: .45rem; }
+.orchestrationRow { border-left: 2px solid var(--accent); padding: .2rem .4rem; font: 11px/1.45 var(--mono); overflow-wrap: anywhere; }
+.orchestrationRow small { display: block; color: var(--mut); }
 .turn.op .bubble { background: color-mix(in srgb, var(--accent) 14%, transparent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); font-family: inherit; font-size: 13px; }
 
 .inputBar { display: flex; gap: .5rem; padding: .7rem .8rem; border-top: 1px solid var(--bd); }

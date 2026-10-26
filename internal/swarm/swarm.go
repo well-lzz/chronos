@@ -75,6 +75,14 @@ func (s *Swarm) sessionPath(spec string) string {
 	return filepath.Join(root, "sessions", mission, hex.EncodeToString(sum[:8])+".jsonl")
 }
 
+func (s *Swarm) handoffSessionPath(spec string, generation int) string {
+	path := s.sessionPath(spec)
+	if generation <= 0 || path == "" {
+		return path
+	}
+	return strings.TrimSuffix(path, ".jsonl") + fmt.Sprintf(".handoff-%d.jsonl", generation)
+}
+
 func (s *Swarm) subagentRoot() string {
 	if s.BB == nil || s.BB.Path == "" {
 		return ""
@@ -175,21 +183,28 @@ func (s *Swarm) Run(ctx context.Context) string {
 		if s.Platform != nil {
 			submitFn = func(fl string) (string, bool, bool) { return s.trySubmit(fl, sp) }
 		}
+		previous := s.loadRuntime(spec)
+		generation := previous.HandoffGeneration
 		sv := solver.New(solver.Options{
 			ModelSpec: spec, Meta: s.Meta, Scope: s.Scope,
 			BB: s.BB, TL: s.TL, AllowExec: s.Settings.AllowLocalExec, InsecureTLS: s.Settings.TargetInsecureTLS, Deadline: deadline,
 			Tokens: &s.Tokens, Notify: func(m string) { log.Printf("[%s/%s] %s", s.Meta.Name, sp, m) },
 			SubmitFn: submitFn, Record: s.recorder(spec), RecordContext: s.contextRecorder(spec),
-			ContextWindow: contextWindow, Resolve: resolve, SessionPath: s.sessionPath(spec),
+			ContextWindow: contextWindow, Resolve: resolve, SessionPath: s.handoffSessionPath(spec, generation),
 			MaxDelegateDepth: s.Settings.MaxDelegateDepth, MaxDelegateChildren: s.Settings.MaxDelegateChildren,
 			MaxDelegateSteps:    s.Settings.MaxDelegateSteps,
 			MinRemainingToSpawn: time.Duration(s.Settings.MinRemainingToSpawnS) * time.Second,
 			GlobalRemaining:     s.GlobalRemaining, SubagentRoot: s.subagentRoot(),
 			RecordChildEvent: s.childRecorder(spec),
+			VerificationPeer: s.routeVerification,
 		})
 		s.mu.Lock()
 		s.solvers[spec] = sv
 		s.mu.Unlock()
+		if previous.Version == 1 {
+			sv.Guide("This executor resumed after a process restart. Revalidate target state before relying on prior actions or traffic; continue from the shared blackboard and preserved transcript.")
+			s.emit(spec, previous.Steps, "resume", "process_restart", "Restored executor session and cycle counters")
+		}
 		wg.Add(1)
 		go func(spec string, sv *solver.Solver) {
 			defer wg.Done()
@@ -205,14 +220,45 @@ func (s *Swarm) Run(ctx context.Context) string {
 }
 
 func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string) string {
+	defer func() {
+		if err := s.BB.ReleaseOwner(spec); err != nil {
+			log.Printf("[%s/%s] release claims: %v", s.Meta.Name, spec, err)
+		}
+		if err := s.BB.ReassignVerificationOwner(spec); err != nil {
+			log.Printf("[%s/%s] release verification work: %v", s.Meta.Name, spec, err)
+		}
+		for _, goal := range s.BB.OpenSubgoals() {
+			if goal.Kind == "verification" && goal.AssignedTo == "" {
+				if next := s.routeVerification(spec, goal.FindingID); next != "" && next != spec {
+					_, _ = s.BB.AssignVerification(goal.FindingID, next)
+				}
+			}
+		}
+	}()
 	maxBumps := s.Settings.MaxBumps
 	if maxBumps <= 0 {
 		maxBumps = 20
 	}
 	retry := time.Duration(s.Settings.SolverRetryDelayS * float64(time.Second))
-	started := time.Now()
-	bumps, cycles := 0, 0
-	providerFailures := 0
+	previous := s.loadRuntime(spec)
+	started := previous.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	bumps, cycles := previous.Bumps, previous.Cycles
+	quietCycles := previous.QuietCycles
+	providerFailures := previous.ProviderFails
+	lastSteps := previous.Steps
+	handoffGeneration := previous.HandoffGeneration
+	checkpointRuntime := func(status string) {
+		if err := s.saveRuntime(spec, executorRuntime{Status: status, StartedAt: started, Cycles: cycles,
+			Bumps: bumps, QuietCycles: quietCycles, ProviderFails: providerFailures, Steps: lastSteps,
+			HandoffGeneration: handoffGeneration}); err != nil {
+			log.Printf("[%s/%s] executor checkpoint failed: %v", s.Meta.Name, spec, err)
+		}
+	}
+	finalStatus := "interrupted"
+	defer func() { checkpointRuntime(finalStatus) }()
 	s.setStatus(spec, "running")
 
 	for {
@@ -227,9 +273,25 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 		markerBefore := s.BB.ProgressMarker()
 		res := sv.RunUntilDoneOrGaveUp(ctx)
 		cycles++
+		lastSteps = res.StepCount
+		checkpointRuntime("running")
+		if s.Platform == nil && res.Status == solver.StatusGaveUp && sv.Saturated() && handoffGeneration < min(2, s.Settings.MaxHandoffs) && len(s.BB.OpenSubgoals()) > 0 && time.Until(sv.Deadline()) > 2*time.Minute {
+			if err := s.BB.ReleaseOwner(spec); err != nil {
+				log.Printf("[%s/%s] handoff claim release failed: %v", s.Meta.Name, spec, err)
+			}
+			handoffGeneration++
+			s.emit(spec, res.StepCount, "handoff", "context_saturation", fmt.Sprintf("Clean executor generation %d takes over open sub-goals using shared blackboard", handoffGeneration))
+			sv = sv.FreshHandoff(s.handoffSessionPath(spec, handoffGeneration))
+			s.mu.Lock()
+			s.solvers[spec] = sv
+			s.mu.Unlock()
+			checkpointRuntime("running")
+			continue
+		}
 
 		switch res.Status {
 		case solver.StatusFlagFound:
+			finalStatus = "flag_found"
 			log.Printf("[%s/%s] flag found: %s", s.Meta.Name, spec, res.Flag)
 			s.setStatus(spec, "flag_found")
 			return res.Flag // recorded; does NOT cancel siblings
@@ -255,6 +317,7 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 			// failed. Keep the conversation intact and retry within the mission
 			// deadline, with bounded exponential backoff.
 			providerFailures++
+			checkpointRuntime("waiting-provider")
 			s.emitErrorOnce(spec, res.StepCount, res.Findings)
 			s.setStatus(spec, "waiting-provider")
 			select {
@@ -266,14 +329,28 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 			continue
 		}
 		providerFailures = 0
+		if s.BB.ProgressMarker() > markerBefore {
+			quietCycles = 0
+		} else {
+			quietCycles++
+		}
+		remaining := time.Until(sv.Deadline()).Seconds()
 
 		st := termination.CycleState{
 			StepCount: res.StepCount, BumpCount: bumps, Cycles: cycles,
 			ProgressMarker: s.BB.ProgressMarker(), PrevProgressMark: markerBefore,
 			ElapsedSeconds: time.Since(started).Seconds(),
+			QuietCycles:    quietCycles, IsEngagement: s.Platform == nil, RemainingSeconds: remaining,
+			QuietCyclesRequired: s.Settings.EngagementQuietCycles,
 		}
 		if termination.ShouldTerminate(s.BB, st) {
+			finalStatus = "finished"
 			log.Printf("[%s/%s] termination hook requested stop", s.Meta.Name, spec)
+			threshold := s.Settings.EngagementQuietCycles
+			if threshold < 1 {
+				threshold = 3
+			}
+			s.emit(spec, res.StepCount, "terminate", "coverage", fmt.Sprintf("All explicit goals and verifications resolved; discovery stayed quiet for %d cycles.", threshold))
 			s.setStatus(spec, "finished")
 			return ""
 		}
@@ -298,11 +375,13 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 				bumps++
 			}
 			if bumps > maxBumps {
+				finalStatus = "finished"
 				log.Printf("[%s/%s] max bumps (%d) reached", s.Meta.Name, spec, maxBumps)
 				s.emit(spec, res.StepCount, "text", "", "Executor stopped: retry ceiling reached after repeated failures.")
 				s.setStatus(spec, "finished")
 				return ""
 			}
+			checkpointRuntime("running")
 			if retry > 0 {
 				select {
 				case <-ctx.Done():
@@ -312,11 +391,45 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 				}
 			}
 			sv.Bump("Keep covering new ground; read the shared working record and build on it.")
+			s.emit(spec, res.StepCount, "pivot", "stalled_cycle", "No durable progress; executor prompted to cover new ground")
 			continue
 		}
 		s.setStatus(spec, "finished")
+		finalStatus = "finished"
 		return ""
 	}
+}
+
+// routeVerification chooses another neutral executor when one is available.
+// It changes only who checks the evidence, never the executor's role or tools.
+func (s *Swarm) routeVerification(origin, findingID string) string {
+	s.mu.Lock()
+	chosen := ""
+	for _, spec := range s.ModelSpecs {
+		if spec == origin || strings.HasPrefix(origin, spec+"/sub:") {
+			continue
+		}
+		status := s.status[spec]
+		if status != "finished" && status != "cancelled" && status != "flag_found" {
+			chosen = spec
+			break
+		}
+	}
+	if chosen == "" {
+		for _, spec := range s.ModelSpecs {
+			if s.status[spec] != "finished" && s.status[spec] != "cancelled" {
+				chosen = spec
+				break
+			}
+		}
+	}
+	peer := s.solvers[chosen]
+	s.mu.Unlock()
+	if peer != nil && chosen != origin {
+		peer.Guide("Independently assess candidate finding " + findingID + ". Read its evidence and original traffic, perform your own check, then call verify_finding with fresh traffic evidence_refs. The verification goal is assigned to you.")
+		s.emit(chosen, 0, "verify_task", findingID, "Independent verification assigned: "+findingID)
+	}
+	return chosen
 }
 
 // trySubmit forwards a flag to the platform with dedup, escalating cooldown, and

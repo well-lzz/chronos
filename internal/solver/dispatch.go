@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +34,10 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 		return s.toolAddSubgoal(argsJSON)
 	case "resolve_subgoal":
 		return s.toolResolveSubgoal(argsJSON)
+	case "claim_surface":
+		return s.toolClaimSurface(argsJSON)
+	case "release_surface":
+		return s.toolReleaseSurface(argsJSON)
 	case "traffic_search":
 		return s.toolTrafficSearch(argsJSON)
 	case "traffic_get":
@@ -84,9 +91,31 @@ func (s *Solver) toolHTTP(ctx context.Context, argsJSON string) string {
 	if ok, msg := s.hostAllowed(host); !ok {
 		return msg
 	}
+	method := strings.ToUpper(strings.TrimSpace(a.Method))
+	if (method != "" && method != "GET" && method != "HEAD") || a.Body != "" {
+		surface, _, err := canonicalSurface(raw)
+		if err != nil {
+			return "http_request error: " + err.Error()
+		}
+		if blocked := s.requireMutationLease(surface); blocked != "" {
+			return blocked
+		}
+	}
 	display := nettools.DoRawHTTP(ctx, a.URL, a.Method, a.Headers, a.Body, 30*time.Second, func(host string) bool {
 		return s.scopeSnapshot().Allows(host)
-	}, s.insecureTLS)
+	}, s.insecureTLS, func(req *http.Request) error {
+		if (req.Method == http.MethodGet || req.Method == http.MethodHead) && req.ContentLength <= 0 {
+			return nil
+		}
+		surface, _, err := canonicalSurface(req.URL.String())
+		if err != nil {
+			return err
+		}
+		if blocked := s.requireMutationLease(surface); blocked != "" {
+			return fmt.Errorf("redirect %s", blocked)
+		}
+		return nil
+	})
 	tid, err := s.tl.RecordHTTP(a.Method, a.URL, a.Headers, a.Body, display, s.ModelSpec)
 	if err != nil {
 		return display + "\ntraffic persistence error: " + err.Error()
@@ -106,6 +135,9 @@ func (s *Solver) toolTCP(ctx context.Context, argsJSON string) string {
 	}
 	if ok, msg := s.hostAllowed(a.Host); !ok {
 		return msg
+	}
+	if blocked := s.requireMutationLease(net.JoinHostPort(strings.ToLower(strings.Trim(a.Host, "[]")), strconv.Itoa(a.Port))); blocked != "" {
+		return blocked
 	}
 	payload, err := decodePayload(a.Payload, a.PayloadHex)
 	if err != nil {
@@ -154,25 +186,27 @@ func (s *Solver) toolAddFinding(argsJSON string) string {
 	if a.Target == "" {
 		a.Target = s.meta.Name
 	}
-	status := blackboard.Candidate
-	if a.Verified {
-		status = blackboard.Verified
-	}
 	refs, warns := s.normalizeRefs(a.EvidenceRefs)
 	id, err := s.bb.AddFinding(blackboard.Finding{
 		Title: a.Title, Severity: a.Severity, Target: a.Target, Category: a.Category,
-		Status: status, Evidence: a.Evidence, Reproduction: a.Reproduction,
+		Status: blackboard.Candidate, Evidence: a.Evidence, Reproduction: a.Reproduction,
 		FoundBy: s.ModelSpec, EvidenceRefs: refs,
 	})
 	if err != nil {
 		return "add_finding persistence error: " + err.Error()
 	}
-	msg := "finding " + id + " recorded"
-	if a.Verified {
-		msg += " (verified)."
-	} else {
-		msg += " (candidate — verify it next)."
+	assignee := s.ModelSpec
+	if s.verificationPeer != nil {
+		if peer := s.verificationPeer(s.ModelSpec, id); peer != "" {
+			assignee = peer
+		}
 	}
+	goalID, err := s.bb.AssignVerification(id, assignee)
+	if err != nil {
+		return "finding " + id + " recorded, but verification assignment failed: " + err.Error()
+	}
+	s.rec("verify_assign", id, fmt.Sprintf("%s assigned to %s for independent verification", goalID, assignee))
+	msg := fmt.Sprintf("finding %s recorded as candidate; verification goal %s assigned to %s.", id, goalID, assignee)
 	if len(refs) > 0 {
 		var ids []string
 		for _, r := range refs {
@@ -205,7 +239,13 @@ func (s *Solver) toolVerifyFinding(argsJSON string) string {
 	if !ok {
 		return "verdict must be one of: reproduced, refuted, inconclusive."
 	}
+	if err := s.bb.CheckVerificationActor(a.FindingID, s.ModelSpec); err != nil {
+		return "verify_finding blocked: " + err.Error()
+	}
 	refs, warns := s.normalizeRefs(a.EvidenceRefs)
+	if (status == blackboard.Verified || status == blackboard.Refuted) && len(refs) == 0 {
+		return "verify_finding blocked: reproduced/refuted verdict requires a real captured traffic evidence_ref"
+	}
 	persisted, err := s.bb.VerifyFinding(a.FindingID, status, a.Summary, a.Evidence, refs, s.ModelSpec)
 	if err != nil {
 		return "verify_finding persistence error: " + err.Error()
