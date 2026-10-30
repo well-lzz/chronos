@@ -68,7 +68,7 @@ HTTP 和 TCP 的真实请求、响应会获得 `[traffic tN]` 引用。浏览器
 | 依赖 | 用途 |
 | --- | --- |
 | Go | 构建核心程序；版本以 `go.mod` 为准，当前指定 `go1.26.10` 工具链。 |
-| Node.js 与 `npx` | 启动 Playwright MCP；当前固定的 MCP 包声明要求 Node.js ≥18。前端开发可使用 CI 配置的 Node.js 22。 |
+| Node.js 与 `npx` | 启动 Playwright MCP；当前 Playwright 依赖要求 Node.js ≥20。托管镜像和前端 CI 使用 Node.js 22。 |
 | Playwright Chromium | 提供浏览器探索能力。 |
 | Python 3 | 仅在显式启用 `run_python` 时需要；默认关闭。 |
 

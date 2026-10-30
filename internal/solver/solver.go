@@ -581,7 +581,7 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 		if !browsermcp.Available() {
 			if !s.browserWarned {
 				s.browserWarned = true
-				s.rec("tool_error", "playwright_mcp", "Node.js >=18 and Playwright MCP are required for browser exploration")
+				s.rec("tool_error", "playwright_mcp", "Node.js >=20 and Playwright MCP are required for browser exploration")
 				log.Printf("[%s/%s] Playwright MCP runtime unavailable", s.meta.Name, s.ModelSpec)
 			}
 		} else if err := s.ensureBrowser(ctx); err != nil {

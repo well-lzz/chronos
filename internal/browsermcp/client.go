@@ -60,7 +60,7 @@ func Available() bool {
 		return false
 	}
 	major, err := strconv.Atoi(strings.SplitN(strings.TrimPrefix(strings.TrimSpace(string(output)), "v"), ".", 2)[0])
-	if err != nil || major < 18 {
+	if err != nil || major < 20 {
 		return false
 	}
 	if cli := os.Getenv("CHRONOS_PLAYWRIGHT_CLI"); cli != "" {
