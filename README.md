@@ -14,6 +14,8 @@ https://github.com/user-attachments/assets/89a6f0e9-ed87-43dc-926f-89d01e9aaeee
 
 ## 设计亮点：以证据论证图计算结论
 
+![证据论证图示意：节点颜色表示判决（confirmed / suspected / refuted），实线为证据接地与支持关系，虚线为反驳，tN 为真实流量证据](docs/media/chronos-evidence-graph.png)
+
 Chronos 将探索中产生的主张、证据、验证与反驳组织为一张**可废止的证据论证图**。它同时保存结论的来源，并为当前判决提供可计算的依据。核心设计包含三个部分：
 
 1. **判决由图规则计算。** 主张的 `confirmed`、`suspected` 或 `refuted` 状态由证据与反驳关系共同决定。Agent 提交观察、证据引用和论证关系，程序据此计算状态；后续反驳可以改变已有判决。
@@ -269,4 +271,4 @@ CHRONOS_BROWSER_SMOKE=1 go test ./internal/browsermcp \
 | `internal/platform/`、`internal/scheduler/` | 平台适配与任务调度 |
 | `internal/web/`、`web/` | 控制台后端与 React / Next.js 前端 |
 
-更多配置见 [.env.example](.env.example)，实现背景见 [Go 实现说明](docs/go-port.md)、[Harness 设计](docs/harness-design.md) 和 [任务模型](docs/mission-modes.md)。
+更多配置见 [.env.example](.env.example)，实现背景见 [Go 实现说明](docs/go-port.md)、[Harness 设计](docs/harness-design.md) 和 [任务模型](docs/mission-modes.md)；设计动机与取舍记录见 [设计方案](docs/design/README.md)。
