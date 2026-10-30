@@ -154,7 +154,7 @@ func Start(ctx context.Context, allowed func(string) bool) (*Client, error) {
 	}
 	if len(c.tools) == 0 {
 		c.Close()
-		return nil, errors.New("Playwright MCP returned no browser exploration tools")
+		return nil, errors.New("playwright MCP returned no browser exploration tools")
 	}
 	return c, nil
 }
@@ -249,7 +249,7 @@ func (c *Client) Call(ctx context.Context, name string, arguments json.RawMessag
 		text = text[:20000] + "\n[truncated]"
 	}
 	if result.IsError {
-		return text, fmt.Errorf("Playwright MCP tool error")
+		return text, errors.New("playwright MCP tool error")
 	}
 	return text, nil
 }

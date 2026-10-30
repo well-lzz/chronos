@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -64,12 +63,20 @@ func (s *Solver) preToolScope(name, argsJSON string) string {
 			return "【平台管控·非目标防御】BLOCKED (scope lock): " + err.Error()
 		}
 		return ""
-	case "http_request":
+	case "http_request", "race", "xss_check", "ssrf_check", "lfi_check":
 		var a struct {
-			URL string `json:"url"`
+			URL    string `json:"url"`
+			Target string `json:"target"`
 		}
 		if json.Unmarshal([]byte(argsJSON), &a) != nil {
 			return ""
+		}
+		if name == "ssrf_check" {
+			if target, err := url.Parse(a.Target); err == nil && target.Hostname() != "" {
+				if ok, message := s.hostAllowed(target.Hostname()); !ok {
+					return message
+				}
+			}
 		}
 		raw := a.URL
 		if !strings.Contains(raw, "://") {
@@ -97,10 +104,33 @@ func (s *Solver) preToolScope(name, argsJSON string) string {
 
 func (s *Solver) dispatchCore(ctx context.Context, name, argsJSON string) string {
 	switch name {
+	case "race", "xss_check", "ssrf_check", "lfi_check":
+		var a struct {
+			URL    string `json:"url"`
+			Method string `json:"method"`
+			Body   string `json:"body"`
+		}
+		if json.Unmarshal([]byte(argsJSON), &a) == nil {
+			if blocked := s.requireHTTPMutationLease(a.URL, a.Method, a.Body); blocked != "" {
+				return blocked
+			}
+		}
+	}
+	switch name {
 	case "http_request":
 		return s.toolHTTP(ctx, argsJSON)
 	case "tcp_send":
 		return s.toolTCP(ctx, argsJSON)
+	case "werkzeug_pin":
+		return s.toolWerkzeugPin(argsJSON)
+	case "race":
+		return s.toolRace(ctx, argsJSON)
+	case "xss_check":
+		return s.toolXSSCheck(ctx, argsJSON)
+	case "ssrf_check":
+		return s.toolSSRFCheck(ctx, argsJSON)
+	case "lfi_check":
+		return s.toolLFICheck(ctx, argsJSON)
 	case "run_python":
 		return s.toolRunPython(ctx, argsJSON)
 	case "add_fact":
@@ -177,31 +207,12 @@ func (s *Solver) toolHTTP(ctx context.Context, argsJSON string) string {
 	if ok, msg := s.hostAllowed(host); !ok {
 		return msg
 	}
-	method := strings.ToUpper(strings.TrimSpace(a.Method))
-	if (method != "" && method != "GET" && method != "HEAD") || a.Body != "" {
-		surface, _, err := canonicalSurface(raw)
-		if err != nil {
-			return "http_request error: " + err.Error()
-		}
-		if blocked := s.requireMutationLease(surface); blocked != "" {
-			return blocked
-		}
+	if blocked := s.requireHTTPMutationLease(raw, a.Method, a.Body); blocked != "" {
+		return blocked
 	}
 	display := nettools.DoRawHTTP(ctx, a.URL, a.Method, a.Headers, a.Body, 30*time.Second, func(host string) bool {
 		return s.scopeSnapshot().Allows(host)
-	}, s.insecureTLS, func(req *http.Request) error {
-		if (req.Method == http.MethodGet || req.Method == http.MethodHead) && req.ContentLength <= 0 {
-			return nil
-		}
-		surface, _, err := canonicalSurface(req.URL.String())
-		if err != nil {
-			return err
-		}
-		if blocked := s.requireMutationLease(surface); blocked != "" {
-			return fmt.Errorf("redirect %s", blocked)
-		}
-		return nil
-	})
+	}, s.insecureTLS, s.checkHTTPMutationLease)
 	tid, err := s.tl.RecordHTTP(a.Method, a.URL, a.Headers, a.Body, display, s.ModelSpec)
 	if err != nil {
 		return display + "\ntraffic persistence error: " + err.Error()

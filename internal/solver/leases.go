@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -111,4 +112,34 @@ func (s *Solver) requireMutationLease(surface string) string {
 		return "【平台管控·非目标防御】BLOCKED (coordination): " + err.Error()
 	}
 	return ""
+}
+
+func (s *Solver) requireHTTPMutationLease(raw, method, body string) string {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if (method == "" || method == http.MethodGet || method == http.MethodHead) && body == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	surface, _, err := canonicalSurface(raw)
+	if err != nil {
+		return "http_request error: " + err.Error()
+	}
+	return s.requireMutationLease(surface)
+}
+
+// Apply the same redirect claim check to HTTP requests and assessment tools.
+func (s *Solver) checkHTTPMutationLease(req *http.Request) error {
+	if (req.Method == http.MethodGet || req.Method == http.MethodHead) && req.ContentLength <= 0 {
+		return nil
+	}
+	surface, _, err := canonicalSurface(req.URL.String())
+	if err != nil {
+		return err
+	}
+	if blocked := s.requireMutationLease(surface); blocked != "" {
+		return fmt.Errorf("redirect %s", blocked)
+	}
+	return nil
 }

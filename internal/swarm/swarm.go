@@ -402,6 +402,9 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 	} else {
 		s.setStatus(spec, "running")
 	}
+	// Preserve the platform's progress-based stall ladder alongside runtime recovery.
+	benchmark := s.Platform != nil
+	stall := termination.NewStallPolicy(termination.StallConfig{})
 
 	for {
 		if ctx.Err() != nil {
@@ -516,6 +519,17 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 			s.emit(spec, res.StepCount, "terminate", "coverage", fmt.Sprintf("All explicit goals and verifications resolved; discovery stayed quiet for %d cycles.", threshold))
 			s.setStatus(spec, "finished")
 			return
+		}
+
+		switch d := stall.Observe(st.MadeProgress()); {
+		case d.Terminate && benchmark:
+			finalStatus = "finished"
+			log.Printf("[%s/%s] stalled across every pivot with no new progress — terminating to free the slot", s.Meta.Name, spec)
+			s.setStatus(spec, "finished")
+			return
+		case d.Pivot:
+			log.Printf("[%s/%s] no progress — pivoting to a different approach", s.Meta.Name, spec)
+			sv.Pivot(d.Directive)
 		}
 
 		if res.Status == solver.StatusError && res.Findings != "" {
