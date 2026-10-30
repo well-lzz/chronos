@@ -1,0 +1,22 @@
+{
+  "rules": [
+    {
+      "tool": "run_python",
+      "action": "ask",
+      "priority": 100,
+      "reason": "本地 Python 执行需要操作人员逐次批准"
+    },
+    {
+      "tool": "http_request",
+      "argument_contains": "\"method\":\"DELETE\"",
+      "action": "ask",
+      "priority": 90,
+      "reason": "删除请求需要操作人员逐次批准"
+    },
+    {
+      "tool": "*",
+      "action": "allow",
+      "priority": 0
+    }
+  ]
+}

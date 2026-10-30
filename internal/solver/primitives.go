@@ -128,6 +128,9 @@ func (s *Solver) toolRace(ctx context.Context, argsJSON string) string {
 	if ok, msg := s.hostAllowed(host); !ok {
 		return msg
 	}
+	if blocked := s.requireHTTPMutationLease(raw, a.Method, a.Body); blocked != "" {
+		return blocked
+	}
 	n := a.Count
 	if n <= 0 {
 		n = 10
@@ -145,7 +148,7 @@ func (s *Solver) toolRace(ctx context.Context, argsJSON string) string {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			results[i] = raceResult{display: nettools.DoRawHTTP(ctx, a.URL, a.Method, a.Headers, a.Body, 30*time.Second, allow, s.insecureTLS)}
+			results[i] = raceResult{display: nettools.DoRawHTTP(ctx, a.URL, a.Method, a.Headers, a.Body, 30*time.Second, allow, s.insecureTLS, s.checkHTTPMutationLease)}
 		}(i)
 	}
 	close(start)

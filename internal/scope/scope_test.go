@@ -60,3 +60,18 @@ func TestEntriesReturnsCopy(t *testing.T) {
 		t.Fatal("Entries exposed mutable internal state")
 	}
 }
+
+func TestSubsetOfAndWithin(t *testing.T) {
+	parent := Parse([]string{"app.test", "10.20.0.0/16", "2001:db8::/32"})
+	child := Parse([]string{"app.test", "10.20.3.0/24", "2001:db8:1::/48"})
+	if !child.SubsetOf(parent) {
+		t.Fatal("narrowed hosts and networks should be authorized")
+	}
+	if Parse([]string{"10.20.0.0/8"}).SubsetOf(parent) || Parse([]string{"other.test"}).SubsetOf(parent) {
+		t.Fatal("wider network or foreign host was accepted")
+	}
+	narrowed := child.Within(Parse([]string{"app.test", "10.20.0.0/16"}))
+	if !narrowed.Allows("app.test") || !narrowed.Allows("10.20.3.1") || narrowed.Allows("2001:db8:1::1") {
+		t.Fatalf("scope narrowing retained an unauthorized entry: %v", narrowed.Entries())
+	}
+}

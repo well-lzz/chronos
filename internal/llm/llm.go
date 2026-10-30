@@ -18,6 +18,7 @@ import (
 
 	"github.com/well-lzz/chronos/internal/config"
 	"github.com/well-lzz/chronos/internal/llmconfig"
+	"github.com/well-lzz/chronos/internal/llmrec"
 )
 
 type httpDoer interface {
@@ -150,6 +151,17 @@ func FromProfile(p llmconfig.Profile) (*openai.Client, string, error) {
 // building the client. In TSecBench hosted mode this prevents a console-saved
 // public endpoint from bypassing the competition gateway rewrite.
 func FromProfileWithSettings(p llmconfig.Profile, cfg config.Settings) (*openai.Client, string, error) {
+	return fromProfileWithSettings(p, cfg, true)
+}
+
+// FromExactProfileWithSettings uses exactly the operator-specified key. This is
+// for models-file entries, where environment key pools must not silently alter
+// a model's credentials.
+func FromExactProfileWithSettings(p llmconfig.Profile, cfg config.Settings) (*openai.Client, string, error) {
+	return fromProfileWithSettings(p, cfg, false)
+}
+
+func fromProfileWithSettings(p llmconfig.Profile, cfg config.Settings, pool bool) (*openai.Client, string, error) {
 	base := strings.TrimSpace(p.BaseURL)
 	if cfg.TSecBenchHosted {
 		base = config.TSecBenchGatewayURL(base)
@@ -168,9 +180,9 @@ func FromProfileWithSettings(p llmconfig.Profile, cfg config.Settings) (*openai.
 	// Pool the profile key with the env DeepSeek pool when the endpoint is DeepSeek,
 	// so both keys are exercised (and both issue the profile's model) instead of the
 	// single profile key carrying the whole run.
-	keys := poolKeys(base, key, cfg)
-	if len(keys) == 0 {
-		keys = []string{key}
+	keys := []string{key}
+	if pool {
+		keys = poolKeys(base, key, cfg)
 	}
 	return newClient(base, keys), model, nil
 }
@@ -178,17 +190,26 @@ func FromProfileWithSettings(p llmconfig.Profile, cfg config.Settings) (*openai.
 // Ping issues a tiny completion to confirm a profile's base URL, key, and model
 // actually work. Used by the console's "test" button.
 func Ping(ctx context.Context, p llmconfig.Profile) error {
+	return PingRecorded(ctx, p, nil)
+}
+
+func PingRecorded(ctx context.Context, p llmconfig.Profile, recorder *llmrec.Recorder) error {
 	client, model, err := FromProfile(p)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	_, err = client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+	request := openai.ChatCompletionRequest{
 		Model:     model,
 		Messages:  []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "ping"}},
 		MaxTokens: 1,
-	})
+	}
+	if recorder != nil {
+		_, err = recorder.Call(ctx, "console", "model-test", request, client.CreateChatCompletion)
+	} else {
+		_, err = client.CreateChatCompletion(ctx, request)
+	}
 	return err
 }
 

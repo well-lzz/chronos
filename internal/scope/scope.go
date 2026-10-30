@@ -11,7 +11,9 @@ package scope
 import (
 	"net"
 	"net/netip"
+	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -96,6 +98,64 @@ func (s Scope) Entries() []string {
 	return append([]string(nil), s.raw...)
 }
 
+// SameTargets compares the actual host and network boundary, ignoring entry
+// order and URL presentation differences.
+func (s Scope) SameTargets(other Scope) bool {
+	if len(s.hosts) != len(other.hosts) || len(s.nets) != len(other.nets) {
+		return false
+	}
+	for host := range s.hosts {
+		if _, ok := other.hosts[host]; !ok {
+			return false
+		}
+	}
+	a, b := s.CIDRStrings(), other.CIDRStrings()
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// SubsetOf checks the entire child scope, including CIDR ranges, against an
+// authorization scope. A child may narrow a network but never widen it.
+func (s Scope) SubsetOf(parent Scope) bool {
+	for host := range s.hosts {
+		if !parent.Allows(host) {
+			return false
+		}
+	}
+	for _, child := range s.nets {
+		allowed := false
+		for _, p := range parent.nets {
+			if p.Contains(child.Addr()) && child.Bits() >= p.Bits() {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
+// Within returns only entries of s still wholly authorized by parent. It is
+// used when an operator narrows scope while a delegated child is running.
+func (s Scope) Within(parent Scope) Scope {
+	var entries []string
+	for _, entry := range s.raw {
+		candidate := Parse([]string{entry})
+		if !candidate.IsEmpty() && candidate.SubsetOf(parent) {
+			entries = append(entries, entry)
+		}
+	}
+	return Parse(entries)
+}
+
 // CIDRStrings returns the authorized networks as strings.
 func (s Scope) CIDRStrings() []string {
 	out := make([]string, 0, len(s.nets))
@@ -115,7 +175,14 @@ func (s Scope) Hosts() []string {
 }
 
 func normalizeHost(token string) string {
-	t := schemeRe.ReplaceAllString(strings.TrimSpace(token), "")
+	t := strings.TrimSpace(token)
+	if schemeRe.MatchString(t) {
+		u, err := url.Parse(t)
+		if err != nil {
+			return ""
+		}
+		return strings.ToLower(u.Hostname())
+	}
 	if i := strings.IndexByte(t, '/'); i >= 0 {
 		t = t[:i] // drop any path
 	}

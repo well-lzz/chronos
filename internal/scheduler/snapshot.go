@@ -1,6 +1,9 @@
 package scheduler
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/well-lzz/chronos/internal/blackboard"
 	"github.com/well-lzz/chronos/internal/console"
 	"github.com/well-lzz/chronos/internal/swarm"
@@ -18,6 +21,7 @@ func (s *Scheduler) Snapshot() map[string]any {
 	}
 	active := len(s.runs)
 	preparing := len(s.pending)
+	orchestration := append([]OrchestrationEvent(nil), s.events...)
 	s.mu.Unlock()
 
 	confirmed, suspected, failed, facts, tokens := 0, 0, 0, 0, 0
@@ -25,7 +29,9 @@ func (s *Scheduler) Snapshot() map[string]any {
 	var findings []map[string]any
 	var subgoals []map[string]any
 	var trafficRows []map[string]any
+	var claims []map[string]any
 	swarms := map[string]any{}
+	evidenceGraphs := map[string]blackboard.GraphSnapshot{}
 	for _, r := range runs {
 		if r.sw == nil {
 			continue
@@ -33,6 +39,10 @@ func (s *Scheduler) Snapshot() map[string]any {
 		swarms[r.meta.Name] = r.sw.Status()
 		tokens += r.sw.TotalTokens()
 		if bb := r.sw.BB; bb != nil {
+			evidenceGraphs[r.meta.Name] = bb.Graph()
+			for _, lease := range bb.ActiveLeases() {
+				claims = append(claims, map[string]any{"mission": r.meta.Name, "surface": lease.Surface, "owner": lease.Owner, "expires_at": lease.ExpiresAt, "subgoal_id": lease.SubgoalID})
+			}
 			vc := bb.VerdictCounts()
 			confirmed += vc["confirmed"]
 			suspected += vc["suspected"]
@@ -48,6 +58,7 @@ func (s *Scheduler) Snapshot() map[string]any {
 				subgoals = append(subgoals, map[string]any{
 					"id": r.meta.Name + "/" + g.ID, "description": g.Description,
 					"status": g.Status, "outcome": g.Outcome, "done": g.Done, "mission": r.meta.Name,
+					"kind": g.Kind, "finding_id": g.FindingID, "assigned_to": g.AssignedTo,
 				})
 			}
 		}
@@ -73,10 +84,13 @@ func (s *Scheduler) Snapshot() map[string]any {
 			"active": active, "preparing": preparing, "tokens": tokens, "budget_left_min": budget,
 			"goals_open": goalsOpen, "goals_total": goalsTotal, "goals_done": goalsTotal - goalsOpen,
 		},
-		"findings": findings,
-		"subgoals": subgoals,
-		"traffic":  trafficRows,
-		"swarms":   swarms,
+		"findings":        findings,
+		"subgoals":        subgoals,
+		"traffic":         trafficRows,
+		"swarms":          swarms,
+		"claims":          claims,
+		"orchestration":   orchestration,
+		"evidence_graphs": evidenceGraphs,
 	}
 }
 
@@ -87,7 +101,7 @@ func findingRow(mission string, f blackboard.FindingRow) map[string]any {
 	}
 	return map[string]any{
 		"id": mission + "/" + f.ID, "title": f.Title, "severity": f.Severity,
-		"status": f.Status, "verdict": f.Verdict, "target": target, "category": f.Category,
+		"status": f.Status, "verdict": f.Verdict, "verdict_reason": f.VerdictReason, "target": target, "category": f.Category,
 		"evidence": f.Evidence, "evidence_text": f.EvidenceText,
 		"reproduction": f.Reproduction, "remediation": f.Remediation,
 		"found_by": f.FoundBy, "ts": f.TS, "verified_ts": f.VerifiedTS,
@@ -110,4 +124,14 @@ func (s *Scheduler) Activity(challenge, model string, after int) []swarm.ActEven
 // Command adapts the console's action tuple to the operator queue.
 func (s *Scheduler) Command(action, challenge, model, message string) {
 	s.Enqueue(Command{Action: action, Challenge: challenge, Model: model, Message: message})
+}
+
+func (s *Scheduler) Chat(challenge, model, message string) error {
+	s.mu.Lock()
+	r := s.runs[challenge]
+	s.mu.Unlock()
+	if r == nil || strings.TrimSpace(message) == "" || !r.sw.Chat(model, message) {
+		return fmt.Errorf("selected executor is unavailable; choose a running executor")
+	}
+	return nil
 }

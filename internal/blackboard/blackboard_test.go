@@ -20,14 +20,14 @@ func TestEvidenceAndImmutableVerification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b.findings[id].Status != Candidate || b.findings[id].Evidence != "original note" {
+	if b.findings[id].Status != Verified || b.findings[id].Evidence != "original note" {
 		t.Fatal("add_finding defaults wrong")
 	}
 	// inconclusive keeps original evidence, appends a record
 	if _, err := b.VerifyFinding(id, Inconclusive, "WAF blocked", "tried A/B, blocked", nil, "deepseek"); err != nil {
 		t.Fatal(err)
 	}
-	if b.findings[id].Status != Inconclusive || b.findings[id].Evidence != "original note" {
+	if b.findings[id].Status != Verified || b.findings[id].Evidence != "original note" {
 		t.Fatal("verification overwrote original evidence")
 	}
 	// reproduced -> verified with verification traffic
@@ -85,7 +85,7 @@ func TestProgressMarkerAndPersist(t *testing.T) {
 	if b.ProgressMarker() != 2 {
 		t.Fatalf("marker=%d want 2", b.ProgressMarker())
 	}
-	if _, err := b.VerifyFinding(id, Verified, "", "", nil, "x"); err != nil {
+	if _, err := b.VerifyFinding(id, Verified, "", "", []EvidenceRef{{Ref: "t1", Role: "verification"}}, "x"); err != nil {
 		t.Fatal(err)
 	}
 	if b.ProgressMarker() != 3 {

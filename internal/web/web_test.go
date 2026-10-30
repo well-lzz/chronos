@@ -36,35 +36,3 @@ func TestServeRejectsNonLoopback(t *testing.T) {
 		t.Fatal("expected non-loopback bind rejection")
 	}
 }
-
-func TestAuthorizeOperator(t *testing.T) {
-	const token = "test-operator-token"
-	unauthorized := httptest.NewRecorder()
-	if authorizeOperator(unauthorized, httptest.NewRequest(http.MethodPost, "/api/command", nil), token) {
-		t.Fatal("missing operator token was accepted")
-	}
-	if unauthorized.Code != http.StatusUnauthorized {
-		t.Fatalf("missing token status=%d", unauthorized.Code)
-	}
-
-	request := httptest.NewRequest(http.MethodPost, "/api/command", nil)
-	request.Header.Set("X-Chronos-Operator", token)
-	authorized := httptest.NewRecorder()
-	if !authorizeOperator(authorized, request, token) {
-		t.Fatal("valid operator token was rejected")
-	}
-}
-
-func TestNewOperatorTokenIsRandomAndLong(t *testing.T) {
-	first, err := newOperatorToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := newOperatorToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first == second || len(first) < 40 {
-		t.Fatalf("weak operator tokens: %q %q", first, second)
-	}
-}

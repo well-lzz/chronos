@@ -2,9 +2,10 @@
 //
 // The operator writes one JSON config describing the goal, the authorized scope
 // (hosts / IPs / CIDRs — the HARD egress boundary) and the rules of engagement.
-// The scope is not optional: an assessment with an empty or unparseable scope
-// fails to load. The config is read-only input; it carries no instructions to
-// the model beyond the goal/RoE text.
+// A headless assessment needs an initial scope. The web console may instead
+// start paused with an empty draft and wait for the operator to set the scope.
+// The config is read-only input; it carries no instructions to the model beyond
+// the goal/RoE text.
 package engagement
 
 import (
@@ -42,6 +43,16 @@ type rawConfig struct {
 
 // Load reads a JSON engagement config from path and validates the scope invariant.
 func Load(path string) (*Engagement, error) {
+	return load(path, false)
+}
+
+// LoadDraft permits an empty initial scope for a paused web engagement. The
+// structural egress guard still denies every target until the operator saves one.
+func LoadDraft(path string) (*Engagement, error) {
+	return load(path, true)
+}
+
+func load(path string, allowEmptyScope bool) (*Engagement, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("engagement config not found: %s", path)
@@ -82,6 +93,9 @@ func Load(path string) (*Engagement, error) {
 		}
 	}
 	e.ScopeTargets = trimNonEmpty(e.ScopeTargets)
+	if allowEmptyScope && e.Scope().IsEmpty() {
+		return e, nil
+	}
 	if err := e.Validate(); err != nil {
 		return nil, err
 	}

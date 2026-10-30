@@ -7,6 +7,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
@@ -19,17 +20,20 @@ import (
 	"github.com/well-lzz/chronos/internal/mission"
 	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/poller"
+	"github.com/well-lzz/chronos/internal/runhistory"
 	"github.com/well-lzz/chronos/internal/scope"
 	"github.com/well-lzz/chronos/internal/swarm"
 	"github.com/well-lzz/chronos/internal/traffic"
 )
 
 type run struct {
-	sw     *swarm.Swarm
-	cancel context.CancelFunc
-	done   chan struct{}
-	meta   mission.Meta
-	solved bool
+	sw            *swarm.Swarm
+	cancel        context.CancelFunc
+	done          chan struct{}
+	meta          mission.Meta
+	solved        bool
+	transitioning bool
+	deadline      time.Time
 }
 
 // Command is an operator action (from the web console or REPL).
@@ -47,11 +51,21 @@ type Scheduler struct {
 	specs    []string
 	maxConc  int
 	runStart time.Time
+	runCtx   context.Context
 
-	LLM *llmconfig.Store // operator-editable model profile (optional)
+	LLM               *llmconfig.Store             // operator-editable model profile (optional)
+	ModelProfiles     map[string]llmconfig.Profile // optional per-executor operator profiles
+	UseConsoleProfile bool
 
 	mu             sync.Mutex
+	scopeUpdateMu  sync.Mutex
+	checkpointMu   sync.Mutex
+	recoveryErr    error
+	events         []OrchestrationEvent
+	eventSeq       uint64
 	runs           map[string]*run
+	resumePending  map[string]time.Time
+	runIDs         map[string]string
 	deferred       map[string]string
 	attempts       map[string]int
 	deferTime      map[string]time.Time
@@ -60,7 +74,8 @@ type Scheduler struct {
 	spawnFailures  map[string]int
 	pulls          sync.WaitGroup
 
-	cmds chan Command
+	cmds              chan Command
+	reconcileRequests chan struct{}
 }
 
 func New(pf platform.Platform, cfg config.Settings, specs []string) *Scheduler {
@@ -68,12 +83,15 @@ func New(pf platform.Platform, cfg config.Settings, specs []string) *Scheduler {
 	if mc <= 0 {
 		mc = 3
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		pf: pf, cfg: cfg, specs: specs, maxConc: mc, runStart: time.Now(),
-		runs: map[string]*run{}, deferred: map[string]string{}, attempts: map[string]int{},
+		runs: map[string]*run{}, deferred: map[string]string{}, attempts: map[string]int{}, resumePending: map[string]time.Time{}, runIDs: map[string]string{},
 		deferTime: map[string]time.Time{}, pending: map[string]bool{}, openContainers: map[string]bool{},
 		spawnFailures: map[string]int{}, cmds: make(chan Command, 64),
+		reconcileRequests: make(chan struct{}, 1),
 	}
+	s.recoveryErr = s.loadState()
+	return s
 }
 
 // Enqueue pushes an operator command (web console / REPL).
@@ -88,12 +106,18 @@ func (s *Scheduler) Poller() *poller.Poller { return s.poll }
 
 // Run drives the loop until ctx is cancelled or everything is solved.
 func (s *Scheduler) Run(ctx context.Context) error {
+	if s.recoveryErr != nil {
+		return s.recoveryErr
+	}
 	runCtx := ctx
 	cancel := func() {}
 	if s.cfg.TotalBudgetSeconds > 0 {
 		runCtx, cancel = context.WithDeadline(ctx, s.runStart.Add(time.Duration(s.cfg.TotalBudgetSeconds)*time.Second))
 	}
 	defer cancel()
+	s.mu.Lock()
+	s.runCtx = runCtx
+	s.mu.Unlock()
 
 	pmin, pmax := 5*time.Second, 15*time.Second
 	s.poll = poller.New(s.pf, (pmin+pmax)/2, (pmax-pmin)/2)
@@ -102,7 +126,16 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		return err
 	}
 	log.Printf("Scheduler starting: %d model(s), %d challenges", len(s.specs), len(s.poll.KnownChallenges()))
+	stubs, solved := s.poll.KnownStubs(), s.poll.KnownSolved()
+	s.mu.Lock()
+	for name := range s.resumePending {
+		if _, exists := stubs[name]; !exists || solved[name] {
+			delete(s.resumePending, name)
+		}
+	}
+	s.mu.Unlock()
 
+	s.reconcileContainers()
 	s.autoSpawnUnsolved(runCtx)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -110,6 +143,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	var deadlockSince time.Time
 
 	for {
+		reconcileNow := false
 		select {
 		case <-runCtx.Done():
 			if ctx.Err() == nil {
@@ -121,6 +155,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			s.handleEvent(runCtx, ev)
 		case c := <-s.cmds:
 			s.handleCommand(runCtx, c)
+		case <-s.reconcileRequests:
+			reconcileNow = true
 		case <-ticker.C:
 		}
 
@@ -130,11 +166,19 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		if s.poll.Terminal() {
 			log.Printf("Benchmark task finished on platform; stopping scheduler cleanly.")
 			s.shutdown()
+			_ = s.clearState()
 			return nil
+		}
+		if reconcileNow {
+			s.reconcileContainers()
+			s.autoSpawnUnsolved(runCtx)
 		}
 
 		if s.reapAndRefill(runCtx) {
 			// slot freed; refill already attempted inside
+		}
+		if err := s.checkpoint(); err != nil {
+			log.Printf("scheduler checkpoint failed: %v", err)
 		}
 
 		if time.Since(lastStatus) >= 60*time.Second {
@@ -153,6 +197,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		if activeOrPending == 0 && len(known) > 0 && len(solved) >= len(known) {
 			log.Printf("All challenges solved; scheduler exiting.")
 			s.shutdown()
+			_ = s.clearState()
 			return nil
 		}
 	}
@@ -161,14 +206,17 @@ func (s *Scheduler) Run(ctx context.Context) error {
 func (s *Scheduler) handleEvent(ctx context.Context, ev poller.Event) {
 	switch ev.Kind {
 	case poller.ChallengeSolved:
+		s.recordDecision("solved", ev.Name, "platform_confirmed", "platform reported mission solved")
 		log.Printf("Solved: %s", ev.Name)
 		s.killSwarm(ev.Name, true)
 	case poller.NewChallenge:
+		s.recordDecision("discovered", ev.Name, "poller", "new mission available")
 		s.spawnOne(ctx, ev.Name)
 	}
 }
 
 func (s *Scheduler) handleCommand(ctx context.Context, c Command) {
+	s.recordDecision("operator_"+c.Action, c.Challenge, "operator", c.Model)
 	s.mu.Lock()
 	r := s.runs[c.Challenge]
 	s.mu.Unlock()
@@ -202,6 +250,7 @@ func (s *Scheduler) handleCommand(ctx context.Context, c Command) {
 		s.mu.Lock()
 		s.deferred[c.Challenge] = "stopped by operator"
 		s.mu.Unlock()
+		s.recordDecision("defer", c.Challenge, "operator_stop", "mission held until explicit resume")
 	case "bump":
 		if r != nil {
 			r.sw.Bump(c.Model, c.Message)
@@ -222,6 +271,7 @@ func (s *Scheduler) killSwarm(name string, solved bool) {
 	s.mu.Unlock()
 	if r != nil {
 		r.cancel()
+		s.recordDecision("kill", name, map[bool]string{true: "platform_solved", false: "operator_or_scheduler"}[solved], "swarm cancellation requested")
 	}
 }
 
@@ -229,18 +279,35 @@ func (s *Scheduler) killSwarm(name string, solved bool) {
 func (s *Scheduler) reapAndRefill(ctx context.Context) bool {
 	var freed bool
 	var releases []string
+	var deferred []string
+	var finished []struct{ id, outcome string }
 	s.mu.Lock()
 	for name, r := range s.runs {
+		if r.transitioning {
+			continue
+		}
 		select {
 		case <-r.done:
+			outcome := "finished"
+			if r.solved {
+				outcome = "platform_solved"
+			} else if s.deferred[name] != "" {
+				outcome = "deferred"
+			}
 			if !r.solved && s.deferred[name] == "" {
 				s.deferred[name] = "solver attempts exhausted"
+				outcome = "deferred"
 				s.deferTime[name] = time.Now()
+				deferred = append(deferred, name)
 				log.Printf("Deferred: %s", name)
 			} else {
 				log.Printf("Swarm finished: %s", name)
 			}
 			delete(s.runs, name)
+			if r.sw != nil && r.sw.BB != nil {
+				finished = append(finished, struct{ id, outcome string }{r.sw.BB.MissionID, outcome})
+			}
+			delete(s.runIDs, name)
 			delete(s.openContainers, name)
 			releases = append(releases, name)
 			freed = true
@@ -248,8 +315,17 @@ func (s *Scheduler) reapAndRefill(ctx context.Context) bool {
 		}
 	}
 	s.mu.Unlock()
+	for _, run := range finished {
+		if err := (runhistory.Store{StateDir: s.cfg.StateDir}).Finish(run.id, run.outcome, time.Now()); err != nil {
+			log.Printf("finish run history %s: %v", run.id, err)
+		}
+	}
+	for _, name := range deferred {
+		s.recordDecision("defer", name, "solver_attempts_exhausted", "swarm finished without platform confirmation")
+	}
 	var closeFailed bool
 	for _, name := range releases {
+		s.recordDecision("release", name, "swarm_finished", "platform container released")
 		if !s.pf.ReleaseChallenge(name) {
 			closeFailed = true
 		}
@@ -287,13 +363,7 @@ func (s *Scheduler) perChallengeLimit(meta mission.Meta) time.Duration {
 }
 
 func guessKillchain(m mission.Meta) bool {
-	blob := strings.ToLower(m.Category + " " + m.Description + " " + m.Name)
-	for _, k := range []string{"killchain", "渗透", "横向", "内网", "多阶段", "跳板", "kill chain"} {
-		if strings.Contains(blob, k) {
-			return true
-		}
-	}
-	return false
+	return m.IsKillchain()
 }
 
 func priorityLess(a, b platform.Challenge) bool {
@@ -318,6 +388,10 @@ func (s *Scheduler) autoSpawnUnsolved(ctx context.Context) {
 	var cands []platform.Challenge
 	s.mu.Lock()
 	slots := s.maxConc - (len(s.runs) + len(s.pending))
+	resume := make(map[string]bool, len(s.resumePending))
+	for name := range s.resumePending {
+		resume[name] = true
+	}
 	busy := func(n string) bool { _, a := s.runs[n]; _, b := s.pending[n]; return a || b }
 	for name, c := range stubs {
 		if solved[name] || busy(name) || s.deferred[name] != "" {
@@ -329,7 +403,13 @@ func (s *Scheduler) autoSpawnUnsolved(ctx context.Context) {
 	if slots <= 0 {
 		return
 	}
-	sort.Slice(cands, func(i, j int) bool { return priorityLess(cands[i], cands[j]) })
+	sort.Slice(cands, func(i, j int) bool {
+		ai, bj := resume[cands[i].Name], resume[cands[j].Name]
+		if ai != bj {
+			return ai
+		}
+		return priorityLess(cands[i], cands[j])
+	})
 
 	picked := cands
 	if len(picked) > slots {
@@ -366,6 +446,7 @@ func (s *Scheduler) autoSpawnUnsolved(ctx context.Context) {
 			delete(s.deferred, c.Name)
 			s.mu.Unlock()
 			log.Printf("Auto-retry deferred challenge: %s", c.Name)
+			s.recordDecision("retry", c.Name, "cooldown_elapsed", "deferred mission re-entered window")
 			picked = append(picked, c)
 		}
 	}
@@ -398,6 +479,9 @@ func (s *Scheduler) reconcileContainers() {
 	for name := range s.openContainers {
 		keep[name] = true
 	}
+	for name := range s.resumePending {
+		keep[name] = true
+	}
 	s.mu.Unlock()
 	if closed := s.pf.CloseStaleContainers(keep); len(closed) > 0 && s.poll != nil {
 		s.poll.Refresh()
@@ -423,11 +507,15 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 	}
 	if rg := s.remainingGlobal(); rg >= 0 && rg < float64(s.cfg.MinRemainingToSpawnS) {
 		s.mu.Unlock()
+		s.recordDecision("spawn_blocked", name, "global_budget", fmt.Sprintf("%.0fs remaining", rg))
 		log.Printf("Skipping spawn of %s: only %.0fs of global budget left", name, rg)
 		return
 	}
 	s.pending[name] = true
 	s.mu.Unlock()
+	if err := s.checkpoint(); err != nil {
+		log.Printf("scheduler checkpoint failed: %v", err)
+	}
 
 	s.pulls.Add(1)
 	go func() {
@@ -437,50 +525,92 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 		delete(s.pending, name)
 		if err != nil {
 			s.spawnFailures[name]++
+			deferred := false
 			if s.spawnFailures[name] >= 2 {
 				s.deferred[name] = "spawn failed: " + truncate(err.Error(), 100)
 				s.deferTime[name] = time.Now()
+				deferred = true
 			}
 			s.mu.Unlock()
+			s.recordDecision("spawn_failed", name, "platform_pull", truncate(err.Error(), 100))
+			if deferred {
+				s.recordDecision("defer", name, "repeated_spawn_failure", "pull failed twice")
+			}
+			_ = s.checkpoint()
 			log.Printf("Auto-spawn failed for %s: %v", name, err)
-			// "max active instances reached" means a slot is held by a container we
-			// failed to close. Reconcile immediately (reap the stale one) instead of
-			// waiting for the 60s sweep, so the next spawn can succeed.
+			// Schedule reconciliation on the coordinator loop. Running it here can
+			// race with a new spawn and close a container missing from an old snapshot.
 			if platform.IsAtCapacity(err) {
-				s.reconcileContainers()
+				select {
+				case s.reconcileRequests <- struct{}{}:
+				default: // a reconciliation is already queued
+				}
 			}
 			return
 		}
 		delete(s.spawnFailures, name)
 		s.openContainers[name] = true
-		sctx, cancel := context.WithTimeout(ctx, s.perChallengeLimit(meta))
-		bb, bbErr := blackboard.LoadOrNew(meta.Name, s.cfg.StateDir)
-		tl, tlErr := traffic.LoadOrNew(meta.Name, s.cfg.StateDir)
-		if bbErr != nil || tlErr != nil {
+		deadline := time.Now().Add(s.perChallengeLimit(meta))
+		if previous, ok := s.resumePending[name]; ok && !previous.IsZero() && previous.Before(deadline) {
+			deadline = previous
+		}
+		if time.Until(deadline) < time.Second {
+			deadline = time.Now().Add(time.Second)
+		}
+		sctx, cancel := context.WithDeadline(ctx, deadline)
+		initialScope := scope.ParseConnInfo(meta.ConnectionInfo)
+		savedScope, savedRunID, hasSavedScope, scopeErr := scope.LoadOperatorScopeRun(s.cfg.StateDir, s.scopeIdentity(name))
+		if hasSavedScope {
+			initialScope = savedScope
+			meta.ConnectionInfo = initialScope.Describe()
+		}
+		_, recovering := s.resumePending[name]
+		runID := ""
+		if recovering {
+			runID = s.runIDs[name]
+			if runID == "" {
+				runID = savedRunID // migration from older checkpoints
+			}
+		} else if scopeErr == nil {
+			runID, scopeErr = scope.NewRunID()
+		}
+		stateID := scope.MissionStateID(meta.Name, runID)
+		bb, bbErr := blackboard.LoadOrNew(stateID, s.cfg.StateDir)
+		tl, tlErr := traffic.LoadOrNew(stateID, s.cfg.StateDir)
+		if bbErr != nil || tlErr != nil || scopeErr != nil {
 			cancel()
 			delete(s.openContainers, name)
-			s.deferred[name] = "state load failed"
+			s.deferred[name] = "mission state load failed"
 			s.deferTime[name] = time.Now()
 			s.mu.Unlock()
+			s.recordDecision("spawn_failed", name, "state_load", "blackboard, traffic, or scope load failed")
+			_ = s.checkpoint()
 			s.pf.ReleaseChallenge(name)
 			if bbErr != nil {
 				log.Printf("State load failed for %s: %v", name, bbErr)
-			} else {
+			} else if tlErr != nil {
 				log.Printf("Traffic load failed for %s: %v", name, tlErr)
+			} else {
+				log.Printf("Scope load failed for %s: %v", name, scopeErr)
 			}
 			return
 		}
 		// Count an attempt only when a solver actually starts. Platform capacity,
 		// container startup and state-load failures must not exhaust this budget.
-		s.attempts[name]++
-		sw := &swarm.Swarm{
-			Meta: meta, Scope: scope.ParseConnInfo(meta.ConnectionInfo), ModelSpecs: s.specs,
-			Settings: s.cfg, Platform: s.pf, LLM: s.LLM,
-			BB: bb, TL: tl,
+		if _, recovering := s.resumePending[name]; !recovering {
+			s.attempts[name]++
 		}
-		r := &run{sw: sw, cancel: cancel, done: make(chan struct{}), meta: meta}
+		delete(s.resumePending, name)
+		s.runIDs[name] = runID
+		sw := s.newSwarm(meta, initialScope, bb, tl)
+		r := &run{sw: sw, cancel: cancel, done: make(chan struct{}), meta: meta, deadline: deadline}
 		s.runs[name] = r
 		s.mu.Unlock()
+		if err := (runhistory.Store{StateDir: s.cfg.StateDir}).Start(stateID, meta.Name, "scheduler", initialScope.Describe(), time.Now()); err != nil {
+			log.Printf("start run history %s: %v", stateID, err)
+		}
+		s.recordDecision("spawn", name, "slot_available", fmt.Sprintf("%d executor(s)", len(s.specs)))
+		_ = s.checkpoint()
 		log.Printf("Swarm spawned for %s (%d models)", name, len(s.specs))
 		go func() {
 			defer close(r.done)
@@ -488,6 +618,15 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 			sw.Run(sctx)
 		}()
 	}()
+}
+
+func (s *Scheduler) newSwarm(meta mission.Meta, current scope.Scope, bb *blackboard.Blackboard, tl *traffic.Log) *swarm.Swarm {
+	return &swarm.Swarm{
+		Meta: meta, Scope: current, ModelSpecs: s.specs,
+		Settings: s.cfg, Platform: s.pf, LLM: s.LLM, ModelProfiles: s.ModelProfiles,
+		UseConsoleProfile: s.UseConsoleProfile,
+		BB:                bb, TL: tl, GlobalRemaining: s.remainingGlobal,
+	}
 }
 
 func (s *Scheduler) handleDeadlock(ctx context.Context, since time.Time) time.Time {
@@ -513,6 +652,7 @@ func (s *Scheduler) handleDeadlock(ctx context.Context, since time.Time) time.Ti
 		s.deferred = map[string]string{}
 		s.mu.Unlock()
 		log.Printf("Auto-resuming %d deferred challenges after deadlock", n)
+		s.recordDecision("auto_resume", "", "deadlock", fmt.Sprintf("%d deferred missions", n))
 		s.autoSpawnUnsolved(ctx)
 		return time.Time{}
 	}

@@ -1,6 +1,9 @@
 package solver
 
 import (
+	"strings"
+	"unicode/utf8"
+
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -22,14 +25,11 @@ import (
 // valid on its own.
 
 const (
-	// contextBudgetChars triggers compaction (≈ 4 chars per token). Set well under
-	// the model's context window so re-sent history stays cheap.
-	contextBudgetChars = 140_000
 	// contextMaxKeepTurns is the most recent cycle boundaries kept when compacting.
 	contextMaxKeepTurns = 3
-	// perMsgClip bounds a single retained tool/assistant message's content when
-	// even one cycle alone exceeds the budget.
-	perMsgClip = 6_000
+	// minMsgClip protects a little context while permitting dense single cycles
+	// with many tool results to fit the total budget.
+	minMsgClip = 256
 )
 
 func msgChars(m openai.ChatCompletionMessage) int {
@@ -153,12 +153,27 @@ func pairingValid(msgs []openai.ChatCompletionMessage) bool {
 // the slice and whether anything was actually clipped.
 func clipOld(msgs []openai.ChatCompletionMessage, budget int) ([]openai.ChatCompletionMessage, bool) {
 	out := append([]openai.ChatCompletionMessage(nil), msgs...)
+	for i := range out {
+		out[i].ToolCalls = append([]openai.ToolCall(nil), msgs[i].ToolCalls...)
+	}
 	changed := false
+	unclippable := make(map[int]bool)
+	// Blackboard snapshots and deltas can carry mandatory findings. Whole
+	// segments may be dropped at safe user boundaries and then reinjected, but
+	// clipping their text would silently lose findings inside a live cycle.
+	protected := make(map[int]bool)
+	for i := 1; i < len(out); i++ {
+		if out[i].Role == openai.ChatMessageRoleUser &&
+			(strings.Contains(out[i].Content, "## working record (blackboard)") ||
+				strings.Contains(out[i].Content, "## blackboard changes (revision")) {
+			protected[i] = true
+		}
+	}
 	for totalChars(out) > budget {
-		// Pick the largest clippable message (never the system prompt at index 0).
+		// Pick the largest reducible message (never the system prompt).
 		idx, size := -1, 0
 		for i := 1; i < len(out); i++ {
-			if c := msgChars(out[i]); c > size {
+			if c := msgChars(out[i]); c > size && c > minMsgClip && !unclippable[i] && !protected[i] {
 				idx, size = i, c
 			}
 		}
@@ -166,11 +181,12 @@ func clipOld(msgs []openai.ChatCompletionMessage, budget int) ([]openai.ChatComp
 			break
 		}
 		target := size / 2
-		if target < perMsgClip {
-			target = perMsgClip
+		if target < minMsgClip {
+			target = minMsgClip
 		}
 		if !clipMessage(&out[idx], target) {
-			break // the largest message is already at the floor; nothing more to do
+			unclippable[idx] = true // leave metadata intact; try other messages
+			continue
 		}
 		changed = true
 	}
@@ -185,31 +201,72 @@ func clipMessage(m *openai.ChatCompletionMessage, target int) bool {
 	if before <= target {
 		return false
 	}
+	argSize := 0
+	for _, tc := range m.ToolCalls {
+		argSize += len(tc.Function.Name) + len(tc.Function.Arguments)
+	}
 	if len(m.Content) > 0 {
-		keep := target
-		if keep < perMsgClip {
-			keep = perMsgClip
+		keep := target - argSize
+		if keep < minMsgClip/2 {
+			keep = minMsgClip / 2
 		}
 		m.Content = clipRunes(m.Content, keep)
 	}
-	if msgChars(*m) > target {
+	if msgChars(*m) > target && len(m.ToolCalls) > 0 {
+		remaining := target - len(m.Content)
+		if remaining < 0 {
+			remaining = 0
+		}
 		for i := range m.ToolCalls {
-			m.ToolCalls[i].Function.Arguments = clipRunes(m.ToolCalls[i].Function.Arguments, perMsgClip)
+			// A truncated argument string is often invalid JSON. The call has
+			// already completed, so keep its ID/name for pairing and replace its
+			// historical arguments with a valid, explicit placeholder.
+			if len(m.ToolCalls[i].Function.Arguments) > remaining/len(m.ToolCalls) {
+				m.ToolCalls[i].Function.Arguments = `{"_elided":true}`
+			}
 		}
 	}
 	return msgChars(*m) < before
 }
 
-// clipRunes keeps the head and tail of s (rune-safe) with an elision marker when
-// it exceeds max runes.
+// clipRunes keeps the head and tail of s without splitting UTF-8 runes, while
+// respecting a byte budget (the same unit used by totalChars).
 func clipRunes(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
+	if len(s) <= max {
 		return s
 	}
-	half := max / 2
-	if half < 1 {
-		half = 1
+	const marker = "\n…[elided to conserve context]…\n"
+	if max <= 0 {
+		return ""
 	}
-	return string(r[:half]) + "\n…[elided to conserve context]…\n" + string(r[len(r)-half:])
+	if max <= len(marker) {
+		i := 0
+		for i < len(s) {
+			_, width := utf8.DecodeRuneInString(s[i:])
+			if i+width > max {
+				break
+			}
+			i += width
+		}
+		return s[:i]
+	}
+	headBudget := (max - len(marker)) / 2
+	tailBudget := max - len(marker) - headBudget
+	head := 0
+	for head < len(s) {
+		_, width := utf8.DecodeRuneInString(s[head:])
+		if head+width > headBudget {
+			break
+		}
+		head += width
+	}
+	tail := len(s)
+	for tail > head {
+		_, width := utf8.DecodeLastRuneInString(s[:tail])
+		if len(s)-tail+width > tailBudget {
+			break
+		}
+		tail -= width
+	}
+	return s[:head] + marker + s[tail:]
 }

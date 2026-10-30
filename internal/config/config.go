@@ -16,7 +16,11 @@ type Settings struct {
 	MaxBumps            int
 	SolverRetryDelayS   float64
 	AllowLocalExec      bool
+	PlaywrightMCP       bool
 	TargetInsecureTLS   bool
+	LLMRecord           bool
+	ToolRulesFile       string
+	WebhookURL          string
 
 	// Platform + scheduler (mechanical shell). The platform is a pluggable work
 	// source; TSecBench is one adapter (PlatformMode="tsec"), not a hard binding.
@@ -35,14 +39,20 @@ type Settings struct {
 	AutoResumeIdleS      int
 
 	// LLM providers (OpenAI-compatible). Base URLs have defaults; keys from env.
-	DeepSeekKey     string
-	DeepSeekKeys    []string
-	DeepSeekBaseURL string
-	QwenKey         string
-	QwenBaseURL     string
-	GLMKey          string
-	GLMBaseURL      string
-	GLMModelID      string
+	DeepSeekKey           string
+	DeepSeekKeys          []string
+	DeepSeekBaseURL       string
+	QwenKey               string
+	QwenBaseURL           string
+	GLMKey                string
+	GLMBaseURL            string
+	GLMModelID            string
+	ContextWindowTokens   int
+	MaxDelegateDepth      int
+	MaxDelegateChildren   int
+	MaxDelegateSteps      int
+	MaxHandoffs           int
+	EngagementQuietCycles int
 }
 
 func getenv(key, def string) string {
@@ -111,16 +121,26 @@ func Load() Settings {
 		MaxBumps:            getenvInt("MAX_BUMPS", 20),
 		SolverRetryDelayS:   getenvFloat("SOLVER_RETRY_DELAY_SECONDS", 2.0),
 		AllowLocalExec:      getenvBool("ALLOW_LOCAL_EXEC", false),
+		PlaywrightMCP:       getenvBool("CHRONOS_PLAYWRIGHT_MCP", true),
 		TargetInsecureTLS:   getenvBool("TARGET_INSECURE_TLS", false),
+		LLMRecord:           getenvBool("LLM_RECORD", false),
+		ToolRulesFile:       os.Getenv("CHRONOS_TOOL_RULES_FILE"),
+		WebhookURL:          os.Getenv("CHRONOS_WEBHOOK_URL"),
 
-		DeepSeekKey:     deepSeekKey,
-		DeepSeekKeys:    deepSeekKeys,
-		DeepSeekBaseURL: getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-		QwenKey:         os.Getenv("QWEN_API_KEY"),
-		QwenBaseURL:     getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-		GLMKey:          os.Getenv("GLM_API_KEY"),
-		GLMBaseURL:      getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
-		GLMModelID:      getenv("GLM_MODEL_ID", "glm-4-plus"),
+		DeepSeekKey:           deepSeekKey,
+		DeepSeekKeys:          deepSeekKeys,
+		DeepSeekBaseURL:       getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+		QwenKey:               os.Getenv("QWEN_API_KEY"),
+		QwenBaseURL:           getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+		GLMKey:                os.Getenv("GLM_API_KEY"),
+		GLMBaseURL:            getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
+		GLMModelID:            getenv("GLM_MODEL_ID", "glm-4-plus"),
+		ContextWindowTokens:   getenvInt("MODEL_CONTEXT_WINDOW_TOKENS", 0),
+		MaxDelegateDepth:      getenvInt("MAX_DELEGATE_DEPTH", 1),
+		MaxDelegateChildren:   getenvInt("MAX_DELEGATE_CHILDREN", 3),
+		MaxDelegateSteps:      getenvInt("MAX_DELEGATE_STEPS", 20),
+		MaxHandoffs:           getenvInt("MAX_HANDOFFS", 2),
+		EngagementQuietCycles: getenvInt("ENGAGEMENT_QUIET_CYCLES", 3),
 
 		PlatformMode:         getenv("PLATFORM_MODE", "tsec"),
 		PlatformURL:          getenv("PLATFORM_URL", ""),
@@ -140,6 +160,18 @@ func Load() Settings {
 		settings.DeepSeekBaseURL = TSecBenchGatewayURL(settings.DeepSeekBaseURL)
 		settings.QwenBaseURL = TSecBenchGatewayURL(settings.QwenBaseURL)
 		settings.GLMBaseURL = TSecBenchGatewayURL(settings.GLMBaseURL)
+	}
+	if settings.MaxHandoffs < 0 {
+		settings.MaxHandoffs = 0
+	}
+	if settings.MaxHandoffs > 2 {
+		settings.MaxHandoffs = 2
+	}
+	if settings.EngagementQuietCycles < 1 {
+		settings.EngagementQuietCycles = 3
+	}
+	if settings.EngagementQuietCycles > 20 {
+		settings.EngagementQuietCycles = 20
 	}
 	return settings
 }

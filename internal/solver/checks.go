@@ -48,6 +48,9 @@ func (s *Solver) sendCheck(ctx context.Context, rawURL, method, param, wireValue
 	if ok, msg := s.hostAllowed(u.Hostname()); !ok {
 		return "", false, msg
 	}
+	if blocked := s.requireHTTPMutationLease(base, method, ""); blocked != "" {
+		return "", false, blocked
+	}
 	// Set the query param verbatim, preserving any other existing params.
 	existing := u.RawQuery
 	pair := url.QueryEscape(param) + "=" + wireValue
@@ -69,7 +72,7 @@ func (s *Solver) sendCheck(ctx context.Context, rawURL, method, param, wireValue
 		u.RawQuery = pair
 	}
 	allow := func(h string) bool { return s.scopeSnapshot().Allows(h) }
-	return nettools.DoRawHTTP(ctx, u.String(), method, nil, "", 30*time.Second, allow, s.insecureTLS), true, ""
+	return nettools.DoRawHTTP(ctx, u.String(), method, nil, "", 30*time.Second, allow, s.insecureTLS, s.checkHTTPMutationLease), true, ""
 }
 
 // ---------- XSS ----------

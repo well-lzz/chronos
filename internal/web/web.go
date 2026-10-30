@@ -7,10 +7,7 @@ package web
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/subtle"
 	"embed"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,9 +21,18 @@ import (
 	"time"
 
 	"github.com/well-lzz/chronos/internal/console"
+	"github.com/well-lzz/chronos/internal/guard"
 	"github.com/well-lzz/chronos/internal/llm"
 	"github.com/well-lzz/chronos/internal/llmconfig"
+	"github.com/well-lzz/chronos/internal/llmrec"
+	"github.com/well-lzz/chronos/internal/runhistory"
 )
+
+type Services struct {
+	Recorder *llmrec.Recorder
+	Guard    *guard.Manager
+	History  *runhistory.Store
+}
 
 // The console front-end is a Next.js app, statically exported to dist/ (built
 // with `npm run build` under web/, then copied here) and embedded so the single
@@ -39,12 +45,12 @@ var distFS embed.FS
 // or a single engagement). store, when non-nil, backs the model-settings panel.
 // The caller runs it in a goroutine.
 func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host string, port int) error {
+	return ServeWithServices(ctx, src, store, Services{}, host, port)
+}
+
+func ServeWithServices(ctx context.Context, src console.Source, store *llmconfig.Store, services Services, host string, port int) error {
 	if !loopbackHost(host) {
 		return fmt.Errorf("web console refuses non-loopback host %q; use 127.0.0.1, ::1, or localhost", host)
-	}
-	operatorToken, err := newOperatorToken()
-	if err != nil {
-		return fmt.Errorf("generate operator token: %w", err)
 	}
 	mux := http.NewServeMux()
 
@@ -57,11 +63,74 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, src.Snapshot())
 	})
+	registerHistory(mux, src, services.History)
 
 	mux.HandleFunc("/api/activity", func(w http.ResponseWriter, r *http.Request) {
 		after, _ := strconv.Atoi(r.URL.Query().Get("after"))
 		ev := src.Activity(r.URL.Query().Get("challenge"), r.URL.Query().Get("model"), after)
 		writeJSON(w, map[string]any{"events": ev})
+	})
+
+	mux.HandleFunc("/api/llm/records", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		if services.Recorder == nil {
+			writeJSON(w, map[string]any{"records": []any{}})
+			return
+		}
+		writeJSON(w, map[string]any{"records": services.Recorder.Recent(200)})
+	})
+	mux.HandleFunc("/api/llm/records/trace", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		if services.Recorder == nil {
+			http.NotFound(w, r)
+			return
+		}
+		trace, ok := services.Recorder.TraceByID(r.URL.Query().Get("mission"), r.URL.Query().Get("id"))
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, trace)
+	})
+	mux.HandleFunc("/api/approvals", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		if services.Guard == nil {
+			writeJSON(w, map[string]any{"pending": []any{}, "audit": []any{}})
+			return
+		}
+		writeJSON(w, map[string]any{"pending": services.Guard.Pending(), "audit": services.Guard.Recent(100), "rules": services.Guard.Rules()})
+	})
+	mux.HandleFunc("/api/approvals/decision", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if services.Guard == nil {
+			writeJSONStatus(w, http.StatusConflict, map[string]any{"ok": false, "error": "approvals unavailable"})
+			return
+		}
+		var request struct {
+			ID      string `json:"id"`
+			Approve bool   `json:"approve"`
+		}
+		if !decodeJSON(w, r, &request) {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if err := services.Guard.Decide(request.ID, request.Approve); err != nil {
+			writeJSONStatus(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
 	})
 
 	mux.HandleFunc("/api/stream", func(w http.ResponseWriter, r *http.Request) {
@@ -92,9 +161,6 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		if !authorizeOperator(w, r, operatorToken) {
-			return
-		}
 		var c struct {
 			Action    string `json:"action"`
 			Challenge string `json:"challenge"`
@@ -105,39 +171,72 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		src.Command(c.Action, c.Challenge, c.Model, c.Message)
+		if c.Action == "chat" {
+			chat, ok := src.(console.ChatSource)
+			if !ok {
+				writeJSONStatus(w, http.StatusConflict, map[string]any{"ok": false, "error": "chat unavailable"})
+				return
+			}
+			if err := chat.Chat(c.Challenge, c.Model, c.Message); err != nil {
+				writeJSONStatus(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+		} else {
+			if checked, ok := src.(console.CheckedCommander); ok {
+				if err := checked.CommandChecked(c.Action, c.Challenge, c.Model, c.Message); err != nil {
+					writeJSONStatus(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
+					return
+				}
+			} else {
+				src.Command(c.Action, c.Challenge, c.Model, c.Message)
+			}
+		}
 		writeJSON(w, map[string]any{"ok": true})
 	})
 
 	mux.HandleFunc("/api/scope", func(w http.ResponseWriter, r *http.Request) {
-		controller, ok := src.(console.ScopeController)
-		if !ok {
+		single, singleOK := src.(console.ScopeController)
+		multi, multiOK := src.(console.MissionScopeController)
+		if !singleOK && !multiOK {
 			writeJSON(w, console.ScopeConfig{Supported: false})
 			return
 		}
 		if r.Method == http.MethodGet {
-			writeJSON(w, controller.ScopeConfig())
+			if multiOK {
+				writeJSON(w, multi.ScopeConfigFor(r.URL.Query().Get("challenge")))
+			} else {
+				writeJSON(w, single.ScopeConfig())
+			}
 			return
 		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
 			return
 		}
-		if !authorizeOperator(w, r, operatorToken) {
-			return
-		}
 		var request struct {
-			Targets []string `json:"targets"`
+			Challenge string   `json:"challenge"`
+			Targets   []string `json:"targets"`
 		}
 		if !decodeJSON(w, r, &request) {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		if err := controller.UpdateScope(request.Targets); err != nil {
+		var err error
+		if multiOK {
+			err = multi.UpdateScopeFor(request.Challenge, request.Targets)
+		} else {
+			err = single.UpdateScope(request.Targets)
+		}
+		if err != nil {
 			writeJSONStatus(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		response := controller.ScopeConfig()
+		var response console.ScopeConfig
+		if multiOK {
+			response = multi.ScopeConfigFor(request.Challenge)
+		} else {
+			response = single.ScopeConfig()
+		}
 		writeJSON(w, map[string]any{
 			"ok": true, "supported": response.Supported, "editable": response.Editable,
 			"targets": response.Targets, "description": response.Description,
@@ -161,9 +260,6 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 			http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
 			return
 		}
-		if !authorizeOperator(w, r, operatorToken) {
-			return
-		}
 		var p llmconfig.Profile
 		if !decodeJSON(w, r, &p) {
 			http.Error(w, "bad json", http.StatusBadRequest)
@@ -181,9 +277,6 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 	mux.HandleFunc("/api/llm/test", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		if !authorizeOperator(w, r, operatorToken) {
 			return
 		}
 		if store == nil {
@@ -206,7 +299,7 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 				p.Model = saved.Model
 			}
 		}
-		if err := llm.Ping(r.Context(), p); err != nil {
+		if err := llm.PingRecorded(r.Context(), p, services.Recorder); err != nil {
 			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
@@ -215,7 +308,6 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	log.Printf("Web console on http://%s", addr)
-	log.Printf("Authenticated operator console: http://%s/#operator=%s", addr, operatorToken)
 	server := &http.Server{
 		Addr: addr, Handler: protect(mux), ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
@@ -230,25 +322,6 @@ func Serve(ctx context.Context, src console.Source, store *llmconfig.Store, host
 		return err
 	}
 	return nil
-}
-
-func newOperatorToken() (string, error) {
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(raw), nil
-}
-
-func authorizeOperator(w http.ResponseWriter, r *http.Request, expected string) bool {
-	provided := strings.TrimSpace(r.Header.Get("X-Chronos-Operator"))
-	if len(provided) != len(expected) || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
-		writeJSONStatus(w, http.StatusUnauthorized, map[string]any{
-			"ok": false, "error": "operator authorization required; reopen the authenticated console URL printed by Chronos",
-		})
-		return false
-	}
-	return true
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -1,7 +1,6 @@
 // Package blackboard is the explicit shared search state for one mission:
-// Facts (confirmed world state), Findings (search products — e.g. vulns, with a
-// candidate→verified|refuted|inconclusive lifecycle and real-traffic evidence),
-// and Sub-Goals (the model's live coverage checklist). It is shared across
+// Facts and Findings are claims whose verdicts derive from the evidence graph;
+// Sub-Goals remain the model's live coverage checklist. It is shared across
 // executors on the same mission and persisted to JSON on every mutation so a
 // long run survives a restart.
 package blackboard
@@ -18,7 +17,7 @@ import (
 	"time"
 )
 
-// Finding lifecycle.
+// Legacy presentation statuses derived from the graph's three verdicts.
 const (
 	Candidate    = "candidate"
 	Verified     = "verified"
@@ -50,6 +49,7 @@ type EvidenceRef struct {
 
 // Verification is one append-only verification attempt.
 type Verification struct {
+	ID           string        `json:"id,omitempty"`
 	Verdict      string        `json:"verdict"`
 	Summary      string        `json:"summary,omitempty"`
 	Evidence     string        `json:"evidence,omitempty"`
@@ -59,11 +59,15 @@ type Verification struct {
 }
 
 type Fact struct {
-	ID        string  `json:"id"`
-	Statement string  `json:"statement"`
-	Evidence  string  `json:"evidence,omitempty"`
-	FoundBy   string  `json:"found_by,omitempty"`
-	TS        float64 `json:"ts"`
+	ID            string        `json:"id"`
+	Statement     string        `json:"statement"`
+	Evidence      string        `json:"evidence,omitempty"`
+	EvidenceRefs  []EvidenceRef `json:"evidence_refs,omitempty"`
+	Verdict       string        `json:"verdict,omitempty"`
+	VerdictReason string        `json:"verdict_reason,omitempty"`
+	FoundBy       string        `json:"found_by,omitempty"`
+	TS            float64       `json:"ts"`
+	Revision      uint64        `json:"revision,omitempty"`
 }
 
 type Finding struct {
@@ -72,7 +76,9 @@ type Finding struct {
 	Target        string         `json:"target,omitempty"`
 	Category      string         `json:"category,omitempty"`
 	Severity      string         `json:"severity"`
-	Status        string         `json:"status"`
+	Status        string         `json:"status,omitempty"`
+	VerdictReason string         `json:"verdict_reason,omitempty"`
+	Oracle        bool           `json:"oracle,omitempty"`
 	Evidence      string         `json:"evidence,omitempty"` // original — immutable after add
 	Reproduction  string         `json:"reproduction,omitempty"`
 	Remediation   string         `json:"remediation,omitempty"`
@@ -81,15 +87,21 @@ type Finding struct {
 	VerifiedTS    *float64       `json:"verified_ts,omitempty"`
 	EvidenceRefs  []EvidenceRef  `json:"evidence_refs,omitempty"`
 	Verifications []Verification `json:"verifications,omitempty"`
+	Revision      uint64         `json:"revision,omitempty"`
 }
 
 type SubGoal struct {
-	ID          string  `json:"id"`
-	Description string  `json:"description"`
-	Status      string  `json:"status"` // open | resolved
-	Outcome     string  `json:"outcome,omitempty"`
-	CreatedBy   string  `json:"created_by,omitempty"`
-	TS          float64 `json:"ts"`
+	ID          string   `json:"id"`
+	Description string   `json:"description"`
+	Status      string   `json:"status"` // open | resolved
+	Outcome     string   `json:"outcome,omitempty"`
+	CreatedBy   string   `json:"created_by,omitempty"`
+	TS          float64  `json:"ts"`
+	Revision    uint64   `json:"revision,omitempty"`
+	Kind        string   `json:"kind,omitempty"` // verification for independent finding checks
+	FindingID   string   `json:"finding_id,omitempty"`
+	AssignedTo  string   `json:"assigned_to,omitempty"`
+	ConflictIDs []string `json:"conflict_ids,omitempty"`
 }
 
 // Blackboard is the shared Fact/Finding/Sub-Goal store for one mission.
@@ -97,20 +109,38 @@ type Blackboard struct {
 	MissionID string
 	Path      string
 
-	mu       sync.Mutex
-	seq      int
-	facts    map[string]*Fact
-	findings map[string]*Finding
-	subgoals map[string]*SubGoal
-	factOrd  []string
-	findOrd  []string
-	goalOrd  []string
+	mu           sync.Mutex
+	seq          int
+	revision     uint64
+	facts        map[string]*Fact
+	findings     map[string]*Finding
+	subgoals     map[string]*SubGoal
+	factOrd      []string
+	findOrd      []string
+	goalOrd      []string
+	leases       map[string]Lease
+	leaseLog     []LeaseEvent
+	round        uint64
+	lineage      map[string][]string
+	activity     map[string]uint64
+	digests      []Digest
+	edges        []GraphEdge
+	challenges   map[string]*Challenge
+	verdicts     map[string]claimVerdict
+	promoted     map[string]bool
+	attackers    map[string][]string
+	neighbors    map[string][]string
+	proofGrounds map[string]bool
+	edgeKeys     map[string]bool
 }
 
 func newBoard(missionID, path string) *Blackboard {
 	return &Blackboard{
 		MissionID: missionID, Path: path,
-		facts: map[string]*Fact{}, findings: map[string]*Finding{}, subgoals: map[string]*SubGoal{},
+		facts: map[string]*Fact{}, findings: map[string]*Finding{}, subgoals: map[string]*SubGoal{}, leases: map[string]Lease{},
+		lineage: map[string][]string{}, activity: map[string]uint64{},
+		challenges: map[string]*Challenge{}, verdicts: map[string]claimVerdict{}, promoted: map[string]bool{},
+		attackers: map[string][]string{}, neighbors: map[string][]string{}, proofGrounds: map[string]bool{}, edgeKeys: map[string]bool{},
 	}
 }
 
@@ -119,21 +149,71 @@ func (b *Blackboard) nextID(prefix string) string {
 	return fmt.Sprintf("%s%d", prefix, b.seq)
 }
 
+func (b *Blackboard) nextRevision() uint64 { b.revision++; return b.revision }
+
+func (b *Blackboard) Revision() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.expireLeasesLocked() {
+		_ = b.persist()
+	}
+	return b.revision
+}
+
+// ArtifactsSince reports new facts/findings authored by a delegated agent or
+// any of its descendants. Revision alone would accidentally attribute writes
+// from concurrently running peer executors to the child.
+func (b *Blackboard) ArtifactsSince(revision uint64, actorPrefix string) (facts, findings []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, id := range b.factOrd {
+		f := b.facts[id]
+		if f.Revision > revision && actorInTree(f.FoundBy, actorPrefix) {
+			facts = append(facts, id)
+		}
+	}
+	for _, id := range b.findOrd {
+		f := b.findings[id]
+		if f.Revision > revision && actorInTree(f.FoundBy, actorPrefix) {
+			findings = append(findings, id)
+		}
+	}
+	return facts, findings
+}
+
+func actorInTree(actor, prefix string) bool {
+	return prefix != "" && (actor == prefix || strings.HasPrefix(actor, prefix+"/sub:"))
+}
+
 func clip(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n]
+	end := 0
+	for i := range s {
+		if i > n {
+			break
+		}
+		end = i
+	}
+	return s[:end]
 }
 
 // ----------------------------- mutations ------------------------------------
 
 func (b *Blackboard) AddFact(statement, evidence, foundBy string) (string, error) {
+	return b.AddFactWithRefs(statement, evidence, nil, foundBy)
+}
+
+func (b *Blackboard) AddFactWithRefs(statement, evidence string, refs []EvidenceRef, foundBy string) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	id := b.nextID("f")
-	b.facts[id] = &Fact{ID: id, Statement: clip(statement, 2000), Evidence: clip(evidence, 2000), FoundBy: foundBy, TS: now()}
+	b.facts[id] = &Fact{ID: id, Statement: clip(statement, 2000), Evidence: clip(evidence, 2000), EvidenceRefs: dedupRefs(nil, refs), FoundBy: foundBy, TS: now(), Revision: b.nextRevision()}
 	b.factOrd = append(b.factOrd, id)
+	b.activity[id] = b.round
+	b.groundLocked(id, refs, foundBy)
+	b.recomputeLocked(id)
 	return id, b.persist()
 }
 
@@ -143,9 +223,8 @@ func (b *Blackboard) AddFinding(f Finding) (string, error) {
 	if !severities[f.Severity] {
 		f.Severity = "info"
 	}
-	if !statuses[f.Status] {
-		f.Status = Candidate
-	}
+	// The caller cannot assign a verdict. Status is a computed presentation field.
+	f.Status, f.VerdictReason, f.VerifiedTS = "", "", nil
 	id := b.nextID("v")
 	f.ID = id
 	f.Title = clip(f.Title, 300)
@@ -155,12 +234,21 @@ func (b *Blackboard) AddFinding(f Finding) (string, error) {
 	f.Reproduction = clip(f.Reproduction, 4000)
 	f.Remediation = clip(f.Remediation, 2000)
 	f.TS = now()
-	if f.Status == Verified {
-		t := now()
-		f.VerifiedTS = &t
-	}
+	f.Revision = b.nextRevision()
 	b.findings[id] = &f
 	b.findOrd = append(b.findOrd, id)
+	b.activity[id] = b.round
+	b.groundLocked(id, f.EvidenceRefs, f.FoundBy)
+	if f.Oracle {
+		b.addEdgeLocked("oracle:"+id, id, "grounds", "proof", "platform accepted the flag", f.FoundBy)
+	}
+	b.recomputeLocked(id)
+	if !f.Oracle {
+		goalID := b.nextID("g")
+		b.subgoals[goalID] = &SubGoal{ID: goalID, Description: "Independently reproduce or refute finding " + id + ": " + clip(f.Title, 200),
+			Status: "open", CreatedBy: f.FoundBy, TS: now(), Revision: b.nextRevision(), Kind: "verification", FindingID: id}
+		b.goalOrd = append(b.goalOrd, goalID)
+	}
 	return id, b.persist()
 }
 
@@ -189,12 +277,21 @@ func (b *Blackboard) AddEvidenceRefs(findingID string, refs []EvidenceRef) (bool
 	if f == nil || len(refs) == 0 {
 		return false, nil
 	}
+	before := len(f.EvidenceRefs)
 	f.EvidenceRefs = dedupRefs(f.EvidenceRefs, refs)
+	groundChanged := b.groundLocked(findingID, refs, "")
+	if len(f.EvidenceRefs) == before && !groundChanged {
+		return false, nil
+	}
+	f.Revision = b.nextRevision()
+	b.activity[findingID] = b.round
+	b.invalidateDigestsLocked(findingID)
+	b.recomputeLocked(findingID)
 	return true, b.persist()
 }
 
-// VerifyFinding appends an immutable verification record and updates status to
-// the latest verdict; the finding's original Evidence is never overwritten.
+// VerifyFinding appends an immutable verification attempt. Its decision becomes
+// an argument edge; the finding's verdict is recomputed from the graph.
 func (b *Blackboard) VerifyFinding(findingID, verdict, summary, evidence string, refs []EvidenceRef, by string) (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -202,16 +299,40 @@ func (b *Blackboard) VerifyFinding(findingID, verdict, summary, evidence string,
 	if f == nil || !statuses[verdict] {
 		return false, nil
 	}
+	verificationID := b.nextID("z")
 	f.Verifications = append(f.Verifications, Verification{
+		ID:      verificationID,
 		Verdict: verdict, Summary: clip(summary, 1000), Evidence: clip(evidence, 4000),
 		EvidenceRefs: refs, By: by, TS: now(),
 	})
-	f.Status = verdict
-	if verdict == Verified {
-		t := now()
-		f.VerifiedTS = &t
+	b.addEdgeLocked(verificationID, findingID, "verifies", verdict, summary, by)
+	if verdict == Refuted {
+		challengeID := b.nextID("c")
+		b.challenges[challengeID] = &Challenge{ID: challengeID, Reason: clip(summary+": "+evidence, 2000), By: by, TS: now(), Revision: b.nextRevision()}
+		b.groundLocked(challengeID, refs, by)
+		b.addEdgeLocked(challengeID, findingID, "refutes", "", "", by)
+	} else if verdict == Verified {
+		f.EvidenceRefs = dedupRefs(f.EvidenceRefs, refs)
+		b.groundLocked(findingID, refs, by)
+	} else {
+		for _, ref := range refs {
+			b.addEdgeLocked(ref.Ref, findingID, "grounds", "supporting", ref.Note, by)
+		}
 	}
-	f.EvidenceRefs = dedupRefs(f.EvidenceRefs, refs)
+	b.recomputeLocked(findingID)
+	f.Revision = b.nextRevision()
+	b.activity[findingID] = b.round
+	b.invalidateDigestsLocked(findingID)
+	computed := b.verdictLocked(findingID).status
+	if (verdict == Verified && computed == "confirmed") || (verdict == Refuted && computed == "refuted") {
+		for _, goal := range b.subgoals {
+			if goal.Kind == "verification" && goal.FindingID == findingID && goal.Status == "open" {
+				goal.Status = "resolved"
+				goal.Outcome = verdict + " by " + by
+				goal.Revision = b.nextRevision()
+			}
+		}
+	}
 	return true, b.persist()
 }
 
@@ -219,8 +340,9 @@ func (b *Blackboard) AddSubgoal(desc, createdBy string) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	id := b.nextID("g")
-	b.subgoals[id] = &SubGoal{ID: id, Description: clip(desc, 500), Status: "open", CreatedBy: createdBy, TS: now()}
+	b.subgoals[id] = &SubGoal{ID: id, Description: clip(desc, 500), Status: "open", CreatedBy: createdBy, TS: now(), Revision: b.nextRevision()}
 	b.goalOrd = append(b.goalOrd, id)
+	b.activity[id] = b.round
 	return id, b.persist()
 }
 
@@ -231,8 +353,13 @@ func (b *Blackboard) ResolveSubgoal(id, outcome string) (bool, error) {
 	if g == nil {
 		return false, nil
 	}
+	if g.Kind == "verification" || g.Kind == "adjudication" {
+		return false, fmt.Errorf("%s sub-goal %s resolves only through evidence graph updates", g.Kind, id)
+	}
 	g.Status = "resolved"
 	g.Outcome = clip(outcome, 1000)
+	g.Revision = b.nextRevision()
+	b.releaseSubgoalLocked(id)
 	return true, b.persist()
 }
 
@@ -244,7 +371,8 @@ func (b *Blackboard) OpenSubgoals() []*SubGoal {
 	var out []*SubGoal
 	for _, id := range b.goalOrd {
 		if g := b.subgoals[id]; g != nil && g.Status == "open" {
-			out = append(out, g)
+			copy := *g
+			out = append(out, &copy)
 		}
 	}
 	return out
@@ -256,13 +384,7 @@ func (b *Blackboard) OpenSubgoals() []*SubGoal {
 func (b *Blackboard) ProgressMarker() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	m := len(b.facts) + len(b.findings)
-	for _, f := range b.findings {
-		if f.Status == Verified {
-			m++
-		}
-	}
-	return m
+	return len(b.facts) + len(b.findings) + len(b.promoted)
 }
 
 func (b *Blackboard) Counts() map[string]int {
@@ -271,14 +393,16 @@ func (b *Blackboard) Counts() map[string]int {
 	c := map[string]int{"facts": len(b.facts), "findings": len(b.findings),
 		"subgoals_total": len(b.subgoals)}
 	for _, f := range b.findings {
-		switch f.Status {
-		case Verified:
+		switch b.verdictLocked(f.ID).status {
+		case "confirmed":
 			c["findings_verified"]++
-		case Candidate:
-			c["findings_candidate"]++
-		case Inconclusive:
-			c["findings_inconclusive"]++
-		case Refuted:
+		case "suspected":
+			if len(f.Verifications) > 0 && f.Verifications[len(f.Verifications)-1].Verdict == Inconclusive {
+				c["findings_inconclusive"]++
+			} else {
+				c["findings_candidate"]++
+			}
+		case "refuted":
 			c["findings_refuted"]++
 		}
 	}
@@ -290,59 +414,10 @@ func (b *Blackboard) Counts() map[string]int {
 	return c
 }
 
-// Summary is the compact text view injected into an executor's context.
+// Summary is the budgeted working record injected into an executor's context.
 func (b *Blackboard) Summary() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.facts) == 0 && len(b.findings) == 0 && len(b.subgoals) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	sb.WriteString("## working record (blackboard)\n")
-	var open []*SubGoal
-	for _, id := range b.goalOrd {
-		if g := b.subgoals[id]; g != nil && g.Status == "open" {
-			open = append(open, g)
-		}
-	}
-	if len(open) > 0 {
-		sb.WriteString("open sub-goals:\n")
-		for i, g := range open {
-			if i >= 20 {
-				break
-			}
-			fmt.Fprintf(&sb, "- [%s] %s\n", g.ID, g.Description)
-		}
-	}
-	if len(b.findOrd) > 0 {
-		sb.WriteString("findings:\n")
-		for _, id := range tail(b.findOrd, 25) {
-			f := b.findings[id]
-			refs := ""
-			if len(f.EvidenceRefs) > 0 {
-				refs = fmt.Sprintf(" evidence:%d", len(f.EvidenceRefs))
-			}
-			at := ""
-			if f.Target != "" {
-				at = " @ " + f.Target
-			}
-			fmt.Fprintf(&sb, "- [%s] (%s/%s) %s%s%s\n", f.ID, f.Status, f.Severity, f.Title, at, refs)
-		}
-	}
-	if len(b.factOrd) > 0 {
-		sb.WriteString("confirmed facts:\n")
-		for _, id := range tail(b.factOrd, 25) {
-			fmt.Fprintf(&sb, "- %s\n", b.facts[id].Statement)
-		}
-	}
-	return strings.TrimRight(sb.String(), "\n")
-}
-
-func tail(ids []string, n int) []string {
-	if len(ids) <= n {
-		return ids
-	}
-	return ids[len(ids)-n:]
+	text, _ := b.SummaryWithBudget(12_000)
+	return text
 }
 
 // FindingsSorted returns findings severity-first (critical→info), then
@@ -352,7 +427,7 @@ func (b *Blackboard) FindingsSorted() []Finding {
 	defer b.mu.Unlock()
 	out := make([]Finding, 0, len(b.findings))
 	for _, id := range b.findOrd {
-		out = append(out, *b.findings[id])
+		out = append(out, b.findingViewLocked(b.findings[id]))
 	}
 	sevRank := map[string]int{"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 	stRank := map[string]int{Verified: 0, Candidate: 1, Inconclusive: 2, Refuted: 3}
@@ -386,6 +461,7 @@ type FindingRow struct {
 	Severity      string         `json:"severity"`
 	Status        string         `json:"status"`
 	Verdict       string         `json:"verdict"`
+	VerdictReason string         `json:"verdict_reason,omitempty"`
 	Target        string         `json:"target,omitempty"`
 	Category      string         `json:"category,omitempty"`
 	Evidence      int            `json:"evidence"`
@@ -406,7 +482,7 @@ func (b *Blackboard) FindingsPublic() []FindingRow {
 	for _, f := range fs {
 		out = append(out, FindingRow{
 			ID: f.ID, Title: f.Title, Severity: f.Severity, Status: f.Status,
-			Verdict: Verdict(f.Status), Target: f.Target, Category: f.Category,
+			Verdict: Verdict(f.Status), VerdictReason: f.VerdictReason, Target: f.Target, Category: f.Category,
 			Evidence: len(f.EvidenceRefs), EvidenceText: f.Evidence,
 			Reproduction: f.Reproduction, Remediation: f.Remediation, FoundBy: f.FoundBy,
 			TS: f.TS, VerifiedTS: f.VerifiedTS, EvidenceRefs: f.EvidenceRefs,
@@ -422,7 +498,7 @@ func (b *Blackboard) VerdictCounts() map[string]int {
 	defer b.mu.Unlock()
 	c := map[string]int{"confirmed": 0, "suspected": 0, "failed": 0, "total": len(b.findings)}
 	for _, f := range b.findings {
-		c[Verdict(f.Status)]++
+		c[b.verdictLocked(f.ID).status]++
 	}
 	return c
 }
@@ -432,7 +508,10 @@ func (b *Blackboard) FactsOrdered() []Fact {
 	defer b.mu.Unlock()
 	out := make([]Fact, 0, len(b.factOrd))
 	for _, id := range b.factOrd {
-		out = append(out, *b.facts[id])
+		f := *b.facts[id]
+		v := b.verdictLocked(id)
+		f.Verdict, f.VerdictReason = v.status, v.reason
+		out = append(out, f)
 	}
 	return out
 }
@@ -454,6 +533,9 @@ type SubgoalRow struct {
 	Status      string `json:"status"` // open | resolved
 	Outcome     string `json:"outcome,omitempty"`
 	Done        bool   `json:"done"`
+	Kind        string `json:"kind,omitempty"`
+	FindingID   string `json:"finding_id,omitempty"`
+	AssignedTo  string `json:"assigned_to,omitempty"`
 }
 
 // SubgoalsPublic returns the coverage checklist as light rows for a snapshot:
@@ -468,7 +550,8 @@ func (b *Blackboard) SubgoalsPublic() []SubgoalRow {
 		if g == nil {
 			continue
 		}
-		row := SubgoalRow{ID: g.ID, Description: g.Description, Status: g.Status, Outcome: g.Outcome, Done: g.Status == "resolved"}
+		row := SubgoalRow{ID: g.ID, Description: g.Description, Status: g.Status, Outcome: g.Outcome, Done: g.Status == "resolved",
+			Kind: g.Kind, FindingID: g.FindingID, AssignedTo: g.AssignedTo}
 		if row.Done {
 			done = append(done, row)
 		} else {
@@ -481,11 +564,22 @@ func (b *Blackboard) SubgoalsPublic() []SubgoalRow {
 // ---------------------------- persistence -----------------------------------
 
 type diskModel struct {
-	MissionID string    `json:"mission_id"`
-	Seq       int       `json:"seq"`
-	Facts     []Fact    `json:"facts"`
-	Findings  []Finding `json:"findings"`
-	Subgoals  []SubGoal `json:"subgoals"`
+	MissionID    string              `json:"mission_id"`
+	Seq          int                 `json:"seq"`
+	Revision     uint64              `json:"revision,omitempty"`
+	Facts        []Fact              `json:"facts"`
+	Findings     []Finding           `json:"findings"`
+	Subgoals     []SubGoal           `json:"subgoals"`
+	Leases       []Lease             `json:"leases,omitempty"`
+	LeaseLog     []LeaseEvent        `json:"lease_log,omitempty"`
+	Round        uint64              `json:"round,omitempty"`
+	Lineage      map[string][]string `json:"lineage,omitempty"`
+	Activity     map[string]uint64   `json:"activity,omitempty"`
+	Digests      []Digest            `json:"digests,omitempty"`
+	GraphVersion int                 `json:"graph_version,omitempty"`
+	Edges        []GraphEdge         `json:"edges,omitempty"`
+	Challenges   []Challenge         `json:"challenges,omitempty"`
+	Promoted     map[string]bool     `json:"promoted,omitempty"`
 }
 
 // persist assumes the caller holds the lock.
@@ -493,16 +587,30 @@ func (b *Blackboard) persist() error {
 	if b.Path == "" {
 		return nil
 	}
-	m := diskModel{MissionID: b.MissionID, Seq: b.seq}
+	m := diskModel{MissionID: b.MissionID, Seq: b.seq, Revision: b.revision, GraphVersion: 1,
+		Round: b.round, Lineage: b.lineage, Activity: b.activity, Digests: b.digests, Promoted: b.promoted}
 	for _, id := range b.factOrd {
-		m.Facts = append(m.Facts, *b.facts[id])
+		f := *b.facts[id]
+		f.Verdict, f.VerdictReason = "", ""
+		m.Facts = append(m.Facts, f)
 	}
 	for _, id := range b.findOrd {
-		m.Findings = append(m.Findings, *b.findings[id])
+		f := *b.findings[id]
+		f.Status, f.VerdictReason, f.VerifiedTS = "", "", nil
+		m.Findings = append(m.Findings, f)
 	}
 	for _, id := range b.goalOrd {
 		m.Subgoals = append(m.Subgoals, *b.subgoals[id])
 	}
+	for _, lease := range b.leases {
+		m.Leases = append(m.Leases, lease)
+	}
+	m.LeaseLog = append(m.LeaseLog, b.leaseLog...)
+	m.Edges = append(m.Edges, b.edges...)
+	for _, challenge := range b.challenges {
+		m.Challenges = append(m.Challenges, *challenge)
+	}
+	sort.Slice(m.Challenges, func(i, j int) bool { return m.Challenges[i].ID < m.Challenges[j].ID })
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
@@ -537,6 +645,24 @@ func LoadOrNew(missionID, stateDir string) (*Blackboard, error) {
 		return nil, fmt.Errorf("load blackboard %s: %w", path, err)
 	}
 	b.seq = m.Seq
+	b.revision = m.Revision
+	b.round = m.Round
+	if m.Lineage != nil {
+		b.lineage = m.Lineage
+	}
+	if m.Activity != nil {
+		b.activity = m.Activity
+	}
+	b.digests = m.Digests
+	if m.Promoted != nil {
+		b.promoted = m.Promoted
+	}
+	b.edges = m.Edges
+	b.rebuildGraphIndexesLocked()
+	for i := range m.Challenges {
+		c := m.Challenges[i]
+		b.challenges[c.ID] = &c
+	}
 	for i := range m.Facts {
 		fc := m.Facts[i]
 		b.facts[fc.ID] = &fc
@@ -547,10 +673,56 @@ func LoadOrNew(missionID, stateDir string) (*Blackboard, error) {
 		b.findings[fd.ID] = &fd
 		b.findOrd = append(b.findOrd, fd.ID)
 	}
+	migrated := m.GraphVersion == 0
+	if migrated {
+		b.migrateLegacyGraphLocked()
+	}
 	for i := range m.Subgoals {
 		g := m.Subgoals[i]
 		b.subgoals[g.ID] = &g
 		b.goalOrd = append(b.goalOrd, g.ID)
+	}
+	for _, id := range b.factOrd {
+		b.recomputeLocked(id)
+	}
+	for _, id := range b.findOrd {
+		b.recomputeLocked(id)
+	}
+	var challengeIDs []string
+	for id := range b.challenges {
+		challengeIDs = append(challengeIDs, id)
+	}
+	sort.Strings(challengeIDs)
+	for _, id := range challengeIDs {
+		b.recomputeLocked(id)
+	}
+	for _, lease := range m.Leases {
+		b.leases[lease.Surface] = lease
+	}
+	b.leaseLog = m.LeaseLog
+	if b.expireLeasesLocked() {
+		if err := b.persist(); err != nil {
+			return nil, err
+		}
+	}
+	// Legacy boards had no revision stamps. Treat their contents as one initial
+	// revision so a newly resumed executor can still receive a full snapshot.
+	if b.revision == 0 && b.seq > 0 {
+		b.revision = 1
+		for _, f := range b.facts {
+			f.Revision = 1
+		}
+		for _, f := range b.findings {
+			f.Revision = 1
+		}
+		for _, g := range b.subgoals {
+			g.Revision = 1
+		}
+	}
+	if migrated || b.revision != m.Revision || len(b.promoted) != len(m.Promoted) {
+		if err := b.persist(); err != nil {
+			return nil, err
+		}
 	}
 	return b, nil
 }

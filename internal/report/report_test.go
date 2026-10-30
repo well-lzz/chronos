@@ -1,6 +1,7 @@
 package report
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -32,6 +33,9 @@ func TestRenderEvidenceAndVerification(t *testing.T) {
 	if _, err := bb.AddFact("nginx 1.25.3 on staging.acme.test", "", "deepseek"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := bb.ChallengeFinding(id, "WAF response was misread", []blackboard.EvidenceRef{{Ref: "t2", Role: "supporting"}}, "reviewer"); err != nil {
+		t.Fatal(err)
+	}
 	g, err := bb.AddSubgoal("enumerate /api/*", "deepseek")
 	if err != nil {
 		t.Fatal(err)
@@ -46,12 +50,26 @@ func TestRenderEvidenceAndVerification(t *testing.T) {
 	}
 	md, _ := os.ReadFile(paths["md"])
 	html, _ := os.ReadFile(paths["html"])
-	for _, want := range []string{"Evidence traffic", "t1", "Verification history", "inconclusive", "Reflected XSS"} {
+	jsonData, _ := os.ReadFile(paths["json"])
+	for _, want := range []string{"Evidence traffic", "t1", "Verification history", "inconclusive", "Reflected XSS", "WAF response was misread", "### Claims"} {
 		if !strings.Contains(string(md), want) {
 			t.Errorf("md missing %q", want)
 		}
 	}
-	if !strings.Contains(string(html), "Evidence traffic") || !strings.Contains(string(html), "Verification history") {
+	if !strings.Contains(string(html), "Evidence traffic") || !strings.Contains(string(html), "Verification history") || !strings.Contains(string(html), "WAF response was misread") {
 		t.Error("html missing evidence/verification sections")
+	}
+	var structured struct {
+		Findings []struct {
+			Status        string `json:"status"`
+			VerdictReason string `json:"verdict_reason"`
+		} `json:"findings"`
+		Graph blackboard.GraphSnapshot `json:"evidence_graph"`
+	}
+	if err := json.Unmarshal(jsonData, &structured); err != nil {
+		t.Fatal(err)
+	}
+	if len(structured.Graph.Edges) == 0 || len(structured.Graph.Verifications) != 2 || structured.Findings[0].VerdictReason == "" {
+		t.Fatalf("report omitted computed argument graph: %+v", structured)
 	}
 }

@@ -46,6 +46,17 @@ func TestEmptyScopeRefused(t *testing.T) {
 	}
 }
 
+func TestWebDraftCanStartWithoutInitialScope(t *testing.T) {
+	path := write(t, `{"name":"operator-selected","mode":"assessment","goal":"review"}`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("headless run accepted empty scope")
+	}
+	draft, err := LoadDraft(path)
+	if err != nil || !draft.Scope().IsEmpty() {
+		t.Fatalf("paused web draft = %+v, %v", draft, err)
+	}
+}
+
 func TestScopeAsList(t *testing.T) {
 	e, err := Load(write(t, `{"name":"y","mode":"assessment","scope":["h.test","10.0.0.0/24"]}`))
 	if err != nil {
