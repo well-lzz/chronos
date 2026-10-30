@@ -4,4 +4,4 @@ go 1.24
 
 toolchain go1.26.10
 
-require github.com/sashabaranov/go-openai v1.32.5
+require github.com/sashabaranov/go-openai v1.43.0
