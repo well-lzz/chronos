@@ -1,0 +1,6 @@
+Asset: chronos-hero.png
+Generator: built-in image_gen
+Purpose: Chronos GitHub README hero banner
+
+Final generation prompt:
+Use case: brand illustration. Asset type: a polished, ultra-wide GitHub README hero banner for the open-source project CHRONOS, an evidence-driven autonomous security assessment agent. Create a landscape banner with roughly 3:1 composition. Scene: deep graphite and midnight navy background, subtle fine technical grid, generous negative space. Main visual on the right: an original sculptural hourglass made from two elegant intersecting orbital arcs in brushed titanium, with luminous teal points falling through its narrow center and branching into an orderly evidence graph of fine silver lines and small cyan and muted amber nodes. Express time, controlled exploration, reasoning, and traceable evidence. Left: the exact word CHRONOS in large, crisp, beautifully spaced off-white geometric sans-serif capitals; no other text. Refined editorial technology identity, precise, calm, dimensional but minimal, sophisticated lighting, legible at README width. Keep generous margins and a balanced horizontal layout. No hooded hackers, skulls, shields, padlocks, Matrix code, extra logos, watermarks, fake UI, or tiny illegible labels.

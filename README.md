@@ -1,3 +1,5 @@
+![Chronos：时间沙漏与证据图谱](docs/media/chronos-hero.png)
+
 # Chronos
 
 **面向授权安全评估的 Agent 执行系统：让模型自主探索目标，用真实流量支撑发现，并保留完整的任务记录。**
@@ -6,9 +8,9 @@ Chronos 以 Go 实现任务调度、工具执行、共享黑板与本地控制�
 
 项目同时支持独立的授权评估任务和评测平台接入。TSecBench 是内置的平台适配器；独立评估无需接入该平台。多个执行器可以使用不同的 OpenAI 兼容模型，在同一任务中共享进展。
 
-## 演示视频
+## 项目演示
 
-[查看或下载项目演示视频（MP4）](docs/media/chronos-demo.mp4)
+https://github.com/user-attachments/assets/89a6f0e9-ed87-43dc-926f-89d01e9aaeee
 
 ## 设计亮点：以证据论证图计算结论
 
