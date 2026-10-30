@@ -7,6 +7,19 @@ import (
 	"github.com/well-lzz/chronos/internal/scope"
 )
 
+func TestEngagementRuntimeWithoutDeadlineRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	started := time.Now().UTC().Truncate(time.Second)
+	authorized := scope.Parse([]string{"target.test"})
+	if err := SaveRuntime(dir, "assessment", started, time.Time{}, authorized); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadRuntime(dir, "assessment")
+	if err != nil || !got.Started.Equal(started) || !got.Deadline.IsZero() {
+		t.Fatalf("unlimited runtime not recovered: %+v %v", got, err)
+	}
+}
+
 func TestEngagementRuntimeRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	started := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)

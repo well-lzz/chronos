@@ -2,7 +2,7 @@
 
 > 本文是"从 CTF 专用 → 通用攻防/代审"重构的**设计基线**。开工前先 review；代码与本文冲突时以本文为准（或先改本文）。承接 [`rewrite-plan.md`](rewrite-plan.md) §0「任务=搜索」。
 
-> **更新（决策，取代下文 §1.4 / §2 的双模式设计）**：Capture/Assessment **两种模式已合并为一种行为**——不再有 `mission_mode` 开关。全系统只按 Assessment 式语义运行：executor 协作（不竞速、互不取消）、产物累积到黑板；`submit_flag` 降为"目标恰好带 flag 时把它记成已验证 Finding"的可选能力（flag_count≥1 才在提示词出现），不再驱动竞速或终止。**终止条件改为用户自定义**，见 `backend/termination.py:should_terminate`（默认永不提前终止，只受 `MAX_BUMPS` 与墙钟预算兜底）；原 §1.4 的递减收益终止已移除。TSecBench 平台 / 机械调度器 / Web **作为机械外壳保留**；CTF 的"平台判真即停"由调度器 poller 的 `challenge_solved` 外部 kill 完成，不在 swarm 内部。下文 §1.4、§2 的表格保留为历史设计记录。
+> **当前决策**：Capture/Assessment 两种模式已合并为一种行为，不再有 `mission_mode` 开关。executor 共享黑板、协作搜索；即使配置多个模型，也没有胜者选择或同伴取消。`submit_flag` 是目标带 flag 时记录已验证 Finding 的可选能力；平台确认任务完成后，由调度器结束该任务。终止规则见当前 Go 实现的 `internal/termination` 和调度器。
 
 ## 0. 核心抽象
 
@@ -17,8 +17,8 @@
 
 | | 产物 vs Goal | 终止 |
 |---|---|---|
-| **CTF** | 产物 = Goal = flag（flag 既是 Finding 又满足 Goal） | flag 到手 |
-| **渗透 / 攻防 / 代审** | Goal 弥散（评估范围）；产物 = 途中的 Finding，持续累积 | 预算 / 覆盖 / 边际收益递减 |
+| **CTF** | 产物 = Goal = flag（flag 既是 Finding 又满足 Goal） | 平台确认后由调度器结束任务 |
+| **渗透 / 攻防 / 代审** | Goal 弥散（评估范围）；产物 = 途中的 Finding，持续累积 | 预算 / 覆盖完成 |
 
 ## 1. 映射到现有内核
 
@@ -39,22 +39,15 @@
 ——这些是**认知结构**工具，不含任何"怎么打"的方法论。现有 http_request/tcp_send/run_python 不变。
 
 ### 1.4 终止谓词
-- **Capture 模式**：目标 Finding（flag）被确认 → 终止（可保留竞速：先得者结束）。
-- **Assessment 模式**：**所有未决 Sub-Goal 已解决 + 连续 N 步无新 Fact/Finding + 在预算内**（涌现式覆盖，见 §7.3）。预算耗尽亦终止。未验证候选还有未决的"验证 Sub-Goal"时不算完。
+- **任务内部**：根据未决 Sub-Goal、覆盖进展和预算判断执行器是否结束；未验证候选的验证 Sub-Goal 仍需处理。
+- **平台任务**：平台确认已解决后，调度器结束整个任务；不按哪个模型先得到 flag 选赢家。
 
 ### 1.5 Executor 池：协作而非竞速
-"solver" 重新定义为 **executor（执行单元）**——不绑定某道题，而是整个发现过程的执行力。多个 executor **共享同一 mission 黑板**，各自拉取下一个 Step/Sub-Goal、执行、写回。Capture 可保留竞速（先得 flag 者结束该 mission）；Assessment 下是**协作覆盖**、发现汇聚，互相不取消。
+"solver" 重新定义为 **executor（执行单元）**——不绑定某道题，而是整个发现过程的执行力。多个 executor **共享同一 mission 黑板**，各自拉取下一个 Step/Sub-Goal、执行、写回。各 executor 协作覆盖、汇聚发现，互相不取消。
 
-## 2. 两种 Mission 模式（同一内核，只换 4 个 policy）
+## 2. 统一 Mission 行为
 
-| policy | **Capture（现有 CTF）** | **Assessment（渗透/攻防/代审）** |
-|---|---|---|
-| Goal/终止 | 目标 Finding(flag) 到手 | 预算 / 覆盖 / 无新发现止损 |
-| oracle | 有（submit_flag 判真） | 无 |
-| 产物 | flag（= 终止目标） | Finding 持续累积，不终止 |
-| swarm | 竞速，先得者取消其余 | 协作覆盖，发现汇聚 |
-
-内核不变：LLM + 中性工具 + 机械调度 + scope-lock + tracing + 本地报告。
+所有任务使用同一套 LLM、黑板、中性工具、scope 约束、执行轨迹和报告。多个 executor 共享任务状态并协作。平台提供 oracle 时，`submit_flag` 可以确认 Finding；平台确认任务完成后，调度器统一结束任务。
 
 ## 3. scope = 强制授权边界（非可选）
 Assessment 模式必须以一份**显式授权范围**为输入（engagement 配置：目标/资产清单 + 交战规则 RoE + 目标描述）。agent 只在范围内行动——现有结构性 target-lock 升级为"engagement scope",**硬约束**。这既是真实渗透的法律/职业底线，也让工具始终处于"仅授权范围"的正道上。
@@ -79,7 +72,7 @@ Finding {
 黑板的 Findings → `report.json`（结构化）+ `report.md`（可读）+ 可选 `report.html`。含 run 元数据、每条 Finding、覆盖/耗时/token/成本汇总。Capture 模式的报告 = 解出的题 + flag + 证据。
 
 ## 6. 与 Less-Is-More 的关系（张力说明）
-加入黑板 + Goal/Finding 管理，比"自由 ReAct + 极简工具"**是多了结构**。但它加的是**领域中立的认知结构**（如何表示状态、目标、发现），**不是**攻击方法论、预设流程或 benchmark 拟合——模型每一步仍自由决策"怎么搜"。对弥散目标的长程搜索,显式状态是**必需**（上下文装不下整场 engagement 的事实）。因此与三原则不冲突：0 Skill/RAG/MCP、无角色多 agent、无预设攻击流程均保持。
+加入黑板 + Goal/Finding 管理，比"自由 ReAct + 极简工具"**是多了结构**。但它加的是**领域中立的认知结构**（如何表示状态、目标、发现），**不是**攻击方法论、预设流程或 benchmark 拟合——模型每一步仍自由决策"怎么搜"。对弥散目标的长程搜索,显式状态是**必需**（上下文装不下整场 engagement 的事实）。Playwright MCP 只提供通用浏览器探索能力，不增加预设攻击流程；0 Skill/RAG、无角色多 agent 的原则保持。
 
 ## 7. 决策（已定稿）
 

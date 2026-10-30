@@ -11,7 +11,9 @@ package scope
 import (
 	"net"
 	"net/netip"
+	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -96,6 +98,28 @@ func (s Scope) Entries() []string {
 	return append([]string(nil), s.raw...)
 }
 
+// SameTargets compares the actual host and network boundary, ignoring entry
+// order and URL presentation differences.
+func (s Scope) SameTargets(other Scope) bool {
+	if len(s.hosts) != len(other.hosts) || len(s.nets) != len(other.nets) {
+		return false
+	}
+	for host := range s.hosts {
+		if _, ok := other.hosts[host]; !ok {
+			return false
+		}
+	}
+	a, b := s.CIDRStrings(), other.CIDRStrings()
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // SubsetOf checks the entire child scope, including CIDR ranges, against an
 // authorization scope. A child may narrow a network but never widen it.
 func (s Scope) SubsetOf(parent Scope) bool {
@@ -151,7 +175,14 @@ func (s Scope) Hosts() []string {
 }
 
 func normalizeHost(token string) string {
-	t := schemeRe.ReplaceAllString(strings.TrimSpace(token), "")
+	t := strings.TrimSpace(token)
+	if schemeRe.MatchString(t) {
+		u, err := url.Parse(t)
+		if err != nil {
+			return ""
+		}
+		return strings.ToLower(u.Hostname())
+	}
 	if i := strings.IndexByte(t, '/'); i >= 0 {
 		t = t[:i] // drop any path
 	}

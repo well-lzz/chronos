@@ -17,6 +17,35 @@ import (
 	"github.com/well-lzz/chronos/internal/blackboard"
 )
 
+func TestSolverWithoutDeadlineRunsAndOmitsCountdown(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chat","object":"chat.completion","created":1,"model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"total_tokens":5}}`))
+	}))
+	defer server.Close()
+	cfg := openai.DefaultConfig("test")
+	cfg.BaseURL = server.URL + "/v1"
+	bb, err := blackboard.LoadOrNew("unlimited-test", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := int64(0)
+	s := New(Options{Model: "test", Client: openai.NewClientWithConfig(cfg), BB: bb, Tokens: &tokens})
+	result := s.RunUntilDoneOrGaveUp(context.Background())
+	if result.StopReason == "deadline" {
+		t.Fatalf("zero deadline forced a timeout: %+v", result)
+	}
+	messages := request["messages"].([]any)
+	prompt := messages[len(messages)-1].(map[string]any)["content"].(string)
+	if !strings.Contains(prompt, "No wall-clock deadline is set") {
+		t.Fatalf("unlimited prompt = %q", prompt)
+	}
+}
+
 func TestRetryableModelErrorResumesWithoutDuplicatePrompt(t *testing.T) {
 	var requests []map[string]any
 	var mu sync.Mutex

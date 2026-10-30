@@ -16,7 +16,11 @@ type Settings struct {
 	MaxBumps            int
 	SolverRetryDelayS   float64
 	AllowLocalExec      bool
+	PlaywrightMCP       bool
 	TargetInsecureTLS   bool
+	LLMRecord           bool
+	ToolRulesFile       string
+	WebhookURL          string
 
 	// Platform + scheduler (mechanical shell). The platform is a pluggable work
 	// source; TSecBench is one adapter (PlatformMode="tsec"), not a hard binding.
@@ -117,7 +121,11 @@ func Load() Settings {
 		MaxBumps:            getenvInt("MAX_BUMPS", 20),
 		SolverRetryDelayS:   getenvFloat("SOLVER_RETRY_DELAY_SECONDS", 2.0),
 		AllowLocalExec:      getenvBool("ALLOW_LOCAL_EXEC", false),
+		PlaywrightMCP:       getenvBool("CHRONOS_PLAYWRIGHT_MCP", true),
 		TargetInsecureTLS:   getenvBool("TARGET_INSECURE_TLS", false),
+		LLMRecord:           getenvBool("LLM_RECORD", false),
+		ToolRulesFile:       os.Getenv("CHRONOS_TOOL_RULES_FILE"),
+		WebhookURL:          os.Getenv("CHRONOS_WEBHOOK_URL"),
 
 		DeepSeekKey:           deepSeekKey,
 		DeepSeekKeys:          deepSeekKeys,

@@ -12,11 +12,90 @@ import (
 	"time"
 
 	"github.com/well-lzz/chronos/internal/blackboard"
+	"github.com/well-lzz/chronos/internal/browsermcp"
 	"github.com/well-lzz/chronos/internal/nettools"
 )
 
 // dispatch executes one tool call and returns the tool result text.
 func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
+	if s.waitIfPaused(ctx) != nil {
+		return "cancelled; call was not executed"
+	}
+	missionID := s.meta.Name
+	if s.bb != nil {
+		missionID = s.bb.MissionID
+	}
+	if blocked := s.preToolScope(name, argsJSON); blocked != "" {
+		if s.guard != nil {
+			s.guard.BuiltinDeny(missionID, s.ModelSpec, name, blocked)
+		}
+		return blocked
+	}
+	if s.guard != nil {
+		allowed, message := s.guard.Check(ctx, missionID, s.ModelSpec, name, argsJSON)
+		if !allowed {
+			return message
+		}
+	}
+	if s.bb != nil {
+		_ = s.bb.TouchMentioned(argsJSON)
+	}
+	result := s.dispatchCore(ctx, name, argsJSON)
+	if s.guard != nil {
+		s.guard.Post(missionID, s.ModelSpec, name, result)
+	}
+	return result
+}
+
+// preToolScope runs before operator rules; no allow or approval can widen the
+// authorized network boundary. Runtime redirects and Python sockets also keep
+// their existing scope guards.
+func (s *Solver) preToolScope(name, argsJSON string) string {
+	var host string
+	switch name {
+	case "browser_navigate":
+		var a struct {
+			URL string `json:"url"`
+		}
+		if json.Unmarshal([]byte(argsJSON), &a) != nil {
+			return ""
+		}
+		if err := browsermcp.CheckURL(a.URL, func(host string) bool { return s.scopeSnapshot().Allows(host) }); err != nil {
+			return "【平台管控·非目标防御】BLOCKED (scope lock): " + err.Error()
+		}
+		return ""
+	case "http_request":
+		var a struct {
+			URL string `json:"url"`
+		}
+		if json.Unmarshal([]byte(argsJSON), &a) != nil {
+			return ""
+		}
+		raw := a.URL
+		if !strings.Contains(raw, "://") {
+			raw = "http://" + raw
+		}
+		if parsed, err := url.Parse(raw); err == nil {
+			host = parsed.Hostname()
+		}
+	case "tcp_send":
+		var a struct {
+			Host string `json:"host"`
+		}
+		if json.Unmarshal([]byte(argsJSON), &a) != nil {
+			return ""
+		}
+		host = a.Host
+	default:
+		return ""
+	}
+	if ok, message := s.hostAllowed(host); !ok {
+		return message
+	}
+	return ""
+}
+
+func (s *Solver) dispatchCore(ctx context.Context, name, argsJSON string) string {
 	switch name {
 	case "http_request":
 		return s.toolHTTP(ctx, argsJSON)
@@ -30,6 +109,10 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 		return s.toolAddFinding(argsJSON)
 	case "verify_finding":
 		return s.toolVerifyFinding(argsJSON)
+	case "challenge_finding":
+		return s.toolChallengeFinding(argsJSON)
+	case "relate_findings":
+		return s.toolRelateFindings(argsJSON)
 	case "add_subgoal":
 		return s.toolAddSubgoal(argsJSON)
 	case "resolve_subgoal":
@@ -58,6 +141,9 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 	case "delegate_resume":
 		return s.toolDelegateResume(ctx, argsJSON)
 	default:
+		if isBrowserTool(name) {
+			return s.toolBrowser(ctx, name, argsJSON)
+		}
 		return "unknown tool: " + name
 	}
 }
@@ -153,29 +239,58 @@ func (s *Solver) toolTCP(ctx context.Context, argsJSON string) string {
 
 func (s *Solver) toolAddFact(argsJSON string) string {
 	var a struct {
-		Statement string `json:"statement"`
-		Evidence  string `json:"evidence"`
+		Statement    string   `json:"statement"`
+		Evidence     string   `json:"evidence"`
+		EvidenceRefs []evRef  `json:"evidence_refs"`
+		FromIDs      []string `json:"from_ids"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return "add_fact error: bad args"
 	}
-	id, err := s.bb.AddFact(a.Statement, a.Evidence, s.ModelSpec)
+	refs, warns := s.normalizeRefs(a.EvidenceRefs)
+	id, err := s.bb.AddFactWithRefs(a.Statement, a.Evidence, refs, s.ModelSpec)
 	if err != nil {
 		return "add_fact persistence error: " + err.Error()
 	}
-	return "fact " + id + " recorded."
+	if len(a.FromIDs) > 0 {
+		if err := s.bb.Link(id, a.FromIDs); err != nil {
+			return "fact " + id + " recorded; lineage error: " + err.Error()
+		}
+	}
+	message := "fact " + id + " recorded; verdict computed from graph."
+	if len(warns) > 0 {
+		message += " dropped refs: " + strings.Join(warns, "; ")
+	}
+	return message
+}
+
+func findingIdentity(title, target, category string) string {
+	normalize := func(value string) string {
+		return strings.ToLower(strings.Join(strings.Fields(value), " "))
+	}
+	return normalize(title) + "\x00" + normalize(target) + "\x00" + normalize(category)
+}
+
+func duplicateFindingID(bb *blackboard.Blackboard, title, target, category string) string {
+	identity := findingIdentity(title, target, category)
+	for _, finding := range bb.FindingsSorted() {
+		if findingIdentity(finding.Title, finding.Target, finding.Category) == identity {
+			return finding.ID
+		}
+	}
+	return ""
 }
 
 func (s *Solver) toolAddFinding(argsJSON string) string {
 	var a struct {
-		Title        string  `json:"title"`
-		Severity     string  `json:"severity"`
-		Target       string  `json:"target"`
-		Category     string  `json:"category"`
-		Evidence     string  `json:"evidence"`
-		Reproduction string  `json:"reproduction"`
-		Verified     bool    `json:"verified"`
-		EvidenceRefs []evRef `json:"evidence_refs"`
+		Title        string   `json:"title"`
+		Severity     string   `json:"severity"`
+		Target       string   `json:"target"`
+		Category     string   `json:"category"`
+		Evidence     string   `json:"evidence"`
+		Reproduction string   `json:"reproduction"`
+		EvidenceRefs []evRef  `json:"evidence_refs"`
+		FromIDs      []string `json:"from_ids"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return "add_finding error: bad args"
@@ -187,6 +302,23 @@ func (s *Solver) toolAddFinding(argsJSON string) string {
 		a.Target = s.meta.Name
 	}
 	refs, warns := s.normalizeRefs(a.EvidenceRefs)
+	if strings.TrimSpace(a.Title) == "" {
+		return "add_finding blocked: title is required"
+	}
+	if strings.TrimSpace(a.Evidence) == "" {
+		return "add_finding blocked: evidence must contain actual observations"
+	}
+	reproduction := strings.TrimSpace(a.Reproduction)
+	hasNumberedStep := strings.Contains(reproduction, "1.") || strings.Contains(reproduction, "1)") || strings.Contains(reproduction, "1、")
+	if reproduction == "" || !hasNumberedStep || !strings.Contains(strings.ToLower(reproduction), "expected:") {
+		return "add_finding blocked: reproduction must contain numbered steps and an Expected: success criterion"
+	}
+	if len(refs) == 0 {
+		return "add_finding blocked: at least one valid captured traffic evidence_ref is required"
+	}
+	if existing := duplicateFindingID(s.bb, a.Title, a.Target, a.Category); existing != "" {
+		return "add_finding blocked: finding " + existing + " already has the same title, target, and category; append a verification to that record instead"
+	}
 	id, err := s.bb.AddFinding(blackboard.Finding{
 		Title: a.Title, Severity: a.Severity, Target: a.Target, Category: a.Category,
 		Status: blackboard.Candidate, Evidence: a.Evidence, Reproduction: a.Reproduction,
@@ -194,6 +326,11 @@ func (s *Solver) toolAddFinding(argsJSON string) string {
 	})
 	if err != nil {
 		return "add_finding persistence error: " + err.Error()
+	}
+	if len(a.FromIDs) > 0 {
+		if err := s.bb.Link(id, a.FromIDs); err != nil {
+			return "finding " + id + " recorded; lineage error: " + err.Error()
+		}
 	}
 	assignee := s.ModelSpec
 	if s.verificationPeer != nil {
@@ -206,7 +343,8 @@ func (s *Solver) toolAddFinding(argsJSON string) string {
 		return "finding " + id + " recorded, but verification assignment failed: " + err.Error()
 	}
 	s.rec("verify_assign", id, fmt.Sprintf("%s assigned to %s for independent verification", goalID, assignee))
-	msg := fmt.Sprintf("finding %s recorded as candidate; verification goal %s assigned to %s.", id, goalID, assignee)
+	verdict, reason, _ := s.bb.ClaimVerdict(id)
+	msg := fmt.Sprintf("finding %s recorded as %s (%s); verification goal %s assigned to %s.", id, verdict, reason, goalID, assignee)
 	if len(refs) > 0 {
 		var ids []string
 		for _, r := range refs {
@@ -246,6 +384,21 @@ func (s *Solver) toolVerifyFinding(argsJSON string) string {
 	if (status == blackboard.Verified || status == blackboard.Refuted) && len(refs) == 0 {
 		return "verify_finding blocked: reproduced/refuted verdict requires a real captured traffic evidence_ref"
 	}
+	if strings.TrimSpace(a.Summary) == "" || strings.TrimSpace(a.Evidence) == "" {
+		return "verify_finding blocked: summary and actual replay observations or blocker evidence are required"
+	}
+	if status == blackboard.Verified || status == blackboard.Refuted {
+		hasVerificationTraffic := false
+		for _, ref := range refs {
+			if ref.Role == "verification" {
+				hasVerificationTraffic = true
+				break
+			}
+		}
+		if !hasVerificationTraffic {
+			return "verify_finding blocked: reproduced/refuted verdict requires new replay traffic with role=verification"
+		}
+	}
 	persisted, err := s.bb.VerifyFinding(a.FindingID, status, a.Summary, a.Evidence, refs, s.ModelSpec)
 	if err != nil {
 		return "verify_finding persistence error: " + err.Error()
@@ -253,16 +406,56 @@ func (s *Solver) toolVerifyFinding(argsJSON string) string {
 	if !persisted {
 		return "no finding " + a.FindingID + "."
 	}
-	msg := "finding " + a.FindingID + " -> " + status + "."
+	computed, reason, _ := s.bb.ClaimVerdict(a.FindingID)
+	msg := "finding " + a.FindingID + " verification recorded; graph verdict: " + computed + " (" + reason + ")."
 	if len(warns) > 0 {
 		msg += " dropped refs: " + strings.Join(warns, "; ")
 	}
 	return msg
 }
 
+func (s *Solver) toolChallengeFinding(argsJSON string) string {
+	var a struct {
+		TargetID     string  `json:"target_id"`
+		Reason       string  `json:"reason"`
+		EvidenceRefs []evRef `json:"evidence_refs"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+		return "challenge_finding error: bad args"
+	}
+	refs, warns := s.normalizeRefs(a.EvidenceRefs)
+	id, err := s.bb.ChallengeFinding(a.TargetID, a.Reason, refs, s.ModelSpec)
+	if err != nil {
+		return "challenge_finding error: " + err.Error()
+	}
+	verdict, reason, _ := s.bb.ClaimVerdict(a.TargetID)
+	msg := fmt.Sprintf("challenge %s recorded; %s is %s (%s).", id, a.TargetID, verdict, reason)
+	if len(warns) > 0 {
+		msg += " dropped refs: " + strings.Join(warns, "; ")
+	}
+	return msg
+}
+
+func (s *Solver) toolRelateFindings(argsJSON string) string {
+	var a struct {
+		A    string `json:"a"`
+		B    string `json:"b"`
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+		return "relate_findings error: bad args"
+	}
+	if err := s.bb.RelateClaims(a.A, a.B, a.Kind, s.ModelSpec); err != nil {
+		return "relate_findings error: " + err.Error()
+	}
+	verdict, reason, _ := s.bb.ClaimVerdict(a.B)
+	return fmt.Sprintf("%s %s -> %s recorded; target verdict %s (%s).", a.Kind, a.A, a.B, verdict, reason)
+}
+
 func (s *Solver) toolAddSubgoal(argsJSON string) string {
 	var a struct {
-		Description string `json:"description"`
+		Description string   `json:"description"`
+		FromIDs     []string `json:"from_ids"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return "add_subgoal error: bad args"
@@ -270,6 +463,11 @@ func (s *Solver) toolAddSubgoal(argsJSON string) string {
 	id, err := s.bb.AddSubgoal(a.Description, s.ModelSpec)
 	if err != nil {
 		return "add_subgoal persistence error: " + err.Error()
+	}
+	if len(a.FromIDs) > 0 {
+		if err := s.bb.Link(id, a.FromIDs); err != nil {
+			return "sub-goal " + id + " added; lineage error: " + err.Error()
+		}
 	}
 	return "sub-goal " + id + " added."
 }
@@ -335,7 +533,7 @@ func (s *Solver) toolSubmitFlag(argsJSON string) string {
 			s.flagComplete = complete
 			if _, err := s.bb.AddFinding(blackboard.Finding{
 				Title: "flag: " + a.Flag, Target: s.meta.Name, Category: "flag",
-				Severity: "info", Status: blackboard.Verified, Evidence: display, FoundBy: s.ModelSpec,
+				Severity: "info", Oracle: true, Evidence: display, FoundBy: s.ModelSpec,
 			}); err != nil {
 				return display + "\nflag persistence error: " + err.Error()
 			}
@@ -346,9 +544,9 @@ func (s *Solver) toolSubmitFlag(argsJSON string) string {
 	s.flagComplete = true
 	if _, err := s.bb.AddFinding(blackboard.Finding{
 		Title: "flag: " + a.Flag, Target: s.meta.Name, Category: "flag",
-		Severity: "info", Status: blackboard.Verified, Evidence: "submitted by model (no oracle)", FoundBy: s.ModelSpec,
+		Severity: "info", Evidence: "submitted by model (no oracle)", FoundBy: s.ModelSpec,
 	}); err != nil {
 		return "flag persistence error: " + err.Error()
 	}
-	return "flag recorded as a verified finding: " + a.Flag
+	return "flag recorded as an unverified claim (no platform oracle): " + a.Flag
 }

@@ -19,6 +19,7 @@ type SummaryStats struct {
 	OmittedGoals      int    `json:"omitted_goals"`
 	BudgetOverflow    bool   `json:"budget_overflow"`
 	ActiveClaims      int    `json:"active_claims"`
+	Digests           int    `json:"digests"`
 }
 
 const (
@@ -47,6 +48,13 @@ func (b *Blackboard) summarySince(since uint64, budget int, delta bool) (string,
 	allFindings := b.FindingsSorted() // shared severity-first ordering used by reports
 	facts := b.FactsOrdered()
 	allGoals := b.SubgoalsOrdered()
+	digests := b.Digests()
+	covered := map[string]bool{}
+	for _, digest := range digests {
+		for _, id := range digest.MemberIDs {
+			covered[id] = true
+		}
+	}
 	leases := b.ActiveLeases()
 	leaseEvents := b.LeaseEventsSince(since)
 	findings, goals := allFindings, allGoals
@@ -54,8 +62,15 @@ func (b *Blackboard) summarySince(since uint64, budget int, delta bool) (string,
 		findings = filterFindings(findings, since)
 		facts = filterFacts(facts, since)
 		goals = filterGoals(goals, since)
+		filtered := digests[:0]
+		for _, digest := range digests {
+			if digest.Revision > since {
+				filtered = append(filtered, digest)
+			}
+		}
+		digests = filtered
 	}
-	if len(findings)+len(facts)+len(goals) == 0 && ((!delta && len(leases) == 0) || (delta && len(leaseEvents) == 0)) {
+	if len(findings)+len(facts)+len(goals)+len(digests) == 0 && ((!delta && len(leases) == 0) || (delta && len(leaseEvents) == 0)) {
 		return "", stats
 	}
 
@@ -88,6 +103,9 @@ func (b *Blackboard) summarySince(since uint64, budget int, delta bool) (string,
 	mandatory := make([]Finding, 0)
 	optional := make([]Finding, 0)
 	for _, f := range findings {
+		if covered[f.ID] && f.Status != Verified && f.Severity != "critical" && f.Severity != "high" {
+			continue
+		}
 		if f.Status == Verified || f.Severity == "critical" || f.Severity == "high" {
 			mandatory = append(mandatory, f)
 		} else if f.Status == Candidate || f.Status == Inconclusive {
@@ -109,6 +127,17 @@ func (b *Blackboard) summarySince(since uint64, budget int, delta bool) (string,
 			stats.BudgetOverflow = true
 		}
 		stats.MandatoryFindings++
+	}
+	if len(digests) > 0 {
+		out.WriteString("cold digests (full members remain in the report):\n")
+		for _, digest := range digests {
+			line := fmt.Sprintf("- [%s] members %s: %s\n", digest.ID, strings.Join(digest.MemberIDs, ","), clip(digest.Text, 1200))
+			if !appendLine(line) {
+				out.WriteString(fmt.Sprintf("- [%s] members %s; see report\n", digest.ID, strings.Join(digest.MemberIDs, ",")))
+				stats.BudgetOverflow = true
+			}
+			stats.Digests++
+		}
 	}
 	openText := openGoalText(allGoals)
 	if len(goals) > 0 {
@@ -146,7 +175,10 @@ func (b *Blackboard) summarySince(since uint64, budget int, delta bool) (string,
 			return facts[i].Revision > facts[j].Revision
 		})
 		for _, f := range facts {
-			line := fmt.Sprintf("- [%s] %s\n", f.ID, clip(f.Statement, 220))
+			if covered[f.ID] {
+				continue
+			}
+			line := fmt.Sprintf("- [%s] (%s: %s) %s\n", f.ID, f.Verdict, clip(f.VerdictReason, 90), clip(f.Statement, 180))
 			if !appendLine(line) {
 				stats.OmittedFacts++
 			}
@@ -201,6 +233,9 @@ func (b *Blackboard) summarySince(since uint64, budget int, delta bool) (string,
 
 func findingLine(f Finding, titleLimit int) string {
 	line := fmt.Sprintf("- [%s] (%s/%s)", f.ID, f.Status, f.Severity)
+	if f.VerdictReason != "" {
+		line += " — " + clip(f.VerdictReason, 105)
+	}
 	if titleLimit > 0 {
 		line += " " + clip(f.Title, titleLimit)
 		if f.Target != "" {

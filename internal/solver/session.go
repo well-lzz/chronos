@@ -17,6 +17,7 @@ type sessionEvent struct {
 	Message  *openai.ChatCompletionMessage  `json:"message,omitempty"`
 	Messages []openai.ChatCompletionMessage `json:"messages,omitempty"`
 	Step     int                            `json:"step"`
+	Turn     int                            `json:"turn,omitempty"`
 	Context  *ContextEvent                  `json:"context,omitempty"`
 }
 
@@ -24,6 +25,7 @@ type sessionState struct {
 	messages []openai.ChatCompletionMessage
 	pending  []openai.ChatCompletionMessage
 	step     int
+	turn     int
 }
 
 func appendSessionEvent(path string, event sessionEvent) error {
@@ -89,11 +91,16 @@ func loadSession(path string) (sessionState, error) {
 			state.messages = event.Messages
 		case "context":
 			// Audit-only event; no effect on active model state.
+		case "turn":
+			// Turn counters survive transcript compaction and process restarts.
 		default:
 			return sessionState{}, fmt.Errorf("unknown session event %q", event.Type)
 		}
 		if event.Step > state.step {
 			state.step = event.Step
+		}
+		if event.Turn > state.turn {
+			state.turn = event.Turn
 		}
 	}
 	return state, nil

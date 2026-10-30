@@ -29,12 +29,13 @@ type RunMeta struct {
 }
 
 type report struct {
-	Mission     map[string]any       `json:"mission"`
-	GeneratedAt string               `json:"generated_at"`
-	Summary     map[string]int       `json:"summary"`
-	Findings    []blackboard.Finding `json:"findings"`
-	Facts       []blackboard.Fact    `json:"facts"`
-	Subgoals    []blackboard.SubGoal `json:"subgoals"`
+	Mission       map[string]any           `json:"mission"`
+	GeneratedAt   string                   `json:"generated_at"`
+	Summary       map[string]int           `json:"summary"`
+	Findings      []blackboard.Finding     `json:"findings"`
+	Facts         []blackboard.Fact        `json:"facts"`
+	Subgoals      []blackboard.SubGoal     `json:"subgoals"`
+	EvidenceGraph blackboard.GraphSnapshot `json:"evidence_graph"`
 }
 
 func build(bb *blackboard.Blackboard, rm RunMeta) report {
@@ -64,12 +65,13 @@ func build(bb *blackboard.Blackboard, rm RunMeta) report {
 		mi["cost_usd"] = rm.CostUSD
 	}
 	return report{
-		Mission:     mi,
-		GeneratedAt: time.Now().Format("2006-01-02 15:04:05 -0700"),
-		Summary:     bb.Counts(),
-		Findings:    bb.FindingsSorted(),
-		Facts:       bb.FactsOrdered(),
-		Subgoals:    bb.SubgoalsOrdered(),
+		Mission:       mi,
+		GeneratedAt:   time.Now().Format("2006-01-02 15:04:05 -0700"),
+		Summary:       bb.Counts(),
+		Findings:      bb.FindingsSorted(),
+		Facts:         bb.FactsOrdered(),
+		Subgoals:      bb.SubgoalsOrdered(),
+		EvidenceGraph: bb.Graph(),
 	}
 }
 
@@ -148,6 +150,7 @@ func renderMarkdown(r report) string {
 	}
 	for _, f := range r.Findings {
 		w(fmt.Sprintf("### [%s] %s  ·  _%s_", strings.ToUpper(f.Severity), f.Title, f.Status))
+		w("- **Computed verdict**: " + blackboard.Verdict(f.Status) + " — " + f.VerdictReason)
 		if f.Target != "" {
 			w("- **Target**: " + f.Target)
 		}
@@ -212,10 +215,32 @@ func renderMarkdown(r report) string {
 	if len(r.Facts) > 0 {
 		w("## Established facts")
 		for _, x := range r.Facts {
-			w("- " + x.Statement)
+			w("- [" + x.ID + "] " + x.Statement + " — " + x.Verdict + ": " + x.VerdictReason)
 		}
 		w("")
 	}
+	w("## Evidence argument graph")
+	w(fmt.Sprintf("%d claims, %d evidence nodes, %d verification attempts, %d edges.", len(r.EvidenceGraph.Claims), len(r.EvidenceGraph.Evidence), len(r.EvidenceGraph.Verifications), len(r.EvidenceGraph.Edges)))
+	w("")
+	w("### Claims")
+	for _, claim := range r.EvidenceGraph.Claims {
+		w(fmt.Sprintf("- `%s` (%s): %s — %s: %s", claim.ID, claim.Kind, claim.Text, claim.Verdict, claim.Reason))
+	}
+	w("")
+	w("### Verification attempts")
+	for _, attempt := range r.EvidenceGraph.Verifications {
+		w(fmt.Sprintf("- `%s` → `%s`: %s — %s", attempt.ID, attempt.FindingID, attempt.Outcome, attempt.Summary))
+	}
+	w("")
+	w("### Edges")
+	for _, edge := range r.EvidenceGraph.Edges {
+		line := fmt.Sprintf("- `%s` —%s→ `%s`", edge.From, edge.Kind, edge.To)
+		if edge.Role != "" {
+			line += " (" + edge.Role + ")"
+		}
+		w(line)
+	}
+	w("")
 	if len(r.Subgoals) > 0 {
 		w("## Sub-goals (coverage checklist)")
 		for _, g := range r.Subgoals {
@@ -284,6 +309,7 @@ func renderHTML(r report) string {
 		w("<div class='card'>")
 		w(fmt.Sprintf("<h3><span class='sev' style='background:%s'>%s</span> %s<span class='status'>%s</span></h3>",
 			color, h(strings.ToUpper(f.Severity)), h(f.Title), h(f.Status)))
+		w("<p><b>Computed verdict:</b> " + h(blackboard.Verdict(f.Status)) + " — " + h(f.VerdictReason) + "</p>")
 		if f.Target != "" {
 			w("<p><b>Target:</b> " + h(f.Target) + "</p>")
 		}
@@ -337,10 +363,27 @@ func renderHTML(r report) string {
 	if len(r.Facts) > 0 {
 		w("<h2>Established facts</h2><ul>")
 		for _, x := range r.Facts {
-			w("<li>" + h(x.Statement) + "</li>")
+			w("<li>" + h(x.Statement) + " — " + h(x.Verdict) + ": " + h(x.VerdictReason) + "</li>")
 		}
 		w("</ul>")
 	}
+	w("<h2>Evidence argument graph</h2><h3>Claims</h3><ul>")
+	for _, claim := range r.EvidenceGraph.Claims {
+		w("<li><code>" + h(claim.ID) + "</code> (" + h(claim.Kind) + "): " + h(claim.Text) + " — " + h(claim.Verdict) + ": " + h(claim.Reason) + "</li>")
+	}
+	w("</ul><h3>Verification attempts</h3><ul>")
+	for _, attempt := range r.EvidenceGraph.Verifications {
+		w("<li><code>" + h(attempt.ID) + "</code> → <code>" + h(attempt.FindingID) + "</code>: " + h(attempt.Outcome) + " — " + h(attempt.Summary) + "</li>")
+	}
+	w("</ul><h3>Edges</h3><ul>")
+	for _, edge := range r.EvidenceGraph.Edges {
+		line := "<code>" + h(edge.From) + "</code> —" + h(edge.Kind) + "→ <code>" + h(edge.To) + "</code>"
+		if edge.Role != "" {
+			line += " (" + h(edge.Role) + ")"
+		}
+		w("<li>" + line + "</li>")
+	}
+	w("</ul>")
 	if len(r.Subgoals) > 0 {
 		w("<h2>Sub-goals (coverage checklist)</h2><ul>")
 		for _, g := range r.Subgoals {

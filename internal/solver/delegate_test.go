@@ -19,6 +19,16 @@ import (
 	"github.com/well-lzz/chronos/internal/scope"
 )
 
+func TestDelegateWithoutDeadline(t *testing.T) {
+	s := New(Options{})
+	if reason := s.delegateGate(); reason != "" {
+		t.Fatalf("unlimited delegation was blocked: %s", reason)
+	}
+	if deadline := s.childDeadline(); !deadline.IsZero() {
+		t.Fatalf("unlimited parent created child deadline: %v", deadline)
+	}
+}
+
 func TestDelegateUsesIsolatedWindowAndReturnsOwnedArtifacts(t *testing.T) {
 	var mu sync.Mutex
 	var requests []map[string]any

@@ -1,0 +1,29 @@
+{
+  "models": [
+    {
+      "name": "primary",
+      "provider": "operator-chosen-provider",
+      "model": "operator-chosen-model-id",
+      "base_url": "https://models.example.com/v1",
+      "api_key_env": "PRIMARY_MODEL_API_KEY",
+      "context_window_tokens": 128000,
+      "fallbacks": [
+        {
+          "name": "primary-backup",
+          "model": "operator-chosen-backup-id",
+          "base_url": "https://backup-models.example.com/v1",
+          "api_key_env": "BACKUP_MODEL_API_KEY",
+          "context_window_tokens": 128000,
+          "priority": 1
+        }
+      ]
+    },
+    {
+      "name": "verification",
+      "provider": "another-provider",
+      "model": "another-model-id",
+      "base_url": "https://other-models.example.com/v1",
+      "api_key_env": "VERIFICATION_MODEL_API_KEY"
+    }
+  ]
+}

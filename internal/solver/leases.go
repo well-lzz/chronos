@@ -108,7 +108,7 @@ func (s *Solver) toolReleaseSurface(argsJSON string) string {
 
 func (s *Solver) requireMutationLease(surface string) string {
 	if err := s.bb.HoldSurface(surface, s.ModelSpec); err != nil {
-		return "BLOCKED (coordination): " + err.Error()
+		return "【平台管控·非目标防御】BLOCKED (coordination): " + err.Error()
 	}
 	return ""
 }

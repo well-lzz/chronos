@@ -6,7 +6,7 @@
 
 - **并发模型最贴**：并行 executor + 共享黑板/流量，goroutine + mutex 比 asyncio 更直白。
 - **OpenAI 兼容**：`go-openai` 直吃 DeepSeek / Qwen / GLM 的兼容端点；agent 循环自己写（~1 个包），不引框架——契合 Less-Is-More。
-- **单静态二进制**：丢到机器上就能跑，无需 venv/uv。
+- **单静态核心二进制**：HTTP/TCP/黑板等核心能力无需 venv/uv；Playwright MCP 浏览器能力另需 Node.js 与 Chromium。
 - 与作者的 [ARTEX](https://github.com/well-lzz/ARTEX) 同栈，便于维护。
 
 唯一外部依赖：`github.com/sashabaranov/go-openai`。engagement 配置用 **JSON**（stdlib，无额外依赖）。
@@ -30,6 +30,7 @@ chronos                               # 默认：对 TSec 平台跑机械调度�
 chronos --web                         # 调度器 + Web 控制台（默认 http://127.0.0.1:8000）
 chronos --engagement <config.json>    # 一次真实授权评估（无平台/调度器）
   --model SPEC         模型规格，可重复（默认 deepseek/deepseek-chat）
+  --models-file PATH   操作人员提供的 OpenAI 兼容模型配置（与 --model 二选一）
   --allow-exec         显式允许 run_python（不安全；仅在隔离环境使用）
   --no-exec            关闭 run_python（兼容参数；默认已关闭）
   --time-limit N       单任务墙钟秒数（默认取配置）
@@ -60,9 +61,10 @@ chronos --engagement <config.json>    # 一次真实授权评估（无平台/调
 ## 包结构（`internal/`）
 
 - `scope` — 授权范围匹配（host + CIDR），三处出网工具唯一判定；空=拒绝一切。
+- 操作人员更换授权目标时创建新的隔离运行 ID；旧 executor 先停止，黑板、流量、会话和运行计数不跨目标复用，中断恢复仍保留原运行 ID。
 - `blackboard` — Fact / Finding（含 evidence_refs + 追加式 verifications，原证据不可变）/ Sub-Goal；JSON 落盘。
 - `traffic` — per-mission 流量日志（真实请求/响应对作证据），JSONL 落盘。
-- `engagement` — JSON 配置加载 + **空 scope 拒绝** + ToMeta。
+- `engagement` — JSON 配置加载 + ToMeta；无 Web 的空 scope 拒绝，Web 可暂停等待操作人员设置并持久化 scope。
 - `prompts` — 统一中性契约（Finding 为核心；带 flag 才出现 submit_flag）。
 - `termination` — `ShouldTerminate(bb, state)` 用户钩子（默认永不提前停）。
 - `report` — JSON + Markdown + HTML（含证据流量、验证历史）。
@@ -79,7 +81,7 @@ chronos --engagement <config.json>    # 一次真实授权评估（无平台/调
 
 控制台前端是 `web/` 下的 **Next.js（App Router，React 19）** 应用，`output: 'export'` 静态导出后**嵌进 Go 二进制**，单二进制部署不变。
 
-运行时会生成一次性的操作员令牌，并把认证入口打印为 `http://127.0.0.1:8000/#operator=...`。令牌只保存在浏览器 `sessionStorage`，不会写入页面或暴露给 Agent 工具；所有控制、模型配置和 Scope 更新接口都要求该令牌。engagement 模式允许操作员在界面替换 Scope，solver 在每次 HTTP/TCP/脚本调用时读取当前边界并强制校验。对话采用独立的无工具回复回合，因此即使执行器暂停或正忙，操作员仍会得到明确回复；消息本身不能修改 Scope。
+本地控制台无需操作员令牌，打开 `http://127.0.0.1:8000` 即可使用控制、模型配置和 Scope 更新接口。服务仅允许监听 loopback 地址，并拦截跨源写请求；不要暴露到局域网或公网。engagement 模式允许操作员在界面替换 Scope，solver 在每次 HTTP/TCP/脚本调用时读取当前边界并强制校验。对话采用独立的无工具回复回合，因此即使执行器暂停或正忙，操作员仍会得到明确回复；消息本身不能修改 Scope。
 
 ```bash
 cd web && npm ci && npm run build        # 产出 web/out/
@@ -94,8 +96,8 @@ cd .. && go build -o chronos ./cmd/chronos
 ## 与 Python 版的等价性
 
 - **scope lock**：host + CIDR，`http_request`/`tcp_send` 在 Go 侧判定；`run_python` 的 socket 由 python 预序列护栏锁定——护栏用**闭包封装**，内部句柄/允许集不泄漏为全局（修掉了 Python 版那段预序列可被模型代码绕过的问题）。它是"防意外漂移"的结构性护栏，**不是**对抗蓄意逆向的沙箱（真隔离需 OS 级边界）。
-- **证据链**：流量 ID → `evidence_refs{ref, role}`（baseline/proof/verification/supporting）→ 报告带可复现报文。
-- **验证**：`verify_finding` 判决 `reproduced|refuted|inconclusive`，追加记录、原证据不可变。
+- **证据链**：流量 ID → `evidence_refs{ref, role}`（baseline/proof/verification/supporting）→ 报告带可复现报文。复现步骤采用编号步骤 + `Expected:` 成功判据，并明确 CSRF、上传资源 URL 等动态值提取。
+- **验证**：`verify_finding` 先原样重放 reproduction，判决 `reproduced|refuted|inconclusive`；确认/驳回需要实际观察和本次 `verification` 流量，追加记录、原证据不可变。间接异常不能单独证明机制，完全相同的 title + target + category 会被保守去重。
 - **终止**：无内置，交给 `termination.ShouldTerminate`。
 
 ## 未实测边界

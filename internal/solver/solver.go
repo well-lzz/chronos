@@ -17,6 +17,9 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 
 	"github.com/well-lzz/chronos/internal/blackboard"
+	"github.com/well-lzz/chronos/internal/browsermcp"
+	"github.com/well-lzz/chronos/internal/guard"
+	"github.com/well-lzz/chronos/internal/llmrec"
 	"github.com/well-lzz/chronos/internal/mission"
 	"github.com/well-lzz/chronos/internal/prompts"
 	"github.com/well-lzz/chronos/internal/scope"
@@ -53,22 +56,29 @@ type SubmitFn func(flag string) (display string, confirmed, complete bool)
 
 // Options configures a Solver.
 type Options struct {
-	ModelSpec   string
-	Model       string
-	Client      *openai.Client
-	Meta        mission.Meta
-	Scope       scope.Scope
-	BB          *blackboard.Blackboard
-	TL          *traffic.Log
-	AllowExec   bool
-	InsecureTLS bool
-	Deadline    time.Time
-	Tokens      *int64
-	Notify      func(string)
+	ModelSpec     string
+	Model         string
+	Client        *openai.Client
+	Meta          mission.Meta
+	Scope         scope.Scope
+	BB            *blackboard.Blackboard
+	TL            *traffic.Log
+	AllowExec     bool
+	PlaywrightMCP bool
+	InsecureTLS   bool
+	Deadline      time.Time
+	Tokens        *int64
+	LLMRecorder   *llmrec.Recorder
+	Complete      func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error)
+	Paused        func() bool
+	WaitPaused    func(context.Context) error
+	Guard         *guard.Manager
+	Notify        func(string)
 	// SubmitFn, when set, makes submit_flag go to the platform; nil = record-only.
 	SubmitFn SubmitFn
 	// Record, when set, receives each step for live observation (web console).
 	Record        func(step int, kind, tool, text string)
+	RecordEvent   func(LoopEvent)
 	RecordContext func(ContextEvent)
 	// ContextWindow resolves the active model's configured token window each cycle.
 	ContextWindow       func(model string) int
@@ -98,23 +108,35 @@ type Solver struct {
 	Model     string
 	client    *openai.Client
 
-	meta        mission.Meta
-	scope       scope.Scope
-	bb          *blackboard.Blackboard
-	tl          *traffic.Log
-	allowExec   bool
-	insecureTLS bool
-	deadline    time.Time
+	meta          mission.Meta
+	scope         scope.Scope
+	bb            *blackboard.Blackboard
+	tl            *traffic.Log
+	allowExec     bool
+	playwrightMCP bool
+	browser       *browsermcp.Client
+	browserMu     sync.Mutex
+	browserURL    string
+	browserWarned bool
+	insecureTLS   bool
+	deadline      time.Time
 
 	messages            []openai.ChatCompletionMessage
 	pendingUser         []openai.ChatCompletionMessage // operator/peer input, inserted only before a model request
 	resumeCycle         bool                           // retry a failed model request without duplicating the cycle prompt
 	started             bool
 	steps               int
+	turns               int
 	tokens              *int64 // shared token counter (mission-wide)
+	llmRecorder         *llmrec.Recorder
+	complete            func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error)
+	paused              func() bool
+	waitPaused          func(context.Context) error
+	guard               *guard.Manager
 	notify              func(string)
 	submitFn            SubmitFn
 	record              func(step int, kind, tool, text string)
+	recordEvent         func(LoopEvent)
 	recordContext       func(ContextEvent)
 	contextWindow       func(model string) int
 	lastPromptTokens    int
@@ -147,8 +169,6 @@ type Solver struct {
 	messageMu           sync.Mutex
 	scopeMu             sync.RWMutex
 	modelMu             sync.RWMutex
-	chatMu              sync.Mutex
-	chatHistory         []openai.ChatCompletionMessage
 	sessionPath         string
 }
 
@@ -177,8 +197,9 @@ func New(o Options) *Solver {
 	}
 	return &Solver{
 		ModelSpec: o.ModelSpec, Model: o.Model, client: o.Client, meta: o.Meta, scope: o.Scope,
-		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, insecureTLS: o.InsecureTLS, deadline: o.Deadline, tokens: o.Tokens,
-		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record, recordContext: o.RecordContext,
+		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, playwrightMCP: o.PlaywrightMCP, insecureTLS: o.InsecureTLS, deadline: o.Deadline, tokens: o.Tokens,
+		llmRecorder: o.LLMRecorder, complete: o.Complete, paused: o.Paused, waitPaused: o.WaitPaused, guard: o.Guard,
+		notify: o.Notify, submitFn: o.SubmitFn, record: o.Record, recordEvent: o.RecordEvent, recordContext: o.RecordContext,
 		contextWindow: o.ContextWindow, resolve: o.Resolve, sessionPath: o.SessionPath,
 		depth: o.Depth, maxDelegateDepth: o.MaxDelegateDepth, maxDelegateChildren: o.MaxDelegateChildren,
 		maxDelegateSteps: o.MaxDelegateSteps, minRemainingToSpawn: o.MinRemainingToSpawn,
@@ -199,6 +220,14 @@ func (s *Solver) recAt(step int, kind, tool, text string) {
 	}
 }
 
+func (s *Solver) loopEvent(event LoopEvent) {
+	if s.recordEvent != nil {
+		s.recordEvent(event)
+		return
+	}
+	s.recAt(event.Step, event.Kind, event.Tool, event.Text)
+}
+
 func (s *Solver) start() {
 	s.messageMu.Lock()
 	defer s.messageMu.Unlock()
@@ -211,7 +240,7 @@ func (s *Solver) start() {
 			log.Printf("session recovery failed (%s): %v", s.sessionPath, err)
 			s.sessionPath = ""
 		} else {
-			s.messages, s.pendingUser, s.steps = state.messages, state.pending, state.step
+			s.messages, s.pendingUser, s.steps, s.turns = state.messages, state.pending, state.step, state.turn
 		}
 	}
 	if len(s.messages) == 0 || s.messages[0].Role != openai.ChatMessageRoleSystem {
@@ -251,6 +280,12 @@ func (s *Solver) systemPrompt() string {
 	current := s.scopeSnapshot()
 	meta.ConnectionInfo = strings.Join(current.Entries(), ", ")
 	sys := prompts.BuildHeadlessPrompt(meta, 0, s.allowExec && pythonAvailable())
+	s.browserMu.Lock()
+	browserReady := s.browser != nil
+	s.browserMu.Unlock()
+	if browserReady {
+		sys += "\n\n## Browser exploration\nPlaywright MCP browser tools are available. Start with browser_navigate on an in-scope HTTP(S) URL, then inspect the accessibility snapshot and interact as needed. Claim the target surface before click, typing, form entry or key actions. Browser observations are exploratory; reproduce important evidence with http_request to obtain a traffic ID for findings."
+	}
 	if s.agentID != "" {
 		sys += "\n\n## Delegated investigation\nInvestigate only the delegated task. Record evidence and findings on the shared blackboard, then return a concise conclusion. Your tool activity is reported in your own child stream."
 	}
@@ -290,11 +325,14 @@ func (s *Solver) SetScope(next scope.Scope) {
 		// Delegated agents may only lose authority, even if scope updates race.
 		next = s.scope.Within(next)
 	}
+	changed := !s.scope.SameTargets(next)
 	s.scope = next
 	s.scopeMu.Unlock()
-	s.chatMu.Lock()
-	s.chatHistory = nil
-	s.chatMu.Unlock()
+	// Existing HTTPS tunnels may outlive a single request. Restart the isolated
+	// browser so a changed scope cannot reuse an authorized old connection.
+	if changed {
+		s.CloseBrowser()
+	}
 	s.messageMu.Lock()
 	if s.started && len(s.messages) > 0 {
 		s.messages[0].Content = s.systemPrompt()
@@ -315,74 +353,6 @@ func (s *Solver) scopeSnapshot() scope.Scope {
 }
 
 func (s *Solver) Deadline() time.Time { return s.deadline }
-
-// ReplyToOperator runs a separate no-tools conversation turn so every operator
-// message receives a direct answer even while the autonomous execution loop is
-// paused or busy. The same message is independently queued through Guide for
-// execution; this method only communicates status and intent.
-func (s *Solver) ReplyToOperator(ctx context.Context, message string, paused bool) (string, error) {
-	s.chatMu.Lock()
-	defer s.chatMu.Unlock()
-
-	s.modelMu.RLock()
-	client, model := s.client, s.Model
-	s.modelMu.RUnlock()
-	if s.resolve != nil {
-		var err error
-		client, model, err = s.resolve()
-		if err != nil {
-			return "", err
-		}
-	}
-	if client == nil {
-		return "", errors.New("model is not configured")
-	}
-
-	state := "running"
-	if paused {
-		state = "paused; execution instructions are queued until the operator resumes it"
-	}
-	currentScope := s.scopeSnapshot().Describe()
-	system := "You are the Chronos security-assessment Agent speaking directly with its human operator. " +
-		"Reply concisely in the operator's language. This is a conversation response, so do not call tools and do not claim an action has completed unless the supplied status says so. " +
-		"The execution state is " + state + ". The current authorized scope is exactly: " + currentScope + ". " +
-		"If the request names a target outside that scope, clearly say it is blocked and instruct the operator to update Scope in the console first. " +
-		"Never imply that a chat message itself can expand scope. Never describe Scope from memory: when asked, repeat the exact current value from this system message."
-	if summary := s.bb.Summary(); summary != "" {
-		system += "\n\nCurrent working-record summary:\n" + summary
-	}
-
-	messages := []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleSystem, Content: system}}
-	if len(s.chatHistory) > 12 {
-		messages = append(messages, s.chatHistory[len(s.chatHistory)-12:]...)
-	} else {
-		messages = append(messages, s.chatHistory...)
-	}
-	userMessage := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: strings.TrimSpace(message)}
-	messages = append(messages, userMessage)
-
-	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: model, Messages: messages, MaxTokens: 500,
-	})
-	if err != nil {
-		return "", err
-	}
-	if len(resp.Choices) == 0 {
-		return "", errors.New("empty LLM response")
-	}
-	atomic.AddInt64(s.tokens, int64(resp.Usage.TotalTokens))
-	reply := strings.TrimSpace(resp.Choices[0].Message.Content)
-	if reply == "" {
-		return "", errors.New("empty operator reply")
-	}
-	s.chatHistory = append(s.chatHistory, userMessage, openai.ChatCompletionMessage{
-		Role: openai.ChatMessageRoleAssistant, Content: reply,
-	})
-	if len(s.chatHistory) > 24 {
-		s.chatHistory = append([]openai.ChatCompletionMessage(nil), s.chatHistory[len(s.chatHistory)-24:]...)
-	}
-	return "当前后端强制 Scope：\n" + currentScope + "\n\n" + reply, nil
-}
 
 func (s *Solver) appendMessage(message openai.ChatCompletionMessage) {
 	s.messageMu.Lock()
@@ -407,10 +377,13 @@ func (s *Solver) flushUser() {
 		s.messageMu.Unlock()
 		return
 	}
+	count := len(s.pendingUser)
 	s.messages = append(s.messages, s.pendingUser...)
 	s.pendingUser = nil
 	s.journal(sessionEvent{Type: "flush", Step: s.steps})
 	s.messageMu.Unlock()
+	s.loopEvent(LoopEvent{Kind: "input_applied", MessageType: "user", Subtype: "input_applied",
+		Turn: s.turns + 1, Step: s.steps, Text: fmt.Sprintf("%d queued message(s) added to the next model request", count)})
 }
 
 func (s *Solver) messageSnapshot() []openai.ChatCompletionMessage {
@@ -490,6 +463,9 @@ func (s *Solver) hasFullSummary() bool {
 }
 
 func (s *Solver) remainingTimeLine() string {
+	if s.deadline.IsZero() {
+		return "[Current time budget] No wall-clock deadline is set."
+	}
 	remaining := time.Until(s.deadline)
 	if remaining < 0 {
 		remaining = 0
@@ -522,13 +498,47 @@ func (s *Solver) hasHistory() bool {
 	return len(s.messages) > 1
 }
 
+func (s *Solver) waitIfPaused(ctx context.Context) error {
+	if s.waitPaused != nil {
+		return s.waitPaused(ctx)
+	}
+	if s.paused == nil {
+		return ctx.Err()
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for s.paused() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	return ctx.Err()
+}
+
 // RunUntilDoneOrGaveUp runs the tool loop until the model stops calling tools
 // (one cycle), the per-cycle cap is hit, or the context/deadline ends.
-func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
+func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 	s.compactedThisCycle = false
 	s.compactAfterChars = 0
 	defer s.finishSaturationCycle()
+	cycleTokens := 0
+	cycleStartTurn := 0
+	defer func() {
+		out.Tokens = cycleTokens
+		lastTurn := 0
+		if s.turns > cycleStartTurn {
+			lastTurn = s.turns
+		}
+		s.loopEvent(LoopEvent{Kind: "result", MessageType: "result", Subtype: "cycle", Turn: lastTurn,
+			Step: out.StepCount, Text: out.Findings, Outcome: out.Status + ":" + out.StopReason, Tokens: cycleTokens})
+	}()
+	if s.waitIfPaused(ctx) != nil {
+		return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
+	}
 	s.start()
+	cycleStartTurn = s.turns
 
 	// Resolve the live model config for this cycle. If the operator hasn't
 	// configured a working model yet (or the key is wrong), report it as a
@@ -549,8 +559,34 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 	if client == nil {
 		return Result{Status: StatusConfigError, Findings: "model not configured: open 模型设置 in the console", StepCount: s.steps}
 	}
+	if s.waitIfPaused(ctx) != nil {
+		return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
+	}
+	if !s.resumeCycle && s.bb != nil {
+		_ = s.bb.AdvanceRound()
+	}
 
 	tools := toolDefs(s.allowExec && pythonAvailable(), s.meta.HasFlags(), s.canDelegate())
+	if s.playwrightMCP && !s.scopeSnapshot().IsEmpty() {
+		if !browsermcp.Available() {
+			if !s.browserWarned {
+				s.browserWarned = true
+				s.rec("tool_error", "playwright_mcp", "Node.js >=18 and Playwright MCP are required for browser exploration")
+				log.Printf("[%s/%s] Playwright MCP runtime unavailable", s.meta.Name, s.ModelSpec)
+			}
+		} else if err := s.ensureBrowser(ctx); err != nil {
+			log.Printf("[%s/%s] Playwright MCP unavailable: %v", s.meta.Name, s.ModelSpec, err)
+			s.rec("tool_error", "playwright_mcp", err.Error())
+		} else {
+			s.browserWarned = false
+			tools = append(tools, s.browserTools()...)
+			s.messageMu.Lock()
+			if len(s.messages) > 0 {
+				s.messages[0].Content = s.systemPrompt()
+			}
+			s.messageMu.Unlock()
+		}
+	}
 
 	// Prompt for this cycle, with the blackboard summary injected.
 	prompt := "Solve this task."
@@ -586,13 +622,16 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 	s.delegateMu.Unlock()
 	contextRecoveries := 0
 	for {
+		if s.waitIfPaused(ctx) != nil {
+			return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
+		}
 		if s.stepLimit > 0 && s.steps+s.delegatedStepsTotal >= s.stepLimit {
 			return Result{Status: StatusStepBudget, StopReason: "max_steps", StepCount: s.steps}
 		}
 		if err := ctx.Err(); err != nil {
 			return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
 		}
-		if time.Now().After(s.deadline) {
+		if !s.deadline.IsZero() && time.Now().After(s.deadline) {
 			return Result{Status: StatusGaveUp, Findings: "time budget reached", StopReason: "deadline", StepCount: s.steps}
 		}
 		s.flushUser()
@@ -613,10 +652,35 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 			seenRevision = stats.Revision
 		}
 		requestMessages := s.messageSnapshot()
-		resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		if s.waitIfPaused(ctx) != nil {
+			return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
+		}
+		s.turns++
+		turn := s.turns
+		s.journal(sessionEvent{Type: "turn", Turn: turn, Step: s.steps})
+		s.loopEvent(LoopEvent{Kind: "turn_start", MessageType: "system", Subtype: "turn_start", Turn: turn, Step: s.steps})
+		request := openai.ChatCompletionRequest{
 			Model: model, Messages: requestMessages, Tools: tools,
-		})
+		}
+		complete := client.CreateChatCompletion
+		if s.complete != nil {
+			complete = s.complete
+		} else if s.llmRecorder != nil {
+			missionID := s.meta.Name
+			if s.bb != nil {
+				missionID = s.bb.MissionID
+			}
+			wrapped := complete
+			complete = func(callCtx context.Context, callRequest openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+				return s.llmRecorder.Call(callCtx, missionID, s.ModelSpec, callRequest, wrapped)
+			}
+		}
+		if s.waitIfPaused(ctx) != nil {
+			return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
+		}
+		resp, err := complete(ctx, request)
 		if err != nil {
+			s.loopEvent(LoopEvent{Kind: "turn_end", MessageType: "system", Subtype: "turn_end", Turn: turn, Step: s.steps, Outcome: "model_error"})
 			if ctx.Err() != nil {
 				return Result{Status: StatusCancelled, StepCount: s.steps}
 			}
@@ -641,59 +705,126 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 			}
 			return Result{Status: StatusError, Findings: "LLM error: " + err.Error(), StepCount: s.steps}
 		}
-		atomic.AddInt64(s.tokens, int64(resp.Usage.TotalTokens))
+		usedTokens := resp.Usage.TotalTokens
+		if usedTokens == 0 {
+			usedTokens = resp.Usage.PromptTokens + resp.Usage.CompletionTokens
+		}
+		if s.tokens != nil {
+			atomic.AddInt64(s.tokens, int64(usedTokens))
+		}
+		cycleTokens += usedTokens
 		if resp.Usage.PromptTokens > 0 {
 			s.lastPromptChars = totalChars(requestMessages)
 			s.lastPromptTokens = resp.Usage.PromptTokens
 		}
 		if len(resp.Choices) == 0 {
+			s.loopEvent(LoopEvent{Kind: "turn_end", MessageType: "system", Subtype: "turn_end", Turn: turn, Step: s.steps, Outcome: "empty_response"})
 			return Result{Status: StatusError, Findings: "empty LLM response", StepCount: s.steps}
 		}
 		msg := resp.Choices[0].Message
+		if s.waitIfPaused(ctx) != nil {
+			return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
+		}
 		s.appendMessage(msg)
+		if len(msg.ToolCalls) > 0 {
+			// Public assistant text can explain the current decision while tools
+			// run. It is distinct from private model reasoning and tool output.
+			if content := strings.TrimSpace(msg.Content); content != "" {
+				s.loopEvent(LoopEvent{Kind: "progress", MessageType: "assistant", Subtype: "text", Turn: turn,
+					Step: s.steps, MessageID: resp.ID, Text: content})
+			} else {
+				var names []string
+				for _, call := range msg.ToolCalls {
+					names = append(names, call.Function.Name)
+				}
+				s.loopEvent(LoopEvent{Kind: "progress", MessageType: "system", Subtype: "tool_pending", Turn: turn,
+					Step: s.steps, Text: "正在执行 " + strings.Join(names, "、") + "；完成后会根据结果继续判断。"})
+			}
+		}
 
 		if len(msg.ToolCalls) == 0 {
 			// Final text, no tool calls: this cycle is done.
-			s.rec("text", "", strings.TrimSpace(msg.Content))
+			if strings.TrimSpace(msg.Content) == "" {
+				s.loopEvent(LoopEvent{Kind: "turn_end", MessageType: "system", Subtype: "turn_end", Turn: turn,
+					Step: s.steps, Outcome: "empty_final"})
+				return Result{Status: StatusError, Findings: "model returned no text or tool calls", StopReason: "empty_final", StepCount: s.steps}
+			}
+			s.loopEvent(LoopEvent{Kind: "assistant", MessageType: "assistant", Subtype: "final_text", Turn: turn,
+				Step: s.steps, MessageID: resp.ID, Text: strings.TrimSpace(msg.Content), Final: true})
+			s.loopEvent(LoopEvent{Kind: "turn_end", MessageType: "system", Subtype: "turn_end", Turn: turn,
+				Step: s.steps, Outcome: "final"})
 			return Result{Status: StatusGaveUp, Findings: strings.TrimSpace(msg.Content), StopReason: "done", StepCount: s.steps}
 		}
 		if parallelReadBatch(msg.ToolCalls) || parallelDelegateBatch(msg.ToolCalls) {
+			if s.waitIfPaused(ctx) != nil {
+				s.skipToolCalls(msg.ToolCalls, turn, resp.ID, "cancelled; call was not executed")
+				return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
+			}
 			remaining := s.setCycleRemaining(maxToolCallsPerCycle - calls)
 			steps := make([]int, len(msg.ToolCalls))
 			for i, tc := range msg.ToolCalls {
 				calls++
 				s.steps++
 				steps[i] = s.steps
-				s.recAt(steps[i], "tool_call", tc.Function.Name, tc.Function.Arguments)
+				s.loopEvent(LoopEvent{Kind: "tool_call", MessageType: "assistant", Subtype: "tool_use", Turn: turn,
+					Step: steps[i], MessageID: resp.ID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: tc.Function.Arguments})
 			}
 			results := runToolBatch(ctx, msg.ToolCalls, remaining, s.dispatch)
 			for i, tc := range msg.ToolCalls {
-				s.recAt(steps[i], "tool_result", tc.Function.Name, results[i])
+				s.loopEvent(LoopEvent{Kind: "tool_result", MessageType: "user", Subtype: "tool_result", Turn: turn,
+					Step: steps[i], MessageID: resp.ID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: results[i]})
 				s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: tc.ID, Content: results[i]})
 			}
 		} else {
-			for _, tc := range msg.ToolCalls {
+			for i, tc := range msg.ToolCalls {
+				if s.waitIfPaused(ctx) != nil {
+					s.skipToolCalls(msg.ToolCalls[i:], turn, resp.ID, "cancelled; call was not executed")
+					return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
+				}
 				remaining := s.setCycleRemaining(maxToolCallsPerCycle - calls)
 				calls++
 				s.steps++
 				s.flagComplete = false
-				s.rec("tool_call", tc.Function.Name, tc.Function.Arguments)
+				s.loopEvent(LoopEvent{Kind: "tool_call", MessageType: "assistant", Subtype: "tool_use", Turn: turn,
+					Step: s.steps, MessageID: resp.ID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: tc.Function.Arguments})
 				result := "tool budget exhausted; call was not executed"
 				if remaining > 0 && calls <= maxToolCallsPerCycle && (s.stepLimit == 0 || s.steps+s.delegatedStepsTotal <= s.stepLimit) {
 					result = s.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
 				}
-				s.rec("tool_result", tc.Function.Name, result)
+				s.loopEvent(LoopEvent{Kind: "tool_result", MessageType: "user", Subtype: "tool_result", Turn: turn,
+					Step: s.steps, MessageID: resp.ID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: result})
 				s.appendMessage(openai.ChatCompletionMessage{
 					Role: openai.ChatMessageRoleTool, ToolCallID: tc.ID, Content: result,
 				})
+				if ctx.Err() != nil {
+					s.skipToolCalls(msg.ToolCalls[i+1:], turn, resp.ID, "cancelled; call was not executed")
+					return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
+				}
 				// A confirmed flag that completed the challenge ends this executor
 				// (recorded; does not cancel siblings). The scheduler's poller also
 				// kills the swarm on the platform-confirmed solve.
 				if tc.Function.Name == "submit_flag" && s.flagComplete && s.lastFlag != "" {
+					// The assistant may have announced more calls in this same
+					// message. Close each with a skipped result so the journal and
+					// next session never contain unmatched tool-call IDs.
+					for _, skipped := range msg.ToolCalls[i+1:] {
+						calls++
+						s.steps++
+						s.loopEvent(LoopEvent{Kind: "tool_call", MessageType: "assistant", Subtype: "tool_use", Turn: turn,
+							Step: s.steps, MessageID: resp.ID, ToolCallID: skipped.ID, Tool: skipped.Function.Name, Text: skipped.Function.Arguments})
+						const reason = "skipped: confirmed flag completed the mission"
+						s.loopEvent(LoopEvent{Kind: "tool_result", MessageType: "user", Subtype: "tool_result", Turn: turn,
+							Step: s.steps, MessageID: resp.ID, ToolCallID: skipped.ID, Tool: skipped.Function.Name, Text: reason})
+						s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: skipped.ID, Content: reason})
+					}
+					s.loopEvent(LoopEvent{Kind: "turn_end", MessageType: "system", Subtype: "turn_end", Turn: turn,
+						Step: s.steps, Outcome: "flag_found"})
 					return Result{Status: StatusFlagFound, Flag: s.lastFlag, StepCount: s.steps, Findings: strings.TrimSpace(msg.Content)}
 				}
 			}
 		}
+		s.loopEvent(LoopEvent{Kind: "turn_end", MessageType: "system", Subtype: "turn_end", Turn: turn,
+			Step: s.steps, Outcome: "tool_use"})
 		if s.stepLimit > 0 && s.steps+s.delegatedStepsTotal >= s.stepLimit {
 			return Result{Status: StatusStepBudget, StopReason: "max_steps", StepCount: s.steps}
 		}
@@ -703,17 +834,30 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) Result {
 	}
 }
 
+// skipToolCalls closes an assistant's announced calls before cancellation, so
+// the append-only session never contains unmatched tool-call IDs.
+func (s *Solver) skipToolCalls(calls []openai.ToolCall, turn int, messageID, reason string) {
+	for _, tc := range calls {
+		s.steps++
+		s.loopEvent(LoopEvent{Kind: "tool_call", MessageType: "assistant", Subtype: "tool_use", Turn: turn,
+			Step: s.steps, MessageID: messageID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: tc.Function.Arguments})
+		s.loopEvent(LoopEvent{Kind: "tool_result", MessageType: "user", Subtype: "tool_result", Turn: turn,
+			Step: s.steps, MessageID: messageID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: reason})
+		s.appendMessage(openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: tc.ID, Content: reason})
+	}
+}
+
 // --- scope guard helpers ---
 
 func (s *Solver) hostAllowed(host string) (bool, string) {
 	currentScope := s.scopeSnapshot()
 	if currentScope.IsEmpty() {
-		return false, "BLOCKED (scope lock — NO TARGET KNOWN): the scope is empty; all egress is refused."
+		return false, "【平台管控·非目标防御】BLOCKED (scope lock — NO TARGET KNOWN): the scope is empty; all egress is refused."
 	}
 	if currentScope.Allows(host) {
 		return true, ""
 	}
-	return false, fmt.Sprintf("BLOCKED (scope lock): %q is not within the authorized scope (%s).", host, currentScope.Describe())
+	return false, fmt.Sprintf("【平台管控·非目标防御】BLOCKED (scope lock): %q is not within the authorized scope (%s).", host, currentScope.Describe())
 }
 
 type evRef struct {

@@ -9,16 +9,18 @@ import (
 )
 
 type executorRuntime struct {
-	Version           int       `json:"version"`
-	Status            string    `json:"status"`
-	StartedAt         time.Time `json:"started_at"`
-	Cycles            int       `json:"cycles"`
-	Bumps             int       `json:"bumps"`
-	QuietCycles       int       `json:"quiet_cycles"`
-	ProviderFails     int       `json:"provider_failures"`
-	Steps             int       `json:"steps"`
-	BBRevision        uint64    `json:"blackboard_revision"`
-	HandoffGeneration int       `json:"handoff_generation"`
+	Version           int            `json:"version"`
+	Status            string         `json:"status"`
+	StartedAt         time.Time      `json:"started_at"`
+	Cycles            int            `json:"cycles"`
+	Bumps             int            `json:"bumps"`
+	QuietCycles       int            `json:"quiet_cycles"`
+	ProviderFails     int            `json:"provider_failures"`
+	Steps             int            `json:"steps"`
+	ToolCalls         int            `json:"tool_calls"`
+	Tools             map[string]int `json:"tools,omitempty"`
+	BBRevision        uint64         `json:"blackboard_revision"`
+	HandoffGeneration int            `json:"handoff_generation"`
 }
 
 func (s *Swarm) runtimePath(spec string) string {

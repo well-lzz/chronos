@@ -10,6 +10,13 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -trimpath -ldflags="-s -w" -o /out/chronos ./cmd/chronos
 
 FROM python:3.13-slim-bookworm
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm \
+    && npm install -g @playwright/mcp@0.0.83 \
+    && npx --yes playwright@1.64.0-alpha-1790635538000 install --with-deps chromium \
+    && chmod -R a+rX /opt/ms-playwright \
+    && rm -rf /var/lib/apt/lists/*
 RUN groupadd --system chronos \
     && useradd --system --gid chronos --home-dir /state --create-home chronos
 COPY --from=build /out/chronos /usr/local/bin/chronos
@@ -27,7 +34,9 @@ ENV HOME=/state \
     MAX_CHALLENGE_ATTEMPTS=3 \
     DEFER_RETRY_COOLDOWN_SECONDS=120 \
     AUTO_RESUME_IDLE_SECONDS=240 \
-    ALLOW_LOCAL_EXEC=true
+    ALLOW_LOCAL_EXEC=true \
+    CHRONOS_PLAYWRIGHT_CLI=/usr/local/lib/node_modules/@playwright/mcp/cli.js \
+    CHRONOS_PLAYWRIGHT_NO_SANDBOX=true
 
 USER chronos
 WORKDIR /state

@@ -17,6 +17,7 @@ type Runtime struct {
 	Started  time.Time `json:"started"`
 	Deadline time.Time `json:"deadline"`
 	Scope    []string  `json:"scope"`
+	RunID    string    `json:"run_id,omitempty"`
 }
 
 func runtimePath(stateDir, name string) string {
@@ -43,18 +44,22 @@ func LoadRuntime(stateDir, name string) (Runtime, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return Runtime{}, err
 	}
-	if state.Version != 1 || state.Started.IsZero() || state.Deadline.IsZero() {
+	if state.Version != 1 || state.Started.IsZero() {
 		return Runtime{}, fmt.Errorf("invalid engagement runtime state")
 	}
 	return state, nil
 }
 
-func SaveRuntime(stateDir, name string, started, deadline time.Time, current scope.Scope) error {
+func SaveRuntime(stateDir, name string, started, deadline time.Time, current scope.Scope, runID ...string) error {
 	path := runtimePath(stateDir, name)
 	if path == "" {
 		return nil
 	}
-	data, err := json.MarshalIndent(Runtime{Version: 1, Started: started, Deadline: deadline, Scope: current.Entries()}, "", "  ")
+	id := ""
+	if len(runID) > 0 {
+		id = runID[0]
+	}
+	data, err := json.MarshalIndent(Runtime{Version: 1, Started: started, Deadline: deadline, Scope: current.Entries(), RunID: id}, "", "  ")
 	if err != nil {
 		return err
 	}

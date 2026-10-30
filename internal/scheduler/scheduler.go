@@ -20,18 +20,20 @@ import (
 	"github.com/well-lzz/chronos/internal/mission"
 	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/poller"
+	"github.com/well-lzz/chronos/internal/runhistory"
 	"github.com/well-lzz/chronos/internal/scope"
 	"github.com/well-lzz/chronos/internal/swarm"
 	"github.com/well-lzz/chronos/internal/traffic"
 )
 
 type run struct {
-	sw       *swarm.Swarm
-	cancel   context.CancelFunc
-	done     chan struct{}
-	meta     mission.Meta
-	solved   bool
-	deadline time.Time
+	sw            *swarm.Swarm
+	cancel        context.CancelFunc
+	done          chan struct{}
+	meta          mission.Meta
+	solved        bool
+	transitioning bool
+	deadline      time.Time
 }
 
 // Command is an operator action (from the web console or REPL).
@@ -49,16 +51,21 @@ type Scheduler struct {
 	specs    []string
 	maxConc  int
 	runStart time.Time
+	runCtx   context.Context
 
-	LLM *llmconfig.Store // operator-editable model profile (optional)
+	LLM               *llmconfig.Store             // operator-editable model profile (optional)
+	ModelProfiles     map[string]llmconfig.Profile // optional per-executor operator profiles
+	UseConsoleProfile bool
 
 	mu             sync.Mutex
+	scopeUpdateMu  sync.Mutex
 	checkpointMu   sync.Mutex
 	recoveryErr    error
 	events         []OrchestrationEvent
 	eventSeq       uint64
 	runs           map[string]*run
 	resumePending  map[string]time.Time
+	runIDs         map[string]string
 	deferred       map[string]string
 	attempts       map[string]int
 	deferTime      map[string]time.Time
@@ -78,7 +85,7 @@ func New(pf platform.Platform, cfg config.Settings, specs []string) *Scheduler {
 	}
 	s := &Scheduler{
 		pf: pf, cfg: cfg, specs: specs, maxConc: mc, runStart: time.Now(),
-		runs: map[string]*run{}, deferred: map[string]string{}, attempts: map[string]int{}, resumePending: map[string]time.Time{},
+		runs: map[string]*run{}, deferred: map[string]string{}, attempts: map[string]int{}, resumePending: map[string]time.Time{}, runIDs: map[string]string{},
 		deferTime: map[string]time.Time{}, pending: map[string]bool{}, openContainers: map[string]bool{},
 		spawnFailures: map[string]int{}, cmds: make(chan Command, 64),
 		reconcileRequests: make(chan struct{}, 1),
@@ -108,6 +115,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		runCtx, cancel = context.WithDeadline(ctx, s.runStart.Add(time.Duration(s.cfg.TotalBudgetSeconds)*time.Second))
 	}
 	defer cancel()
+	s.mu.Lock()
+	s.runCtx = runCtx
+	s.mu.Unlock()
 
 	pmin, pmax := 5*time.Second, 15*time.Second
 	s.poll = poller.New(s.pf, (pmin+pmax)/2, (pmax-pmin)/2)
@@ -270,12 +280,23 @@ func (s *Scheduler) reapAndRefill(ctx context.Context) bool {
 	var freed bool
 	var releases []string
 	var deferred []string
+	var finished []struct{ id, outcome string }
 	s.mu.Lock()
 	for name, r := range s.runs {
+		if r.transitioning {
+			continue
+		}
 		select {
 		case <-r.done:
+			outcome := "finished"
+			if r.solved {
+				outcome = "platform_solved"
+			} else if s.deferred[name] != "" {
+				outcome = "deferred"
+			}
 			if !r.solved && s.deferred[name] == "" {
 				s.deferred[name] = "solver attempts exhausted"
+				outcome = "deferred"
 				s.deferTime[name] = time.Now()
 				deferred = append(deferred, name)
 				log.Printf("Deferred: %s", name)
@@ -283,6 +304,10 @@ func (s *Scheduler) reapAndRefill(ctx context.Context) bool {
 				log.Printf("Swarm finished: %s", name)
 			}
 			delete(s.runs, name)
+			if r.sw != nil && r.sw.BB != nil {
+				finished = append(finished, struct{ id, outcome string }{r.sw.BB.MissionID, outcome})
+			}
+			delete(s.runIDs, name)
 			delete(s.openContainers, name)
 			releases = append(releases, name)
 			freed = true
@@ -290,6 +315,11 @@ func (s *Scheduler) reapAndRefill(ctx context.Context) bool {
 		}
 	}
 	s.mu.Unlock()
+	for _, run := range finished {
+		if err := (runhistory.Store{StateDir: s.cfg.StateDir}).Finish(run.id, run.outcome, time.Now()); err != nil {
+			log.Printf("finish run history %s: %v", run.id, err)
+		}
+	}
 	for _, name := range deferred {
 		s.recordDecision("defer", name, "solver_attempts_exhausted", "swarm finished without platform confirmation")
 	}
@@ -528,21 +558,40 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 			deadline = time.Now().Add(time.Second)
 		}
 		sctx, cancel := context.WithDeadline(ctx, deadline)
-		bb, bbErr := blackboard.LoadOrNew(meta.Name, s.cfg.StateDir)
-		tl, tlErr := traffic.LoadOrNew(meta.Name, s.cfg.StateDir)
-		if bbErr != nil || tlErr != nil {
+		initialScope := scope.ParseConnInfo(meta.ConnectionInfo)
+		savedScope, savedRunID, hasSavedScope, scopeErr := scope.LoadOperatorScopeRun(s.cfg.StateDir, s.scopeIdentity(name))
+		if hasSavedScope {
+			initialScope = savedScope
+			meta.ConnectionInfo = initialScope.Describe()
+		}
+		_, recovering := s.resumePending[name]
+		runID := ""
+		if recovering {
+			runID = s.runIDs[name]
+			if runID == "" {
+				runID = savedRunID // migration from older checkpoints
+			}
+		} else if scopeErr == nil {
+			runID, scopeErr = scope.NewRunID()
+		}
+		stateID := scope.MissionStateID(meta.Name, runID)
+		bb, bbErr := blackboard.LoadOrNew(stateID, s.cfg.StateDir)
+		tl, tlErr := traffic.LoadOrNew(stateID, s.cfg.StateDir)
+		if bbErr != nil || tlErr != nil || scopeErr != nil {
 			cancel()
 			delete(s.openContainers, name)
-			s.deferred[name] = "state load failed"
+			s.deferred[name] = "mission state load failed"
 			s.deferTime[name] = time.Now()
 			s.mu.Unlock()
-			s.recordDecision("spawn_failed", name, "state_load", "blackboard or traffic load failed")
+			s.recordDecision("spawn_failed", name, "state_load", "blackboard, traffic, or scope load failed")
 			_ = s.checkpoint()
 			s.pf.ReleaseChallenge(name)
 			if bbErr != nil {
 				log.Printf("State load failed for %s: %v", name, bbErr)
-			} else {
+			} else if tlErr != nil {
 				log.Printf("Traffic load failed for %s: %v", name, tlErr)
+			} else {
+				log.Printf("Scope load failed for %s: %v", name, scopeErr)
 			}
 			return
 		}
@@ -552,15 +601,14 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 			s.attempts[name]++
 		}
 		delete(s.resumePending, name)
-		sw := &swarm.Swarm{
-			Meta: meta, Scope: scope.ParseConnInfo(meta.ConnectionInfo), ModelSpecs: s.specs,
-			Settings: s.cfg, Platform: s.pf, LLM: s.LLM,
-			BB: bb, TL: tl,
-			GlobalRemaining: s.remainingGlobal,
-		}
+		s.runIDs[name] = runID
+		sw := s.newSwarm(meta, initialScope, bb, tl)
 		r := &run{sw: sw, cancel: cancel, done: make(chan struct{}), meta: meta, deadline: deadline}
 		s.runs[name] = r
 		s.mu.Unlock()
+		if err := (runhistory.Store{StateDir: s.cfg.StateDir}).Start(stateID, meta.Name, "scheduler", initialScope.Describe(), time.Now()); err != nil {
+			log.Printf("start run history %s: %v", stateID, err)
+		}
 		s.recordDecision("spawn", name, "slot_available", fmt.Sprintf("%d executor(s)", len(s.specs)))
 		_ = s.checkpoint()
 		log.Printf("Swarm spawned for %s (%d models)", name, len(s.specs))
@@ -570,6 +618,15 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 			sw.Run(sctx)
 		}()
 	}()
+}
+
+func (s *Scheduler) newSwarm(meta mission.Meta, current scope.Scope, bb *blackboard.Blackboard, tl *traffic.Log) *swarm.Swarm {
+	return &swarm.Swarm{
+		Meta: meta, Scope: current, ModelSpecs: s.specs,
+		Settings: s.cfg, Platform: s.pf, LLM: s.LLM, ModelProfiles: s.ModelProfiles,
+		UseConsoleProfile: s.UseConsoleProfile,
+		BB:                bb, TL: tl, GlobalRemaining: s.remainingGlobal,
+	}
 }
 
 func (s *Scheduler) handleDeadlock(ctx context.Context, since time.Time) time.Time {

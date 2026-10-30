@@ -17,7 +17,19 @@ type Source interface {
 	Command(action, challenge, model, message string)
 }
 
-// ScopeConfig is the operator-visible authorization boundary for an engagement.
+// CheckedCommander reports immediate rejections of an operator command.
+type CheckedCommander interface {
+	CommandChecked(action, challenge, model, message string) error
+}
+
+// ChatSource accepts a message only while its selected executor can process it.
+// The web handler uses this acknowledgement instead of claiming every queued
+// command was delivered to a live session.
+type ChatSource interface {
+	Chat(challenge, model, message string) error
+}
+
+// ScopeConfig is the operator-visible authorization boundary for one mission.
 type ScopeConfig struct {
 	Supported   bool     `json:"supported"`
 	Editable    bool     `json:"editable"`
@@ -25,11 +37,16 @@ type ScopeConfig struct {
 	Description string   `json:"description"`
 }
 
-// ScopeController is implemented only by sources whose authorization boundary
-// may be replaced by the authenticated operator at runtime.
+// ScopeController controls a single engagement's boundary.
 type ScopeController interface {
 	ScopeConfig() ScopeConfig
 	UpdateScope(targets []string) error
+}
+
+// MissionScopeController controls one selected mission within a scheduler.
+type MissionScopeController interface {
+	ScopeConfigFor(challenge string) ScopeConfig
+	UpdateScopeFor(challenge string, targets []string) error
 }
 
 var verdictRank = map[string]int{"confirmed": 0, "suspected": 1, "failed": 2}

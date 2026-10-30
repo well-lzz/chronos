@@ -19,6 +19,7 @@ type schedulerState struct {
 	Deferred      map[string]string    `json:"deferred"`
 	DeferTime     map[string]time.Time `json:"defer_time"`
 	ResumePending map[string]time.Time `json:"resume_pending"`
+	RunIDs        map[string]string    `json:"run_ids,omitempty"`
 	EventSeq      uint64               `json:"event_seq,omitempty"`
 	Events        []OrchestrationEvent `json:"events,omitempty"`
 }
@@ -65,6 +66,9 @@ func (s *Scheduler) loadState() error {
 	for name, deadline := range state.ResumePending {
 		s.resumePending[name] = deadline
 	}
+	for name, runID := range state.RunIDs {
+		s.runIDs[name] = runID
+	}
 	s.eventSeq = state.EventSeq
 	s.events = append(s.events, state.Events...)
 	return nil
@@ -82,7 +86,8 @@ func (s *Scheduler) checkpoint() error {
 	s.mu.Lock()
 	state := schedulerState{Version: 1, RunStart: s.runStart,
 		Attempts: make(map[string]int, len(s.attempts)), Deferred: make(map[string]string, len(s.deferred)),
-		DeferTime: make(map[string]time.Time, len(s.deferTime)), ResumePending: make(map[string]time.Time)}
+		DeferTime: make(map[string]time.Time, len(s.deferTime)), ResumePending: make(map[string]time.Time),
+		RunIDs: make(map[string]string, len(s.runIDs))}
 	for name, n := range s.attempts {
 		state.Attempts[name] = n
 	}
@@ -94,6 +99,9 @@ func (s *Scheduler) checkpoint() error {
 	}
 	for name, deadline := range s.resumePending {
 		state.ResumePending[name] = deadline
+	}
+	for name, runID := range s.runIDs {
+		state.RunIDs[name] = runID
 	}
 	for name, r := range s.runs {
 		state.ResumePending[name] = r.deadline

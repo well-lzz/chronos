@@ -2,10 +2,14 @@ package llm
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	openai "github.com/sashabaranov/go-openai"
 
 	"github.com/well-lzz/chronos/internal/config"
 	"github.com/well-lzz/chronos/internal/llmconfig"
@@ -123,5 +127,30 @@ func TestFromProfileBuildsKeyPoolForDeepSeek(t *testing.T) {
 	}
 	if client == nil {
 		t.Fatal("nil client")
+	}
+}
+
+func TestExactProfileDoesNotBorrowEnvironmentKeys(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer server.Close()
+	p := llmconfig.Profile{Provider: "custom", Model: "chosen", BaseURL: server.URL, APIKey: "operator-key"}
+	cfg := config.Settings{DeepSeekBaseURL: server.URL, DeepSeekKeys: []string{"environment-key"}}
+	client, model, err := FromExactProfileWithSettings(p, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
+		Model: model, Messages: []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "test"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer operator-key" {
+		t.Fatalf("authorization = %q", gotAuth)
 	}
 }

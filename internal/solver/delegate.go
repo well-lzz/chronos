@@ -77,7 +77,7 @@ func (s *Solver) delegateGate() string {
 			return "global budget too low; delegation not started; continue directly"
 		}
 	}
-	if time.Until(s.deadline) < 2*time.Second {
+	if !s.deadline.IsZero() && time.Until(s.deadline) < 2*time.Second {
 		return "mission deadline too near; delegation not started; continue directly"
 	}
 	return ""
@@ -219,9 +219,10 @@ func (s *Solver) toolDelegate(ctx context.Context, argsJSON string) string {
 	childMeta.Description = args.Task
 	child := New(Options{
 		ModelSpec: actor, Model: s.Model, Client: s.client, Meta: childMeta, Scope: childScope,
-		BB: s.bb, TL: s.tl, AllowExec: s.allowExec, InsecureTLS: s.insecureTLS,
-		Deadline: s.childDeadline(), Tokens: s.tokens, SubmitFn: s.submitFn,
-		Resolve: s.resolve, ContextWindow: s.contextWindow,
+		BB: s.bb, TL: s.tl, AllowExec: s.allowExec, PlaywrightMCP: s.playwrightMCP, InsecureTLS: s.insecureTLS,
+		Deadline: s.childDeadline(), Tokens: s.tokens, LLMRecorder: s.llmRecorder, Guard: s.guard, SubmitFn: s.submitFn,
+		Resolve: s.resolve, Complete: s.complete, ContextWindow: s.contextWindow,
+		Paused: s.paused, WaitPaused: s.waitPaused,
 		Depth: s.depth + 1, MaxDelegateDepth: s.maxDelegateDepth, MaxDelegateChildren: s.maxDelegateChildren,
 		MaxDelegateSteps: s.maxDelegateSteps, MinRemainingToSpawn: s.minRemainingToSpawn,
 		GlobalRemaining: s.globalRemaining, SubagentRoot: s.subagentRoot,
@@ -322,6 +323,9 @@ func (s *Solver) toolDelegateResume(ctx context.Context, argsJSON string) string
 }
 
 func (s *Solver) childDeadline() time.Time {
+	if s.deadline.IsZero() {
+		return time.Time{}
+	}
 	remaining := time.Until(s.deadline)
 	slice := remaining / 2
 	if slice > 2*time.Minute {
@@ -340,9 +344,13 @@ func (s *Solver) childEvent(event ChildEvent) {
 }
 
 func (s *Solver) runChild(ctx context.Context, record *delegatedChild) string {
+	defer record.solver.CloseBrowser()
 	defer s.releaseChild()
 	defer func() { _ = s.bb.ReleaseOwner(record.actor) }()
-	childCtx, cancel := context.WithDeadline(ctx, record.solver.deadline)
+	childCtx, cancel := context.WithCancel(ctx)
+	if !record.solver.deadline.IsZero() {
+		childCtx, cancel = context.WithDeadline(ctx, record.solver.deadline)
+	}
 	defer cancel()
 	res := record.solver.RunUntilDoneOrGaveUp(childCtx)
 	status, reason := "inconclusive", res.StopReason
@@ -354,7 +362,7 @@ func (s *Solver) runChild(ctx context.Context, record *delegatedChild) string {
 	}
 	if res.Status == StatusCancelled || reason == "deadline" {
 		status = "stopped"
-		if childCtx.Err() == context.DeadlineExceeded || time.Now().After(record.solver.deadline) {
+		if childCtx.Err() == context.DeadlineExceeded || (!record.solver.deadline.IsZero() && time.Now().After(record.solver.deadline)) {
 			reason = "deadline"
 		} else {
 			reason = "cancelled"

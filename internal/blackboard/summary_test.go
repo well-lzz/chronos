@@ -8,7 +8,7 @@ import (
 
 func TestSummaryKeepsMandatoryAcrossAgeAndBudget(t *testing.T) {
 	b := newBoard("m", "")
-	oldVerified, _ := b.AddFinding(Finding{Title: "old verified", Severity: "low", Status: Verified})
+	oldVerified, _ := b.AddFinding(Finding{Title: "old verified", Severity: "low", EvidenceRefs: []EvidenceRef{{Ref: "t1", Role: "proof"}}})
 	oldCritical, _ := b.AddFinding(Finding{Title: "old critical candidate", Severity: "critical"})
 	oldHigh, _ := b.AddFinding(Finding{Title: "old high inconclusive", Severity: "high", Status: Inconclusive})
 	for i := 0; i < 45; i++ {
