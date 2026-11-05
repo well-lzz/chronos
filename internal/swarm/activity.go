@@ -27,6 +27,7 @@ func (s *Swarm) activityPath() string {
 // appendActivityLocked keeps the live ring bounded and journals its public
 // events for read-only task history. The caller holds s.mu so appends are ordered.
 func (s *Swarm) appendActivityLocked(model string, event ActEvent) {
+	s.countToolActivityLocked(model, event)
 	if s.activity == nil {
 		s.activity = map[string][]ActEvent{}
 	}
@@ -60,6 +61,26 @@ func (s *Swarm) appendActivityLocked(model string, event ActEvent) {
 	}
 }
 
+// countToolActivityLocked accounts for every activity source, including typed
+// solver events and child streams. Results never count as another invocation.
+// Counts outlive the live ring and are rebuilt from the same journal on restart.
+func (s *Swarm) countToolActivityLocked(model string, event ActEvent) {
+	if event.Kind != "tool_call" || event.Tool == "" {
+		return
+	}
+	if s.toolCalls == nil {
+		s.toolCalls = map[string]int{}
+	}
+	if s.toolByName == nil {
+		s.toolByName = map[string]map[string]int{}
+	}
+	if s.toolByName[model] == nil {
+		s.toolByName[model] = map[string]int{}
+	}
+	s.toolCalls[model]++
+	s.toolByName[model][event.Tool]++
+}
+
 // loadActivityLocked restores recent conversation and tool events after a
 // process restart. Full history stays on disk; the live stream keeps its cap.
 func (s *Swarm) loadActivityLocked() error {
@@ -91,13 +112,7 @@ func (s *Swarm) loadActivityLocked() error {
 			buf = buf[len(buf)-activityRing:]
 		}
 		s.activity[record.Model] = buf
-		if record.Event.Kind == "tool_call" && record.Event.Tool != "" {
-			s.toolCalls[record.Model]++
-			if s.toolByName[record.Model] == nil {
-				s.toolByName[record.Model] = map[string]int{}
-			}
-			s.toolByName[record.Model][record.Event.Tool]++
-		}
+		s.countToolActivityLocked(record.Model, record.Event)
 	}
 	atomic.StoreInt64(&s.evSeq, maxSeq)
 	return scan.Err()

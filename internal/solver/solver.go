@@ -1,11 +1,13 @@
 // Package solver is one headless executor: a model + the neutral tool surface,
 // driving a search over an authorized scope. It records Facts/Findings on the
-// shared blackboard and cites real captured traffic as evidence. No sandbox, no
+// shared blackboard and cites real captured traffic as evidence. OS-sandboxed offline Python, no
 // role split — reasoning plus http/tcp/python and the blackboard tools.
 package solver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -22,7 +24,9 @@ import (
 	"github.com/well-lzz/chronos/internal/llmrec"
 	"github.com/well-lzz/chronos/internal/mission"
 	"github.com/well-lzz/chronos/internal/prompts"
+	"github.com/well-lzz/chronos/internal/runevent"
 	"github.com/well-lzz/chronos/internal/scope"
+	"github.com/well-lzz/chronos/internal/taskruntime"
 	"github.com/well-lzz/chronos/internal/traffic"
 )
 
@@ -30,6 +34,7 @@ import (
 const (
 	StatusGaveUp         = "gave_up"
 	StatusError          = "error"
+	StatusStorageError   = "storage_error"
 	StatusRetryableError = "retryable_error" // provider/network outage; does not consume exploration bumps
 	StatusConfigError    = "config_error"    // model misconfigured/unauthorized — recoverable once the operator fixes it
 	StatusCancelled      = "cancelled"
@@ -56,24 +61,29 @@ type SubmitFn func(flag string) (display string, confirmed, complete bool)
 
 // Options configures a Solver.
 type Options struct {
-	ModelSpec     string
-	Model         string
-	Client        *openai.Client
-	Meta          mission.Meta
-	Scope         scope.Scope
-	BB            *blackboard.Blackboard
-	TL            *traffic.Log
-	AllowExec     bool
-	PlaywrightMCP bool
-	InsecureTLS   bool
-	Deadline      time.Time
-	Tokens        *int64
-	LLMRecorder   *llmrec.Recorder
-	Complete      func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error)
-	Paused        func() bool
-	WaitPaused    func(context.Context) error
-	Guard         *guard.Manager
-	Notify        func(string)
+	ModelCallTimeout time.Duration
+	AsyncDelegate    bool
+	MissionContext   context.Context
+	Budget           *taskruntime.Budget
+	BudgetOwner      string
+	ModelSpec        string
+	Model            string
+	Client           *openai.Client
+	Meta             mission.Meta
+	Scope            scope.Scope
+	BB               *blackboard.Blackboard
+	TL               *traffic.Log
+	AllowExec        bool
+	PlaywrightMCP    bool
+	InsecureTLS      bool
+	Deadline         time.Time
+	Tokens           *int64
+	LLMRecorder      *llmrec.Recorder
+	Complete         func(context.Context, openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error)
+	Paused           func() bool
+	WaitPaused       func(context.Context) error
+	Guard            *guard.Manager
+	Notify           func(string)
 	// SubmitFn, when set, makes submit_flag go to the platform; nil = record-only.
 	SubmitFn SubmitFn
 	// Record, when set, receives each step for live observation (web console).
@@ -104,9 +114,19 @@ type Options struct {
 
 // Solver is one executor bound to a model and a shared mission state.
 type Solver struct {
-	ModelSpec string
-	Model     string
-	client    *openai.Client
+	modelTimeout   time.Duration
+	health         loopHealth
+	asyncDelegate  bool
+	missionContext context.Context
+	budget         *taskruntime.Budget
+	budgetOwner    string
+	jobs           *asyncJobs
+	inputWake      chan struct{}
+	control        *runevent.Journal
+	inputIDs       map[string]bool
+	ModelSpec      string
+	Model          string
+	client         *openai.Client
 
 	meta          mission.Meta
 	scope         scope.Scope
@@ -170,10 +190,15 @@ type Solver struct {
 	scopeMu             sync.RWMutex
 	modelMu             sync.RWMutex
 	sessionPath         string
+	storageMu           sync.Mutex
+	storageErr          error
 }
 
 // New builds a solver from Options.
 func New(o Options) *Solver {
+	if o.ModelCallTimeout <= 0 {
+		o.ModelCallTimeout = 180 * time.Second
+	}
 	if o.MaxDelegateDepth < 1 {
 		o.MaxDelegateDepth = 1
 	}
@@ -196,6 +221,7 @@ func New(o Options) *Solver {
 		o.MaxDelegateSteps = 40
 	}
 	return &Solver{
+		modelTimeout: o.ModelCallTimeout, inputWake: make(chan struct{}, 1), asyncDelegate: o.AsyncDelegate, missionContext: o.MissionContext, budget: o.Budget, budgetOwner: o.BudgetOwner,
 		ModelSpec: o.ModelSpec, Model: o.Model, client: o.Client, meta: o.Meta, scope: o.Scope,
 		bb: o.BB, tl: o.TL, allowExec: o.AllowExec, playwrightMCP: o.PlaywrightMCP, insecureTLS: o.InsecureTLS, deadline: o.Deadline, tokens: o.Tokens,
 		llmRecorder: o.LLMRecorder, complete: o.Complete, paused: o.Paused, waitPaused: o.WaitPaused, guard: o.Guard,
@@ -228,19 +254,20 @@ func (s *Solver) loopEvent(event LoopEvent) {
 	s.recAt(event.Step, event.Kind, event.Tool, event.Text)
 }
 
-func (s *Solver) start() {
+func (s *Solver) start() error {
 	s.messageMu.Lock()
 	defer s.messageMu.Unlock()
 	if s.started {
-		return
+		return s.StorageError()
 	}
 	if s.sessionPath != "" {
 		state, err := loadSession(s.sessionPath)
 		if err != nil {
-			log.Printf("session recovery failed (%s): %v", s.sessionPath, err)
-			s.sessionPath = ""
+			s.failStorage(fmt.Errorf("recover session %s: %w", s.sessionPath, err))
+			return s.StorageError()
 		} else {
 			s.messages, s.pendingUser, s.steps, s.turns = state.messages, state.pending, state.step, state.turn
+			s.inputIDs = state.inputIDs
 		}
 	}
 	if len(s.messages) == 0 || s.messages[0].Role != openai.ChatMessageRoleSystem {
@@ -266,13 +293,61 @@ func (s *Solver) start() {
 			break
 		}
 	}
+	if s.inputIDs == nil {
+		s.inputIDs = map[string]bool{}
+	}
+	controlPath := ""
+	if s.sessionPath != "" {
+		controlPath = s.sessionPath + ".control.jsonl"
+	}
+	runID := s.meta.Name
+	if s.bb != nil {
+		runID = s.bb.MissionID
+	}
+	control, err := runevent.Open(controlPath, runID)
+	if err != nil {
+		s.failStorage(err)
+		return s.StorageError()
+	}
+	s.control = control
 	s.started = true
+	return s.StorageError()
 }
 
-func (s *Solver) journal(event sessionEvent) {
-	if err := appendSessionEvent(s.sessionPath, event); err != nil {
-		log.Printf("session journal write failed (%s): %v", s.sessionPath, err)
+// StorageError is sticky: a damaged or unwritable journal must never silently
+// turn a recoverable executor into an unrecorded one. A restart can retry after
+// the operator repairs the underlying storage.
+func (s *Solver) StorageError() error {
+	s.storageMu.Lock()
+	err := s.storageErr
+	s.storageMu.Unlock()
+	if err == nil && s.bb != nil {
+		err = s.bb.StorageError()
 	}
+	return err
+}
+
+func (s *Solver) failStorage(err error) {
+	if err == nil {
+		return
+	}
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	if s.storageErr == nil {
+		s.storageErr = err
+	}
+}
+
+func (s *Solver) journal(event sessionEvent) error {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	if s.storageErr != nil {
+		return s.storageErr
+	}
+	if err := appendSessionEvent(s.sessionPath, event); err != nil {
+		s.storageErr = fmt.Errorf("commit session %s: %w", s.sessionPath, err)
+	}
+	return s.storageErr
 }
 
 func (s *Solver) systemPrompt() string {
@@ -307,13 +382,27 @@ func (s *Solver) Bump(insights string) {
 // Guide injects an operator instruction into the execution loop without
 // changing the structural scope lock. The next model turn can act on it only
 // through tools that independently enforce the current scope.
-func (s *Solver) Guide(message string) {
-	s.queueUser(openai.ChatCompletionMessage{
+func (s *Solver) Guide(message string) error {
+	id, err := newAgentID()
+	if err != nil {
+		return err
+	}
+	return s.queueInput(id, "operator", openai.ChatCompletionMessage{
 		Role: openai.ChatMessageRoleUser,
 		Content: "[Operator instruction]\n" + strings.TrimSpace(message) +
 			"\n\nFollow this instruction only within the currently authorized scope. " +
 			"If it targets anything outside scope, do not access it; ask the operator to update Scope in the console.",
 	})
+}
+
+// RuntimeGuide preserves the provenance of scheduler and parent guidance.
+// It must not be labeled as an operator instruction in a child session.
+func (s *Solver) RuntimeGuide(message string) error {
+	id, err := newAgentID()
+	if err != nil {
+		return err
+	}
+	return s.queueInput(id, "runtime", openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: "[Runtime guidance]\n" + strings.TrimSpace(message) + "\nStay within the currently authorized scope."})
 }
 
 // Pivot injects a stall-breaking methodology nudge before the next cycle. It is
@@ -366,16 +455,58 @@ func (s *Solver) Deadline() time.Time { return s.deadline }
 
 func (s *Solver) appendMessage(message openai.ChatCompletionMessage) {
 	s.messageMu.Lock()
-	s.messages = append(s.messages, message)
-	s.journal(sessionEvent{Type: "message", Message: &message, Step: s.steps})
+	if s.journal(sessionEvent{Type: "message", Message: &message, Step: s.steps}) == nil {
+		s.messages = append(s.messages, message)
+	}
 	s.messageMu.Unlock()
 }
 
-func (s *Solver) queueUser(message openai.ChatCompletionMessage) {
+func (s *Solver) queueUser(message openai.ChatCompletionMessage) error {
+	id, err := newAgentID()
+	if err != nil {
+		return err
+	}
+	return s.queueInput(id, "runtime", message)
+}
+
+// DeliverInput records one logical event once, including across compaction and
+// process restarts. applied means inserted into session history, not completed.
+func (s *Solver) DeliverInput(id, source, text string) error {
+	if id == "" || (source != "operator" && source != "child" && source != "runtime") {
+		return fmt.Errorf("invalid input identity or source")
+	}
+	return s.queueInput(id, source, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: "[Input source: " + source + "]\n" + text})
+}
+
+func (s *Solver) queueInput(id, source string, message openai.ChatCompletionMessage) error {
+	if err := s.start(); err != nil {
+		return err
+	}
 	s.messageMu.Lock()
+	defer s.messageMu.Unlock()
+	if s.inputIDs[id] {
+		return nil
+	}
+	if len(s.pendingUser) >= 128 {
+		return fmt.Errorf("executor inbox is full; retry delivery later")
+	}
+	bytes := len(message.Content)
+	for _, pending := range s.pendingUser {
+		bytes += len(pending.Content)
+	}
+	if bytes > 512*1024 {
+		return fmt.Errorf("executor inbox byte quota exceeded")
+	}
+	if err := s.journal(sessionEvent{Type: "queue", InputID: id, Source: source, Message: &message}); err != nil {
+		return err
+	}
 	s.pendingUser = append(s.pendingUser, message)
-	s.journal(sessionEvent{Type: "queue", Message: &message})
-	s.messageMu.Unlock()
+	s.inputIDs[id] = true
+	select {
+	case s.inputWake <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 // flushUser runs only at a model-request boundary, after all tool results from
@@ -388,9 +519,12 @@ func (s *Solver) flushUser() {
 		return
 	}
 	count := len(s.pendingUser)
+	if s.journal(sessionEvent{Type: "flush", Step: s.steps}) != nil {
+		s.messageMu.Unlock()
+		return
+	}
 	s.messages = append(s.messages, s.pendingUser...)
 	s.pendingUser = nil
-	s.journal(sessionEvent{Type: "flush", Step: s.steps})
 	s.messageMu.Unlock()
 	s.loopEvent(LoopEvent{Kind: "input_applied", MessageType: "user", Subtype: "input_applied",
 		Turn: s.turns + 1, Step: s.steps, Text: fmt.Sprintf("%d queued message(s) added to the next model request", count)})
@@ -536,6 +670,18 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 	cycleTokens := 0
 	cycleStartTurn := 0
 	defer func() {
+		if s.control != nil && s.bb != nil && s.StorageError() == nil {
+			id, err := newAgentID()
+			if err == nil {
+				_, err = s.control.Append("progress:"+id, "progress.shadow", s.bb.Metrics())
+			}
+			if err != nil {
+				s.failStorage(err)
+			}
+		}
+		if err := s.StorageError(); err != nil {
+			out.Status, out.StopReason, out.Findings = StatusStorageError, "storage", err.Error()
+		}
 		out.Tokens = cycleTokens
 		lastTurn := 0
 		if s.turns > cycleStartTurn {
@@ -547,7 +693,13 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 	if s.waitIfPaused(ctx) != nil {
 		return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
 	}
-	s.start()
+	if err := s.start(); err != nil {
+		return Result{Status: StatusStorageError, Findings: err.Error(), StopReason: "storage", StepCount: s.steps}
+	}
+	if err := s.RestoreJobs(); err != nil {
+		s.failStorage(err)
+		return Result{Status: StatusStorageError, Findings: err.Error(), StepCount: s.steps}
+	}
 	cycleStartTurn = s.turns
 
 	// Resolve the live model config for this cycle. If the operator hasn't
@@ -573,10 +725,16 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 		return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
 	}
 	if !s.resumeCycle && s.bb != nil {
-		_ = s.bb.AdvanceRound()
+		if err := s.bb.AdvanceRound(); err != nil {
+			s.failStorage(err)
+			return Result{Status: StatusStorageError, Findings: err.Error(), StepCount: s.steps}
+		}
 	}
 
 	tools := toolDefs(s.allowExec && pythonAvailable(), s.meta.HasFlags(), s.canDelegate())
+	if s.asyncDelegate && s.canDelegate() {
+		tools = append(tools, asyncToolDefs()...)
+	}
 	if s.playwrightMCP && !s.scopeSnapshot().IsEmpty() {
 		if !browsermcp.Available() {
 			if !s.browserWarned {
@@ -644,6 +802,10 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 		if !s.deadline.IsZero() && time.Now().After(s.deadline) {
 			return Result{Status: StatusGaveUp, Findings: "time budget reached", StopReason: "deadline", StepCount: s.steps}
 		}
+		if err := s.PollJobs(); err != nil && s.StorageError() != nil {
+			return Result{Status: StatusStorageError, Findings: err.Error(), StepCount: s.steps}
+		}
+		s.health.lastBoundary.Store(time.Now().Unix())
 		s.flushUser()
 		s.compactMessages() // bound the growing transcript before re-sending it
 		if s.bb.Revision() > 0 && !s.hasFullSummary() {
@@ -660,6 +822,12 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 				s.contextEvent(ContextEvent{Phase: "reinject", Reason: "blackboard_delta", BudgetChars: s.deltaBudgetChars(), Summary: stats})
 			}
 			seenRevision = stats.Revision
+		}
+		if s.budget != nil && s.budget.Exhausted(s.budgetOwner) {
+			if s.HasJobs() {
+				return Result{Status: StatusWaitingEvent, StopReason: "waiting_for_reserved_work", StepCount: s.steps}
+			}
+			return Result{Status: StatusStepBudget, StopReason: "run_tool_budget", StepCount: s.steps}
 		}
 		requestMessages := s.messageSnapshot()
 		if s.waitIfPaused(ctx) != nil {
@@ -688,7 +856,23 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 		if s.waitIfPaused(ctx) != nil {
 			return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
 		}
-		resp, err := complete(ctx, request)
+		if err := s.StorageError(); err != nil {
+			return Result{Status: StatusStorageError, Findings: err.Error(), StepCount: s.steps}
+		}
+		promptData, err := json.Marshal(request.Messages)
+		if err != nil {
+			return Result{Status: StatusError, Findings: err.Error(), StepCount: s.steps}
+		}
+		schemaData, err := json.Marshal(request.Tools)
+		if err != nil {
+			return Result{Status: StatusError, Findings: err.Error(), StepCount: s.steps}
+		}
+		promptHash, schemaHash := sha256.Sum256(promptData), sha256.Sum256(schemaData)
+		if _, err := s.control.Append(fmt.Sprintf("request:%d", turn), "model.request", map[string]any{"model": model, "prompt_sha256": fmt.Sprintf("%x", promptHash), "tools_sha256": fmt.Sprintf("%x", schemaHash), "blackboard_revision": s.bb.Revision()}); err != nil {
+			s.failStorage(err)
+			return Result{Status: StatusStorageError, Findings: err.Error(), StepCount: s.steps}
+		}
+		resp, err := s.modelCall(ctx, request, complete)
 		if err != nil {
 			s.loopEvent(LoopEvent{Kind: "turn_end", MessageType: "system", Subtype: "turn_end", Turn: turn, Step: s.steps, Outcome: "model_error"})
 			if ctx.Err() != nil {
@@ -736,6 +920,9 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 			return Result{Status: StatusCancelled, StopReason: "cancelled", StepCount: s.steps}
 		}
 		s.appendMessage(msg)
+		if err := s.StorageError(); err != nil {
+			return Result{Status: StatusStorageError, Findings: err.Error(), StepCount: s.steps}
+		}
 		if len(msg.ToolCalls) > 0 {
 			// Public assistant text can explain the current decision while tools
 			// run. It is distinct from private model reasoning and tool output.
@@ -753,6 +940,9 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 		}
 
 		if len(msg.ToolCalls) == 0 {
+			if s.HasJobs() {
+				return Result{Status: StatusWaitingEvent, Findings: strings.TrimSpace(msg.Content), StepCount: s.steps}
+			}
 			// Final text, no tool calls: this cycle is done.
 			if strings.TrimSpace(msg.Content) == "" {
 				s.loopEvent(LoopEvent{Kind: "turn_end", MessageType: "system", Subtype: "turn_end", Turn: turn,
@@ -779,7 +969,7 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 				s.loopEvent(LoopEvent{Kind: "tool_call", MessageType: "assistant", Subtype: "tool_use", Turn: turn,
 					Step: steps[i], MessageID: resp.ID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: tc.Function.Arguments})
 			}
-			results := runToolBatch(ctx, msg.ToolCalls, remaining, s.dispatch)
+			results := runToolBatch(ctx, msg.ToolCalls, remaining, s.dispatch, s.dispatchCall)
 			for i, tc := range msg.ToolCalls {
 				s.loopEvent(LoopEvent{Kind: "tool_result", MessageType: "user", Subtype: "tool_result", Turn: turn,
 					Step: steps[i], MessageID: resp.ID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: results[i]})
@@ -799,7 +989,7 @@ func (s *Solver) RunUntilDoneOrGaveUp(ctx context.Context) (out Result) {
 					Step: s.steps, MessageID: resp.ID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: tc.Function.Arguments})
 				result := "tool budget exhausted; call was not executed"
 				if remaining > 0 && calls <= maxToolCallsPerCycle && (s.stepLimit == 0 || s.steps+s.delegatedStepsTotal <= s.stepLimit) {
-					result = s.dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+					result = s.dispatchCall(ctx, tc)
 				}
 				s.loopEvent(LoopEvent{Kind: "tool_result", MessageType: "user", Subtype: "tool_result", Turn: turn,
 					Step: s.steps, MessageID: resp.ID, ToolCallID: tc.ID, Tool: tc.Function.Name, Text: result})

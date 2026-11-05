@@ -1,6 +1,7 @@
 package solver
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -39,7 +40,7 @@ func TestFreshHandoffKeepsSharedStateWithoutOldTranscript(t *testing.T) {
 		Deadline: time.Now().Add(time.Minute)})
 	s.messages = []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "OLD PRIVATE TRANSCRIPT"}}
 	fresh := s.FreshHandoff("")
-	if fresh == s || fresh.bb != bb || !fresh.scopeSnapshot().Allows("target.test") || len(fresh.messageSnapshot()) != 0 {
+	if fresh == s || fresh.bb != bb || !fresh.scopeSnapshot().Allows("target.test") || strings.Contains(fmt.Sprint(fresh.messageSnapshot()), "OLD PRIVATE TRANSCRIPT") {
 		t.Fatal("handoff did not create an isolated window with shared state")
 	}
 	if len(fresh.pendingUser) != 1 || !strings.Contains(fresh.pendingUser[0].Content, "shared blackboard") {

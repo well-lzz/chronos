@@ -31,7 +31,7 @@ chronos --web                         # 调度器 + Web 控制台（默认 http:
 chronos --engagement <config.json>    # 一次真实授权评估（无平台/调度器）
   --model SPEC         模型规格，可重复（默认 deepseek/deepseek-chat）
   --models-file PATH   操作人员提供的 OpenAI 兼容模型配置（与 --model 二选一）
-  --allow-exec         显式允许 run_python（不安全；仅在隔离环境使用）
+  --allow-exec         显式允许离线 OS 沙箱内的 run_python
   --no-exec            关闭 run_python（兼容参数；默认已关闭）
   --time-limit N       单任务墙钟秒数（默认取配置）
   --max-challenges N   并发窗口（默认取配置，硬上限 3）
@@ -54,7 +54,7 @@ chronos --engagement <config.json>    # 一次真实授权评估（无平台/调
 | `CHRONOS_STATE_DIR` | `.chronos-state` | 黑板/流量/报告/工作区根目录 |
 | `MAX_BUMPS` | `20` | 每个 executor 的硬性 bump 上限（兜底） |
 | `CHALLENGE_TIME_LIMIT_SECONDS` | `1800` | 默认墙钟预算 |
-| `ALLOW_LOCAL_EXEC` | `false` | 是否允许 run_python；仅在 OS/容器隔离中开启 |
+| `ALLOW_LOCAL_EXEC` | `false` | 是否允许离线 run_python；缺少可用 OS 沙箱时拒绝执行 |
 | `TARGET_INSECURE_TLS` | `false` | 是否跳过目标 TLS 证书校验 |
 | `PLATFORM_INSECURE_TLS` | `false` | 是否跳过平台 TLS 证书校验 |
 
@@ -81,7 +81,7 @@ chronos --engagement <config.json>    # 一次真实授权评估（无平台/调
 
 控制台前端是 `web/` 下的 **Next.js（App Router，React 19）** 应用，`output: 'export'` 静态导出后**嵌进 Go 二进制**，单二进制部署不变。
 
-本地控制台无需操作员令牌，打开 `http://127.0.0.1:8000` 即可使用控制、模型配置和 Scope 更新接口。服务仅允许监听 loopback 地址，并拦截跨源写请求；不要暴露到局域网或公网。engagement 模式允许操作员在界面替换 Scope，solver 在每次 HTTP/TCP/脚本调用时读取当前边界并强制校验。对话采用独立的无工具回复回合，因此即使执行器暂停或正忙，操作员仍会得到明确回复；消息本身不能修改 Scope。
+本地控制台使用操作员令牌，打开终端输出的 `http://127.0.0.1:8000/#token=…` 建立 HttpOnly 会话。全部 API 读写校验身份，浏览器写入另校验 CSRF；服务只监听 loopback，严格校验 Host 和来源。engagement 模式允许操作员在界面替换 Scope，solver 在每次 HTTP/TCP 调用时读取当前边界并强制校验。Python 仅在操作系统沙箱内离线执行。对话采用独立的无工具回复回合，因此即使执行器暂停或正忙，操作员仍会得到明确回复；消息本身不能修改 Scope。
 
 ```bash
 cd web && npm ci && npm run build        # 产出 web/out/
@@ -95,11 +95,11 @@ cd .. && go build -o chronos ./cmd/chronos
 
 ## 与 Python 版的等价性
 
-- **scope lock**：host + CIDR，`http_request`/`tcp_send` 在 Go 侧判定；`run_python` 的 socket 由 python 预序列护栏锁定——护栏用**闭包封装**，内部句柄/允许集不泄漏为全局（修掉了 Python 版那段预序列可被模型代码绕过的问题）。它是"防意外漂移"的结构性护栏，**不是**对抗蓄意逆向的沙箱（真隔离需 OS 级边界）。
+- **scope lock**：host + CIDR，`http_request`/`tcp_send` 在 Go 侧判定；`run_python` 使用独立 OS 沙箱进程，禁止联网，不再依赖可绕过的 Python socket 预序列。控制进程与 mission 生命周期仍共享 Go 进程，部署边界详见 [Harness 加固说明](harness-hardening.md)。
 - **证据链**：流量 ID → `evidence_refs{ref, role}`（baseline/proof/verification/supporting）→ 报告带可复现报文。复现步骤采用编号步骤 + `Expected:` 成功判据，并明确 CSRF、上传资源 URL 等动态值提取。
 - **验证**：`verify_finding` 先原样重放 reproduction，判决 `reproduced|refuted|inconclusive`；确认/驳回需要实际观察和本次 `verification` 流量，追加记录、原证据不可变。间接异常不能单独证明机制，完全相同的 title + target + category 会被保守去重。
 - **终止**：无内置，交给 `termination.ShouldTerminate`。
 
 ## 未实测边界
 
-沙箱内无 LLM Key / TSec VPN / 目标网络，故**未跑真实模型、真实平台与真实目标**。已验证：`go build ./...`、`go vet ./...`、`go test ./...`（scope/blackboard/traffic/engagement/report 单测）、engagement 空 scope 拒绝、engagement 全链路空跑产出报告、python 护栏实测（CIDR 内放行 / 越界拦截 / 内部不泄漏为全局）、Web 控制台起服务并返回 `/`、`/api/state`、`/api/command`。TSec 平台适配器与调度器针对不可达平台会干净地空转(轮询报错降级为空、不误判完成)。
+早期移植阶段仅完成离线测试；旧 Python 护栏测试已由 OS 沙箱负向测试取代。当前增加真实模型与进程自建目标的完整证据链验证及重复运行入口，结果、命令和局限见 [Harness 加固说明](harness-hardening.md)。这些验证不证明真实平台可达，也不证明任意授权生产目标上的长期稳定性。

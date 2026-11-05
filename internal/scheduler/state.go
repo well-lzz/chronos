@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/well-lzz/chronos/internal/durable"
 	"os"
 	"path/filepath"
 	"time"
@@ -76,7 +77,20 @@ func (s *Scheduler) loadState() error {
 
 // checkpoint serializes snapshots so an older asynchronous pull completion
 // cannot overwrite a newer coordinator state. Rename makes crash tails safe.
-func (s *Scheduler) checkpoint() error {
+func (s *Scheduler) checkpoint() (err error) {
+	defer func() {
+		if err != nil {
+			s.mu.Lock()
+			if s.storageErr == nil {
+				s.storageErr = err
+			}
+			cancel := s.storageCancel
+			s.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+		}
+	}()
 	path := s.statePath()
 	if path == "" {
 		return nil
@@ -121,15 +135,7 @@ func (s *Scheduler) checkpoint() error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return durable.WriteFile(path, data)
 }
 
 func (s *Scheduler) clearState() error {

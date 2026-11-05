@@ -51,6 +51,11 @@ func TestRenderEvidenceAndVerification(t *testing.T) {
 	md, _ := os.ReadFile(paths["md"])
 	html, _ := os.ReadFile(paths["html"])
 	jsonData, _ := os.ReadFile(paths["json"])
+	for format, data := range map[string][]byte{"md": md, "html": html, "json": jsonData} {
+		if !strings.Contains(string(data), "not absolute correctness") || !strings.Contains(string(data), "independently reproduce") {
+			t.Errorf("%s omitted verdict limitations", format)
+		}
+	}
 	for _, want := range []string{"Evidence traffic", "t1", "Verification history", "inconclusive", "Reflected XSS", "WAF response was misread", "### Claims"} {
 		if !strings.Contains(string(md), want) {
 			t.Errorf("md missing %q", want)

@@ -29,14 +29,17 @@ type RunMeta struct {
 }
 
 type report struct {
-	Mission       map[string]any           `json:"mission"`
-	GeneratedAt   string                   `json:"generated_at"`
-	Summary       map[string]int           `json:"summary"`
-	Findings      []blackboard.Finding     `json:"findings"`
-	Facts         []blackboard.Fact        `json:"facts"`
-	Subgoals      []blackboard.SubGoal     `json:"subgoals"`
-	EvidenceGraph blackboard.GraphSnapshot `json:"evidence_graph"`
+	VerdictSemantics string                   `json:"verdict_semantics"`
+	Mission          map[string]any           `json:"mission"`
+	GeneratedAt      string                   `json:"generated_at"`
+	Summary          map[string]int           `json:"summary"`
+	Findings         []blackboard.Finding     `json:"findings"`
+	Facts            []blackboard.Fact        `json:"facts"`
+	Subgoals         []blackboard.SubGoal     `json:"subgoals"`
+	EvidenceGraph    blackboard.GraphSnapshot `json:"evidence_graph"`
 }
+
+const verdictSemantics = "confirmed means the current program evidence rules are satisfied, not absolute correctness. Models still select evidence and interpret observations. Review the cited evidence and independently reproduce the result; the evidence graph makes review traceable, it does not replace it."
 
 func build(bb *blackboard.Blackboard, rm RunMeta) report {
 	mi := map[string]any{"name": bb.MissionID}
@@ -65,13 +68,14 @@ func build(bb *blackboard.Blackboard, rm RunMeta) report {
 		mi["cost_usd"] = rm.CostUSD
 	}
 	return report{
-		Mission:       mi,
-		GeneratedAt:   time.Now().Format("2006-01-02 15:04:05 -0700"),
-		Summary:       bb.Counts(),
-		Findings:      bb.FindingsSorted(),
-		Facts:         bb.FactsOrdered(),
-		Subgoals:      bb.SubgoalsOrdered(),
-		EvidenceGraph: bb.Graph(),
+		VerdictSemantics: verdictSemantics,
+		Mission:          mi,
+		GeneratedAt:      time.Now().Format("2006-01-02 15:04:05 -0700"),
+		Summary:          bb.Counts(),
+		Findings:         bb.FindingsSorted(),
+		Facts:            bb.FactsOrdered(),
+		Subgoals:         bb.SubgoalsOrdered(),
+		EvidenceGraph:    bb.Graph(),
 	}
 }
 
@@ -139,6 +143,8 @@ func renderMarkdown(r report) string {
 	s := r.Summary
 	w("")
 	w("## Summary")
+	w("> " + r.VerdictSemantics)
+	w("")
 	w(fmt.Sprintf("- Findings: **%d** (verified %d, candidate %d, inconclusive %d, refuted %d)",
 		s["findings"], s["findings_verified"], s["findings_candidate"], s["findings_inconclusive"], s["findings_refuted"]))
 	w(fmt.Sprintf("- Facts established: %d", s["facts"]))
@@ -283,6 +289,7 @@ func renderHTML(r report) string {
 	w("</style></head><body>")
 	w("<h1>Mission report — " + h(name) + "</h1>")
 	w("<p>Generated " + h(r.GeneratedAt) + "</p>")
+	w("<p role='note'>" + h(r.VerdictSemantics) + "</p>")
 	w("<ul class='meta'>")
 	for _, mo := range metaOrder {
 		if v := metaStr(r.Mission, mo.key); v != "" {

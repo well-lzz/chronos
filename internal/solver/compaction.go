@@ -67,6 +67,7 @@ func compactWindow(msgs []openai.ChatCompletionMessage, maxKeepTurns, budget int
 	// Guide/SetScope messages can land mid tool-loop, so a bare "is user" test is
 	// not enough). This keeps the retained tail structurally valid.
 	userIdx := cleanUserBoundaries(msgs)
+	unread := unreadReferenceStart(msgs)
 	if len(userIdx) < 2 {
 		// Nothing safe to drop — only shrink bulky message bodies (pairing intact).
 		out, changed := clipOld(msgs, budget)
@@ -81,6 +82,9 @@ func compactWindow(msgs []openai.ChatCompletionMessage, maxKeepTurns, budget int
 			continue
 		}
 		cut := userIdx[len(userIdx)-keep]
+		if unread >= 0 && cut > unread {
+			continue // reference text must reach a model turn before it can be evicted
+		}
 		out := make([]openai.ChatCompletionMessage, 0, len(msgs)-cut+1)
 		out = append(out, msgs[0])       // system prompt
 		out = append(out, msgs[cut:]...) // last `keep` cycles (starts on a clean boundary)
@@ -96,7 +100,29 @@ func compactWindow(msgs []openai.ChatCompletionMessage, maxKeepTurns, budget int
 			return out, true
 		}
 	}
-	return msgs, false
+	out, changed := clipOld(msgs, budget)
+	if !pairingValid(out) {
+		return msgs, false
+	}
+	return out, changed
+}
+
+// Uploaded reference text uses the ordinary operator inbox. Keep all newly
+// delivered reference messages intact until an assistant has had a turn to read
+// them; a provider context-limit error is preferable to analyzing a silent slice.
+func unreadReferenceStart(msgs []openai.ChatCompletionMessage) int {
+	lastAssistant := 0
+	for i, message := range msgs {
+		if message.Role == openai.ChatMessageRoleAssistant {
+			lastAssistant = i
+		}
+	}
+	for i := lastAssistant + 1; i < len(msgs); i++ {
+		if msgs[i].Role == openai.ChatMessageRoleUser && strings.HasPrefix(msgs[i].Content, "[Operator instruction]\n") && strings.Contains(msgs[i].Content, `"text_attachments":`) {
+			return i
+		}
+	}
+	return -1
 }
 
 // cleanUserBoundaries returns the indices of user messages (after the system
@@ -162,8 +188,9 @@ func clipOld(msgs []openai.ChatCompletionMessage, budget int) ([]openai.ChatComp
 	// segments may be dropped at safe user boundaries and then reinjected, but
 	// clipping their text would silently lose findings inside a live cycle.
 	protected := make(map[int]bool)
+	unread := unreadReferenceStart(out)
 	for i := 1; i < len(out); i++ {
-		if out[i].Role == openai.ChatMessageRoleUser &&
+		if (unread >= 0 && i >= unread && out[i].Role == openai.ChatMessageRoleUser) || out[i].Role == openai.ChatMessageRoleUser &&
 			(strings.Contains(out[i].Content, "## working record (blackboard)") ||
 				strings.Contains(out[i].Content, "## blackboard changes (revision")) {
 			protected[i] = true

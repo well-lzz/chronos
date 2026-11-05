@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "test": "node --test test/*.test.mjs",
     "dev": "next dev -p 3000",
     "build": "next build",
     "build:static": "next build",

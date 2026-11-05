@@ -61,6 +61,8 @@ type Scheduler struct {
 	scopeUpdateMu  sync.Mutex
 	checkpointMu   sync.Mutex
 	recoveryErr    error
+	storageErr     error
+	storageCancel  context.CancelFunc
 	events         []OrchestrationEvent
 	eventSeq       uint64
 	runs           map[string]*run
@@ -109,14 +111,16 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	if s.recoveryErr != nil {
 		return s.recoveryErr
 	}
-	runCtx := ctx
+	runCtx, storageCancel := context.WithCancel(ctx)
+	defer storageCancel()
 	cancel := func() {}
 	if s.cfg.TotalBudgetSeconds > 0 {
-		runCtx, cancel = context.WithDeadline(ctx, s.runStart.Add(time.Duration(s.cfg.TotalBudgetSeconds)*time.Second))
+		runCtx, cancel = context.WithDeadline(runCtx, s.runStart.Add(time.Duration(s.cfg.TotalBudgetSeconds)*time.Second))
 	}
 	defer cancel()
 	s.mu.Lock()
 	s.runCtx = runCtx
+	s.storageCancel = storageCancel
 	s.mu.Unlock()
 
 	pmin, pmax := 5*time.Second, 15*time.Second
@@ -150,7 +154,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				log.Printf("Global budget exhausted; stopping all active work.")
 			}
 			s.shutdown()
-			return nil
+			s.mu.Lock()
+			err := s.storageErr
+			s.mu.Unlock()
+			return err
 		case ev := <-s.poll.Events():
 			s.handleEvent(runCtx, ev)
 		case c := <-s.cmds:
@@ -174,6 +181,21 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			s.autoSpawnUnsolved(runCtx)
 		}
 
+		s.mu.Lock()
+		var failed error
+		for _, r := range s.runs {
+			if r.sw != nil {
+				if err := r.sw.Failure(); err != nil {
+					failed = err
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
+		if failed != nil {
+			s.shutdown()
+			return failed
+		}
 		if s.reapAndRefill(runCtx) {
 			// slot freed; refill already attempted inside
 		}
@@ -515,6 +537,7 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 	s.mu.Unlock()
 	if err := s.checkpoint(); err != nil {
 		log.Printf("scheduler checkpoint failed: %v", err)
+		return
 	}
 
 	s.pulls.Add(1)
@@ -610,7 +633,11 @@ func (s *Scheduler) spawnOne(ctx context.Context, name string) {
 			log.Printf("start run history %s: %v", stateID, err)
 		}
 		s.recordDecision("spawn", name, "slot_available", fmt.Sprintf("%d executor(s)", len(s.specs)))
-		_ = s.checkpoint()
+		if err := s.checkpoint(); err != nil {
+			cancel()
+			close(r.done)
+			return
+		}
 		log.Printf("Swarm spawned for %s (%d models)", name, len(s.specs))
 		go func() {
 			defer close(r.done)

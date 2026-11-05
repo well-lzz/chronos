@@ -130,8 +130,8 @@ func (s *Scheduler) Chat(challenge, model, message string) error {
 	s.mu.Lock()
 	r := s.runs[challenge]
 	s.mu.Unlock()
-	if r == nil || strings.TrimSpace(message) == "" || !r.sw.Chat(model, message) {
+	if r == nil || strings.TrimSpace(message) == "" {
 		return fmt.Errorf("selected executor is unavailable; choose a running executor")
 	}
-	return nil
+	return r.sw.ChatChecked(model, message)
 }

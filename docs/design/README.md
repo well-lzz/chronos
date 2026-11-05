@@ -1,6 +1,6 @@
 # 设计方案
 
-2026-10-25 至 10-27 的一轮 harness 审计与演进中写下的设计方案。它们记录**为什么这样做、比较过哪些替代方案、刻意不做什么**。截至 2026-10-30，五份方案均已在 `main` 实现；实现细节以代码和各实现契约为准，这里保留的是设计取舍。
+这里收录 harness 审计与演进中的设计方案，记录**为什么这样做、比较过哪些替代方案、刻意不做什么**。2026-10-25 至 10-27 首轮五份方案涉及的能力截至 2026-10-30 已在 `main` 实现；新增提案单独标明状态。实现细节以代码和各实现契约为准。
 
 | 方案 | 解决的问题 | 状态 | 落地位置 |
 |---|---|---|---|
@@ -9,6 +9,7 @@
 | [任务编排优化](orchestration-plan.md) | 并行写冲突、发现者自验、崩溃即重来、无理性终止 | ✅ 已实现（`c7f7122`） | 租约 `internal/solver/leases.go`、独立验证与恢复 `internal/swarm`、会话接力 `internal/solver/handoff.go` |
 | [借鉴 ARTEX](artex-borrow-plan.md) | 缺调用计量、跨模型故障转移、通用工具闸门、保真压缩 | ✅ 已实现（`7e452b5`） | `internal/llmrec`、`internal/llm/pool.go`、`internal/guard`、`internal/blackboard/digest.go` |
 | [问题与解决方案汇总](problems-and-solutions.md) | 以上全部问题的总索引（问题 → 根因 → 方案） | 历史快照 | 表内状态为 10-27 时点，现均已实现 |
+| [借鉴 Super-agent 的 Harness 优化](harness-superagent-optimization.md) | 同步子任务阻塞、子任务恢复缺口、存储故障静默降级与事件可靠投递 | 核心已在工作区实现；异步默认关闭 | 持久化、幂等 Inbox、异步子任务、按 ID 召回与监督观测；见 [运行说明](../harness-runtime.md) |
 
 ## 共同的设计边界
 

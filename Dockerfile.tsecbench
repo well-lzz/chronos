@@ -15,7 +15,7 @@ FROM python:3.13-slim-bookworm
 COPY --from=node-runtime /usr/local/ /usr/local/
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 bubblewrap \
     && npm install -g @playwright/mcp@0.0.83 \
     && npx --yes playwright@1.64.0-alpha-1790635538000 install --with-deps chromium \
     && chmod -R a+rX /opt/ms-playwright \
@@ -37,7 +37,7 @@ ENV HOME=/state \
     MAX_CHALLENGE_ATTEMPTS=3 \
     DEFER_RETRY_COOLDOWN_SECONDS=120 \
     AUTO_RESUME_IDLE_SECONDS=240 \
-    ALLOW_LOCAL_EXEC=true \
+    ALLOW_LOCAL_EXEC=false \
     CHRONOS_PLAYWRIGHT_CLI=/usr/local/lib/node_modules/@playwright/mcp/cli.js \
     CHRONOS_PLAYWRIGHT_NO_SANDBOX=true
 

@@ -53,7 +53,7 @@ func (s *Swarm) Resume() {
 }
 
 func terminalStatus(status string) bool {
-	return status == "finished" || status == "cancelled" || status == "flag_found"
+	return status == "finished" || status == "cancelled" || status == "flag_found" || status == "storage_error" || status == "budget_exhausted"
 }
 
 // waitIfPaused is shared by the parent loop, model/tool loop and cold digest.

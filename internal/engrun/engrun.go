@@ -256,10 +256,7 @@ func (r *Runner) Chat(_ string, model, message string) error {
 	r.mu.RLock()
 	sw := r.sw
 	r.mu.RUnlock()
-	if !sw.Chat(model, message) {
-		return fmt.Errorf("selected executor is unavailable; choose a running executor")
-	}
-	return nil
+	return sw.ChatChecked(model, message)
 }
 
 func (r *Runner) ScopeConfig() console.ScopeConfig {

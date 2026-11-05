@@ -21,6 +21,7 @@ import (
 
 	"github.com/well-lzz/chronos/internal/blackboard"
 	"github.com/well-lzz/chronos/internal/config"
+	"github.com/well-lzz/chronos/internal/durable"
 	"github.com/well-lzz/chronos/internal/engagement"
 	"github.com/well-lzz/chronos/internal/engrun"
 	"github.com/well-lzz/chronos/internal/guard"
@@ -30,6 +31,7 @@ import (
 	"github.com/well-lzz/chronos/internal/mission"
 	"github.com/well-lzz/chronos/internal/notify"
 	"github.com/well-lzz/chronos/internal/platform"
+	"github.com/well-lzz/chronos/internal/pythonexec"
 	"github.com/well-lzz/chronos/internal/report"
 	"github.com/well-lzz/chronos/internal/runhistory"
 	"github.com/well-lzz/chronos/internal/scheduler"
@@ -48,6 +50,9 @@ func (m *modelList) Set(v string) error {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--mission-worker" {
+		os.Exit(missionWorkerMain())
+	}
 	var (
 		engPath    string
 		modelsFile string
@@ -64,7 +69,7 @@ func main() {
 	flag.StringVar(&engPath, "engagement", "", "run an Assessment engagement from a scope config (JSON)")
 	flag.Var(&models, "model", "model spec, repeatable (default deepseek/deepseek-chat)")
 	flag.StringVar(&modelsFile, "models-file", "", "JSON file of operator-selected OpenAI-compatible executor models")
-	flag.BoolVar(&allowExec, "allow-exec", false, "allow model-generated Python on this host (unsafe; opt-in)")
+	flag.BoolVar(&allowExec, "allow-exec", false, "allow offline Python in an OS sandbox (opt-in; refuses unsandboxed execution)")
 	flag.BoolVar(&noExec, "no-exec", false, "disable the run_python tool (deprecated; execution is disabled by default)")
 	flag.IntVar(&timeLimit, "time-limit", 0, "per-mission wall-clock seconds (default from config)")
 	flag.BoolVar(&webUI, "web", false, "launch the web console alongside the scheduler")
@@ -97,6 +102,14 @@ func main() {
 	}
 	if cfg.MaxConcurrent > 3 {
 		cfg.MaxConcurrent = 3
+	}
+	if !preflight {
+		writer, err := durable.LockDir(cfg.StateDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "state directory:", err)
+			os.Exit(2)
+		}
+		defer writer.Close()
 	}
 	if err := guard.Shared(cfg.StateDir, cfg.ToolRulesFile).LoadError(); err != nil {
 		fmt.Fprintln(os.Stderr, "tool rules:", err)
@@ -150,7 +163,7 @@ func main() {
 
 	// Engagement mode: one authorized assessment, no platform/scheduler.
 	if engPath != "" {
-		if err := runEngagement(cfg, engPath, specs, llmStore, modelProfiles, useConsoleProfile, webUI, webHost, webPort, timeLimit); err != nil {
+		if err := runIsolatedEngagement(cfg, engPath, specs, llmStore, modelProfiles, useConsoleProfile, webUI, webHost, webPort, timeLimit); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -262,8 +275,15 @@ func runPreflight(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 		_ = os.Remove(name)
 	}
 	if cfg.AllowLocalExec {
-		if _, err := exec.LookPath("python3"); err != nil {
+		if python, err := exec.LookPath("python3"); err != nil {
 			failures = append(failures, "ALLOW_LOCAL_EXEC is enabled but python3 is unavailable")
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			_, err := pythonexec.Run(ctx, python, "print('sandbox preflight')")
+			cancel()
+			if err != nil {
+				failures = append(failures, "Python OS sandbox cannot start: "+err.Error())
+			}
 		}
 	}
 
@@ -329,6 +349,8 @@ func runScheduler(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	notifier, _ := notify.Shared(cfg.StateDir, cfg.WebhookURL)
+	go notifier.Run(ctx)
 
 	fmt.Printf("chronos scheduler — platform adapter %q (%s), models %s, window %d\n",
 		cfg.PlatformMode, cfg.PlatformBase(), strings.Join(specs, ", "), cfg.MaxConcurrent)
@@ -336,7 +358,7 @@ func runScheduler(cfg config.Settings, specs []string, llmStore *llmconfig.Store
 		fmt.Printf("DeepSeek API key pool: %d keys (request-level round-robin; automatic failover enabled)\n", len(cfg.DeepSeekKeys))
 	}
 	if webUI {
-		fmt.Printf("Web console → http://%s:%d (Ctrl+C to stop)\n", webHost, webPort)
+		fmt.Println("Starting authenticated local console (Ctrl+C to stop)")
 		go func() {
 			if err := web.ServeWithServices(ctx, sch, llmStore, web.Services{Recorder: llmrec.Shared(cfg.StateDir, cfg.LLMRecord), Guard: guard.Shared(cfg.StateDir, cfg.ToolRulesFile), History: history}, webHost, webPort); err != nil {
 				fmt.Fprintln(os.Stderr, "web console error:", err)
@@ -399,7 +421,7 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 	} else if previous.RunID != "" {
 		runID = previous.RunID
 	}
-	if sc.IsEmpty() && !webUI {
+	if sc.IsEmpty() && !webUI && workerControl == nil {
 		return fmt.Errorf("engagement has no authorized scope; start with --web to set it before execution, or add scope.targets to the config")
 	}
 	if previous.Started.IsZero() || runID == "" {
@@ -440,6 +462,8 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 	}
 	base, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	notifier, _ := notify.Shared(cfg.StateDir, cfg.WebhookURL)
+	go notifier.Run(base)
 	deadline := time.Time{}
 	if budget > 0 {
 		deadline = started.Add(time.Duration(budget) * time.Second)
@@ -461,7 +485,7 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 		Meta: meta, Scope: sc, ModelSpecs: specs, Settings: cfg, BB: bb, TL: tl, LLM: llmStore, ModelProfiles: profiles,
 		UseConsoleProfile: useConsoleProfile,
 	}
-	if webUI {
+	if webUI || workerControl != nil {
 		// Web engagements are operator-led: configure/review Scope and converse
 		// while paused, then explicitly resume autonomous execution.
 		sw.Pause()
@@ -533,12 +557,17 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 			}
 		})
 		done := runner.Start(ctx)
-		fmt.Printf("Web console → http://%s:%d (findings: confirmed/suspected/failed)\n\n", webHost, webPort)
-		go func() {
-			if err := web.ServeWithServices(ctx, runner, llmStore, web.Services{Recorder: llmrec.Shared(cfg.StateDir, cfg.LLMRecord), Guard: guard.Shared(cfg.StateDir, cfg.ToolRulesFile), History: history}, webHost, webPort); err != nil {
-				fmt.Fprintln(os.Stderr, "web console error:", err)
-			}
-		}()
+		if workerControl != nil {
+			workerControl(runner)
+		}
+		if webUI {
+			fmt.Println("Starting authenticated local console (findings: confirmed/suspected/failed)")
+			go func() {
+				if err := web.ServeWithServices(ctx, runner, llmStore, web.Services{Recorder: llmrec.Shared(cfg.StateDir, cfg.LLMRecord), Guard: guard.Shared(cfg.StateDir, cfg.ToolRulesFile), History: history}, webHost, webPort); err != nil {
+					fmt.Fprintln(os.Stderr, "web console error:", err)
+				}
+			}()
+		}
 		<-done
 		sw, bb, meta, started = runner.Current()
 	} else {
@@ -550,7 +579,11 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 		sw.Run(runCtx)
 		runCancel()
 	}
+	runFailure := sw.Failure()
 	outcome := "completed"
+	if runFailure != nil {
+		outcome = "storage_or_budget_error"
+	}
 	if base.Err() != nil {
 		outcome = "interrupted"
 	}
@@ -558,6 +591,9 @@ func runEngagement(cfg config.Settings, path string, specs []string, llmStore *l
 		fmt.Fprintln(os.Stderr, "record engagement completion:", err)
 	}
 	cancel()
+	if runFailure != nil {
+		return runFailure
+	}
 	if base.Err() == nil {
 		if err := engagement.ClearRuntime(cfg.StateDir, runtimeID); err != nil {
 			return fmt.Errorf("clear engagement runtime: %w", err)

@@ -2,21 +2,37 @@ package solver
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/well-lzz/chronos/internal/taskruntime"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/well-lzz/chronos/internal/blackboard"
 	"github.com/well-lzz/chronos/internal/browsermcp"
 	"github.com/well-lzz/chronos/internal/nettools"
 )
 
+type toolCallKey struct{}
+
+func (s *Solver) dispatchCall(ctx context.Context, call openai.ToolCall) string {
+	return s.dispatch(context.WithValue(ctx, toolCallKey{}, call.ID), call.Function.Name, call.Function.Arguments)
+}
+
 // dispatch executes one tool call and returns the tool result text.
 func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
+	if err := s.start(); err != nil {
+		return "storage_error; call was not executed: " + err.Error()
+	}
+	if err := s.StorageError(); err != nil {
+		return "storage_error; call was not executed: " + err.Error()
+	}
 	if s.waitIfPaused(ctx) != nil {
 		return "cancelled; call was not executed"
 	}
@@ -36,10 +52,66 @@ func (s *Solver) dispatch(ctx context.Context, name, argsJSON string) string {
 			return message
 		}
 	}
-	if s.bb != nil {
-		_ = s.bb.TouchMentioned(argsJSON)
+	if err := s.StorageError(); err != nil {
+		return "storage_error; call was not executed: " + err.Error()
 	}
+	if s.bb != nil {
+		if err := s.bb.TouchMentioned(argsJSON); err != nil {
+			s.failStorage(err)
+			return "storage_error; call was not executed: " + err.Error()
+		}
+	}
+	id, err := newAgentID()
+	if err != nil {
+		return "action id error; call was not executed: " + err.Error()
+	}
+	callID, _ := ctx.Value(toolCallKey{}).(string)
+	if callID != "" {
+		id = fmt.Sprintf("turn-%d:%s", s.turns, callID)
+	}
+	intent := map[string]any{"tool_call_id": callID, "executor": s.ModelSpec, "tool": name, "arguments": argsJSON}
+	if _, err := s.control.Append(id+":intent", "action.intent", intent); err != nil {
+		s.failStorage(err)
+		return "storage_error; call was not executed: " + err.Error()
+	}
+	if err := s.StorageError(); err != nil {
+		return "storage_error; call was not executed: " + err.Error()
+	}
+	if blocked := s.preToolScope(name, argsJSON); blocked != "" {
+		return blocked
+	}
+	acquired, err := s.control.Claim(id+":claimed", "action.claimed", nil)
+	if err != nil {
+		s.failStorage(err)
+		return "storage_error; call was not executed: " + err.Error()
+	}
+	if !acquired {
+		return "action already started previously; result may be unknown; inspect existing traffic before any new action"
+	}
+	if s.budget != nil {
+		if err := s.budget.Spend(s.budgetOwner); err != nil {
+			if !errors.Is(err, taskruntime.ErrExhausted) {
+				s.failStorage(err)
+			}
+			return "tool-step budget unavailable; call was not executed: " + err.Error()
+		}
+	}
+	_, err = s.control.Append(id+":started", "action.started", nil)
+	if err != nil {
+		s.failStorage(err)
+		return "storage_error; call was not executed: " + err.Error()
+	}
+	s.health.activeTools.Add(1)
+	defer s.health.activeTools.Add(-1)
 	result := s.dispatchCore(ctx, name, argsJSON)
+	hash := sha256.Sum256([]byte(result))
+	kind := "action.result"
+	if s.StorageError() != nil {
+		kind = "action.unknown"
+	}
+	if _, err := s.control.Append(id+":result", kind, map[string]string{"sha256": fmt.Sprintf("%x", hash)}); err != nil {
+		s.failStorage(err)
+	}
 	if s.guard != nil {
 		s.guard.Post(missionID, s.ModelSpec, name, result)
 	}
@@ -155,6 +227,27 @@ func (s *Solver) dispatchCore(ctx context.Context, name, argsJSON string) string
 		return s.toolTrafficSearch(argsJSON)
 	case "traffic_get":
 		return s.toolTrafficGet(argsJSON)
+	case "artifact_get":
+		var a struct {
+			Kind      string `json:"kind"`
+			ID        string `json:"id"`
+			Query     string `json:"query"`
+			Page      int    `json:"page"`
+			Offset    int    `json:"offset"`
+			Length    int    `json:"length"`
+			Neighbors bool   `json:"neighbors"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
+			return "artifact_get: invalid arguments"
+		}
+		if a.ID == "" {
+			return jsonOut(s.bb.ArtifactIndex(a.Kind, a.Query, a.Page))
+		}
+		record, err := s.bb.ReadArtifact(a.Kind, a.ID, a.Offset, a.Length, a.Neighbors)
+		if err != nil {
+			return "artifact_get: " + err.Error()
+		}
+		return jsonOut(record)
 	case "notify":
 		var a struct {
 			Message string `json:"message"`
@@ -166,6 +259,12 @@ func (s *Solver) dispatchCore(ctx context.Context, name, argsJSON string) string
 		return "noted."
 	case "submit_flag":
 		return s.toolSubmitFlag(argsJSON)
+	case "delegate_start":
+		return s.toolDelegateStart(ctx, argsJSON)
+	case "delegate_status":
+		return s.toolDelegateStatus(argsJSON)
+	case "delegate_cancel":
+		return s.toolDelegateCancel(argsJSON)
 	case "delegate":
 		return s.toolDelegate(ctx, argsJSON)
 	case "delegate_resume":
@@ -215,6 +314,7 @@ func (s *Solver) toolHTTP(ctx context.Context, argsJSON string) string {
 	}, s.insecureTLS, s.checkHTTPMutationLease)
 	tid, err := s.tl.RecordHTTP(a.Method, a.URL, a.Headers, a.Body, display, s.ModelSpec)
 	if err != nil {
+		s.failStorage(err)
 		return display + "\ntraffic persistence error: " + err.Error()
 	}
 	return display + fmt.Sprintf("\n[traffic %s — cite as evidence with add_finding/verify_finding]", tid)
@@ -243,6 +343,7 @@ func (s *Solver) toolTCP(ctx context.Context, argsJSON string) string {
 	display := nettools.DoTCPSendContext(ctx, a.Host, a.Port, payload, 30*time.Second, 3*time.Second)
 	tid, err := s.tl.RecordTCP(a.Host, a.Port, a.Payload, a.PayloadHex, display, s.ModelSpec)
 	if err != nil {
+		s.failStorage(err)
 		return display + "\ntraffic persistence error: " + err.Error()
 	}
 	return display + fmt.Sprintf("\n[traffic %s — cite as evidence]", tid)

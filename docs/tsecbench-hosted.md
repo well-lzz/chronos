@@ -23,7 +23,7 @@
 - `dist/chronos-tsecbench-amd64.tar.gz`
 - `dist/chronos-tsecbench-amd64.tar.gz.sha256`
 
-镜像为 `linux/amd64`，使用非 root 用户运行，包含 CPython 标准库供受 Scope 锁约束的 `run_python` 使用。构建上下文不会复制 `.env`、本地状态、日志或 Git 历史。平台限制为 3 GB；脚本会在导出后检查大小。
+镜像为 `linux/amd64`，使用非 root 用户运行，包含 CPython 和 bubblewrap。`run_python` 默认关闭，显式开启后仅在离线 OS 沙箱内执行；宿主必须允许用户命名空间，禁止时拒绝运行，不降级为宿主 Python。网络操作经 Go 的 Scope 检查工具执行。构建上下文不会复制 `.env`、本地状态、日志或 Git 历史。平台限制为 3 GB；脚本会在导出后检查大小。
 
 ## 平台运行变量
 

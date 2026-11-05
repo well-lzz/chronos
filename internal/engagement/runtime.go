@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/well-lzz/chronos/internal/durable"
 	"os"
 	"path/filepath"
 	"time"
@@ -66,15 +67,7 @@ func SaveRuntime(stateDir, name string, started, deadline time.Time, current sco
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return durable.WriteFile(path, data)
 }
 
 func ClearRuntime(stateDir, name string) error {

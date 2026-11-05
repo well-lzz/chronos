@@ -20,7 +20,57 @@ import (
 	"github.com/well-lzz/chronos/internal/traffic"
 )
 
-type Store struct{ StateDir string }
+type Store struct {
+	StateDir string
+	Leaf     bool
+}
+
+// Supervisors can read completed capsule histories, while workers only mount
+// their own state root. Never follow symlinks supplied inside a capsule tree.
+func (s Store) capsules() ([]Store, error) {
+	if s.Leaf {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(filepath.Join(s.StateDir, "capsules"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var stores []Store
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		id, err := hex.DecodeString(entry.Name())
+		if err != nil || len(id) != 16 {
+			continue
+		}
+		stores = append(stores, Store{StateDir: filepath.Join(s.StateDir, "capsules", entry.Name()), Leaf: true})
+	}
+	return stores, nil
+}
+
+func (s Store) capsuleFor(id string) (*Store, error) {
+	stores, err := s.capsules()
+	if err != nil {
+		return nil, err
+	}
+	for _, store := range stores {
+		runs, err := store.List(nil)
+		if err != nil {
+			return nil, err
+		}
+		for _, run := range runs {
+			if run.ID == id {
+				copy := store
+				return &copy, nil
+			}
+		}
+	}
+	return nil, nil
+}
 
 type Run struct {
 	ID      string         `json:"id"`
@@ -276,6 +326,23 @@ func (s Store) List(active map[string]bool) ([]Run, error) {
 		}
 		out = append(out, run)
 	}
+	stores, err := s.capsules()
+	if err != nil {
+		return nil, err
+	}
+	for _, store := range stores {
+		runs, err := store.List(active)
+		if err != nil {
+			return nil, err
+		}
+		for _, run := range runs {
+			if _, exists := indexed[run.ID]; exists {
+				return nil, fmt.Errorf("duplicate run identity across isolation roots")
+			}
+			indexed[run.ID] = run
+			out = append(out, run)
+		}
+	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Started.Equal(out[j].Started) {
 			return out[i].ID < out[j].ID
@@ -298,6 +365,11 @@ func baseMission(id string) string {
 }
 
 func (s Store) Detail(id string, active map[string]bool) (Detail, error) {
+	if nested, err := s.capsuleFor(id); err != nil {
+		return Detail{}, err
+	} else if nested != nil {
+		return nested.Detail(id, active)
+	}
 	runs, err := s.List(active)
 	if err != nil {
 		return Detail{}, err
@@ -361,6 +433,11 @@ func (s Store) findReport(id string) (savedReport, bool) {
 }
 
 func (s Store) Traffic(runID, trafficID string) (map[string]any, error) {
+	if nested, err := s.capsuleFor(runID); err != nil {
+		return nil, err
+	} else if nested != nil {
+		return nested.Traffic(runID, trafficID)
+	}
 	runs, err := s.List(nil)
 	if err != nil {
 		return nil, err

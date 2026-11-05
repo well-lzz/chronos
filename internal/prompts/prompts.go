@@ -58,8 +58,8 @@ func BuildHeadlessPrompt(m mission.Meta, remainingSeconds int, allowExec bool) s
 	if len(addrs) > 0 {
 		w("In scope: " + strings.Join(addrs, ", "))
 		w("These hosts/ranges are the ONLY authorized targets. A scope lock is enforced:")
-		w("http_request, tcp_send, and run_python socket connections to anything outside")
-		w("this scope are blocked, with no bypass. Touching out-of-scope systems is")
+		w("http_request and tcp_send connections outside this scope are blocked.")
+		w("run_python is offline in an OS sandbox and cannot access any network. Touching out-of-scope systems is")
 		w("unauthorized and any result found there is invalid — stay strictly within scope.")
 	} else {
 		w("No target was provided. Without an authorized target you cannot proceed — report")
@@ -103,8 +103,8 @@ func BuildHeadlessPrompt(m mission.Meta, remainingSeconds int, allowExec bool) s
 	w("- `traffic_search(host, url_contains, body_contains, page)` / `traffic_get(traffic_id,")
 	w("  side, offset, length)`: search/read what you ALREADY captured instead of re-fetching.")
 	if allowExec {
-		w("- `run_python(code)`: local CPython scratchpad (if available on the host). Its sockets")
-		w("  are scope-locked too.")
+		w("- `run_python(code)`: offline CPython scratchpad in an OS sandbox, if enabled.")
+		w("  No network, credentials or host workspace access. Use http_request/tcp_send for target traffic.")
 	}
 	if hasFlags {
 		w("- `submit_flag(flag)`: if the target yields a flag, submit it verbatim; recorded as a")

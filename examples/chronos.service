@@ -1,0 +1,25 @@
+# Linux deployment example; customize paths and install prerequisites first.
+[Unit]
+Description=Chronos authorized assessment runtime
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=chronos
+Group=chronos
+StateDirectory=chronos
+WorkingDirectory=/var/lib/chronos
+Environment=CHRONOS_STATE_DIR=/var/lib/chronos/state
+EnvironmentFile=/etc/chronos/chronos.env
+ExecStart=/opt/chronos/chronos --engagement /etc/chronos/engagement.json
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

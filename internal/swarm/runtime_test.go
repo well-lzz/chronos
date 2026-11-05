@@ -1,6 +1,7 @@
 package swarm
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -19,7 +20,10 @@ func TestExecutorRuntimeCheckpointRestoresCycleCounters(t *testing.T) {
 	if err := s.saveRuntime("model-a", state); err != nil {
 		t.Fatal(err)
 	}
-	got := s.loadRuntime("model-a")
+	got, err := s.loadRuntime("model-a")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.Cycles != 7 || got.Bumps != 3 || got.Steps != 31 || got.ToolCalls != 199 || got.Tools["http_request"] != 199 || !got.StartedAt.Equal(started) {
 		t.Fatalf("runtime state not restored: %+v", got)
 	}
@@ -27,7 +31,23 @@ func TestExecutorRuntimeCheckpointRestoresCycleCounters(t *testing.T) {
 	if err := s.saveRuntime("model-a", state); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.loadRuntime("model-a"); got.Cycles != 0 {
+	if got, err := s.loadRuntime("model-a"); err != nil || got.Cycles != 0 {
 		t.Fatalf("finished attempt unexpectedly resumed: %+v", got)
+	}
+}
+
+func TestRuntimeRejectsCorruptionAndFutureVersion(t *testing.T) {
+	bb, _ := blackboard.LoadOrNew("bad-state", t.TempDir())
+	s := &Swarm{BB: bb}
+	if err := s.saveRuntime("a", executorRuntime{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range []string{"{broken", `{"version":2,"cycles":8}`} {
+		if err := os.WriteFile(s.runtimePath("a"), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.loadRuntime("a"); err == nil {
+			t.Fatal("bad checkpoint silently reset")
+		}
 	}
 }

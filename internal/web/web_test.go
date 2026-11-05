@@ -20,7 +20,8 @@ func TestLoopbackHost(t *testing.T) {
 }
 
 func TestProtectRejectsCrossOriginWrite(t *testing.T) {
-	handler := protect(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	auth, _ := newConsoleAuth("127.0.0.1", 80, strings.Repeat("t", 32))
+	handler := auth.protect(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/command", strings.NewReader(`{}`))
 	req.Host = "127.0.0.1"
 	req.Header.Set("Origin", "https://evil.example")

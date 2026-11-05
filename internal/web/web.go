@@ -11,11 +11,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -29,9 +30,13 @@ import (
 )
 
 type Services struct {
-	Recorder *llmrec.Recorder
-	Guard    *guard.Manager
-	History  *runhistory.Store
+	// Forward handles explicitly selected internal-worker APIs after the
+	// supervisor's authentication, origin and CSRF middleware has accepted them.
+	Forward      func(http.ResponseWriter, *http.Request) bool
+	ConsoleToken string
+	Recorder     *llmrec.Recorder
+	Guard        *guard.Manager
+	History      *runhistory.Store
 }
 
 // The console front-end is a Next.js app, statically exported to dist/ (built
@@ -52,11 +57,50 @@ func ServeWithServices(ctx context.Context, src console.Source, store *llmconfig
 	if !loopbackHost(host) {
 		return fmt.Errorf("web console refuses non-loopback host %q; use 127.0.0.1, ::1, or localhost", host)
 	}
+	listener, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	actualPort := listener.Addr().(*net.TCPAddr).Port
+	token := services.ConsoleToken
+	if token == "" {
+		token = os.Getenv("CHRONOS_CONSOLE_TOKEN")
+	}
+	auth, err := newConsoleAuth(host, actualPort, token)
+	if err != nil {
+		return err
+	}
+	handler, err := consoleHandler(src, store, services, auth)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Web console access → %s\n", auth.accessURL())
+
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	log.Printf("Web console on http://%s", addr)
+	server := &http.Server{
+		Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
+	}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+func consoleHandler(src console.Source, store *llmconfig.Store, services Services, auth *consoleAuth) (http.Handler, error) {
 	mux := http.NewServeMux()
 
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mux.Handle("/", http.FileServerFS(sub))
 
@@ -306,22 +350,38 @@ func ServeWithServices(ctx context.Context, src console.Source, store *llmconfig
 		writeJSON(w, map[string]any{"ok": true})
 	})
 
-	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	log.Printf("Web console on http://%s", addr)
-	server := &http.Server{
-		Addr: addr, Handler: protect(mux), ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
-	}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
-	}()
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	mux.HandleFunc("/api/session", auth.sessionHandler)
+	return auth.protect(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if services.Forward != nil && services.Forward(w, r) {
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})), nil
+}
+
+// ServeWorker exposes a private capability-authenticated Unix control socket.
+// Workers never open a TCP console or receive the public operator token.
+func ServeWorker(ctx context.Context, listener net.Listener, src console.Source, store *llmconfig.Store, services Services, token string) error {
+	auth, err := newConsoleAuth("127.0.0.1", 1, token)
+	if err != nil {
 		return err
 	}
-	return nil
+	handler, err := consoleHandler(src, store, services, auth)
+	if err != nil {
+		return err
+	}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdown)
+	}()
+	err = server.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -339,7 +399,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(dst) == nil
+	if decoder.Decode(dst) != nil {
+		return false
+	}
+	return decoder.Decode(new(any)) == io.EOF
 }
 
 func loopbackHost(host string) bool {
@@ -349,22 +412,4 @@ func loopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
-}
-
-func protect(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Cache-Control", "no-store")
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			if origin := r.Header.Get("Origin"); origin != "" {
-				u, err := url.Parse(origin)
-				if err != nil || !strings.EqualFold(u.Host, r.Host) {
-					http.Error(w, "cross-origin request blocked", http.StatusForbidden)
-					return
-				}
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
 }

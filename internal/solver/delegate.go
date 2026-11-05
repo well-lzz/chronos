@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/well-lzz/chronos/internal/durable"
 	"log"
 	"os"
 	"path/filepath"
@@ -27,6 +28,10 @@ type ChildEvent struct {
 }
 
 type delegatedChild struct {
+	async          bool
+	parentActor    string
+	attempt        int
+	savedScope     []string
 	id             string
 	parentID       string
 	actor          string
@@ -52,6 +57,12 @@ type delegateResult struct {
 }
 
 type childMetadata struct {
+	Version        int       `json:"version,omitempty"`
+	RunID          string    `json:"run_id,omitempty"`
+	ParentActor    string    `json:"parent_actor,omitempty"`
+	Async          bool      `json:"async,omitempty"`
+	Attempt        int       `json:"attempt,omitempty"`
+	Summary        string    `json:"summary,omitempty"`
 	AgentID        string    `json:"agent_id"`
 	ParentID       string    `json:"parent_id,omitempty"`
 	Depth          int       `json:"depth"`
@@ -162,7 +173,7 @@ func (c *delegatedChild) persist() error {
 	if c.dir == "" {
 		return nil
 	}
-	m := childMetadata{AgentID: c.id, ParentID: c.parentID, Depth: c.solver.depth, Task: c.task,
+	m := childMetadata{Version: 1, RunID: c.solver.bb.MissionID, ParentActor: c.parentActor, Async: c.async, Attempt: c.attempt, Summary: c.summary, AgentID: c.id, ParentID: c.parentID, Depth: c.solver.depth, Task: c.task,
 		Scope: c.solver.scopeSnapshot().Entries(), StartRevision: c.rev0, AllocatedSteps: c.allocatedSteps,
 		RemainingSteps: max(0, c.solver.stepLimit-c.solver.steps-c.solver.delegatedStepsTotal), Status: c.status,
 		StoppedReason: c.stoppedReason, UpdatedAt: time.Now()}
@@ -173,15 +184,7 @@ func (c *delegatedChild) persist() error {
 	if err := os.MkdirAll(c.dir, 0o700); err != nil {
 		return err
 	}
-	tmp := filepath.Join(c.dir, "metadata.json.tmp")
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, filepath.Join(c.dir, "metadata.json")); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return durable.WriteFile(filepath.Join(c.dir, "metadata.json"), data)
 }
 
 func (s *Solver) toolDelegate(ctx context.Context, argsJSON string) string {
@@ -213,11 +216,20 @@ func (s *Solver) toolDelegate(ctx context.Context, argsJSON string) string {
 		s.restoreReservation(grant)
 		return "delegate error: " + err.Error()
 	}
+	budgetOwner := s.budgetOwner
+	if budgetOwner == "" && s.budget != nil {
+		if err := s.budget.Reserve(id, grant); err != nil {
+			s.restoreReservation(grant)
+			return "delegate budget error: " + err.Error()
+		}
+		budgetOwner = id
+	}
 	actor := s.ModelSpec + "/sub:" + id
 	dir := s.childDirectory(id)
 	childMeta := s.meta
 	childMeta.Description = args.Task
 	child := New(Options{
+		ModelCallTimeout: s.modelTimeout, Budget: s.budget, BudgetOwner: budgetOwner, MissionContext: s.missionContext,
 		ModelSpec: actor, Model: s.Model, Client: s.client, Meta: childMeta, Scope: childScope,
 		BB: s.bb, TL: s.tl, AllowExec: s.allowExec, PlaywrightMCP: s.playwrightMCP, InsecureTLS: s.insecureTLS,
 		Deadline: s.childDeadline(), Tokens: s.tokens, LLMRecorder: s.llmRecorder, Guard: s.guard, SubmitFn: s.submitFn,
@@ -246,9 +258,13 @@ func (s *Solver) toolDelegate(ctx context.Context, argsJSON string) string {
 			s.childEvent(ChildEvent{AgentID: id, ParentID: s.agentID, Kind: "notify", Text: message})
 		},
 	})
-	record := &delegatedChild{id: id, parentID: s.agentID, actor: actor, task: args.Task, rev0: s.bb.Revision(), solver: child, dir: dir, status: "running", running: true, allocatedSteps: grant}
+	record := &delegatedChild{id: id, parentID: s.agentID, actor: actor, task: args.Task, rev0: s.bb.Revision(), solver: child, dir: dir, status: "running", running: true, allocatedSteps: grant, async: ctx.Value(asyncKey{}) == true, parentActor: s.ModelSpec, attempt: 1}
 	if err := record.persist(); err != nil {
 		s.restoreReservation(grant)
+		if s.budget != nil && budgetOwner == id {
+			_ = s.budget.Release(id)
+		}
+		s.failStorage(err)
 		return "delegate persistence error: " + err.Error()
 	}
 	s.delegateMu.Lock()
@@ -260,10 +276,18 @@ func (s *Solver) toolDelegate(ctx context.Context, argsJSON string) string {
 		child.SetScope(child.scopeSnapshot().Within(current))
 	}
 	s.rec("delegate_spawn", id, fmt.Sprintf("⇲ delegated: %s (max %d steps, depth %d)", clipRunes(args.Task, 140), grant, child.depth))
+	if record.async {
+		return s.launchAsync(record)
+	}
 	return s.runChild(ctx, record)
 }
 
 func (s *Solver) toolDelegateResume(ctx context.Context, argsJSON string) string {
+	if s.asyncDelegate {
+		if result, ok := s.resumeAsync(ctx, argsJSON); ok {
+			return result
+		}
+	}
 	if reason := s.delegateGate(); reason != "" {
 		return jsonOut(map[string]any{"status": "stopped", "stopped_reason": reason})
 	}
@@ -299,6 +323,13 @@ func (s *Solver) toolDelegateResume(ctx context.Context, argsJSON string) string
 		s.restoreReservation(grant)
 		return "delegate_resume error: child is already running"
 	}
+	if s.budget != nil && record.solver.budgetOwner == record.id {
+		if err := s.budget.Reserve(record.id, grant); err != nil {
+			s.delegateMu.Unlock()
+			s.restoreReservation(grant)
+			return "delegate_resume budget error: " + err.Error()
+		}
+	}
 	record.running = true
 	record.status = "running"
 	previousLimit := record.solver.stepLimit
@@ -316,7 +347,7 @@ func (s *Solver) toolDelegateResume(ctx context.Context, argsJSON string) string
 		return "delegate_resume persistence error: " + err.Error()
 	}
 	if note := strings.TrimSpace(args.Note); note != "" {
-		record.solver.Guide(note)
+		record.solver.RuntimeGuide(note)
 	}
 	s.rec("delegate_resume", record.id, "↻ resumed "+record.id)
 	return s.runChild(ctx, record)
@@ -353,7 +384,16 @@ func (s *Solver) runChild(ctx context.Context, record *delegatedChild) string {
 	}
 	defer cancel()
 	res := record.solver.RunUntilDoneOrGaveUp(childCtx)
+	if record.solver.budget != nil && record.solver.budgetOwner == record.id {
+		if err := record.solver.budget.Release(record.id); err != nil {
+			s.failStorage(err)
+		}
+	}
 	status, reason := "inconclusive", res.StopReason
+	if res.Status == StatusStorageError {
+		status, reason = StatusStorageError, res.Findings
+		s.failStorage(record.solver.StorageError())
+	}
 	if reason == "done" || res.Status == StatusFlagFound {
 		status, reason = "completed", "done"
 	}
@@ -383,12 +423,13 @@ func (s *Solver) runChild(ctx context.Context, record *delegatedChild) string {
 	record.status, record.stoppedReason, record.summary = status, reason, summary
 	s.delegateMu.Unlock()
 	if err := record.persist(); err != nil {
+		s.failStorage(err)
 		log.Printf("subagent metadata write failed (%s): %v", record.id, err)
 	}
 	s.delegateMu.Lock()
 	record.running = false
 	s.delegateMu.Unlock()
-	s.rec("delegate_return", record.id, fmt.Sprintf("⇱ returned: %v +%d facts (%s; %s)", result.FindingIDs, result.FactsAdded, status, reason))
+	s.recAt(0, "delegate_return", record.id, fmt.Sprintf("⇱ returned: %v +%d facts (%s; %s)", result.FindingIDs, result.FactsAdded, status, reason))
 	return jsonOut(result)
 }
 
@@ -411,6 +452,15 @@ func (s *Solver) narrowChildren(next scope.Scope) {
 		}
 	}
 	s.delegateMu.Unlock()
+	if s.jobs != nil {
+		s.jobs.mu.Lock()
+		for _, job := range s.jobs.items {
+			if job.record.solver != nil {
+				children = append(children, job.record)
+			}
+		}
+		s.jobs.mu.Unlock()
+	}
 	for _, c := range children {
 		c.solver.SetScope(c.solver.scopeSnapshot().Within(next))
 	}

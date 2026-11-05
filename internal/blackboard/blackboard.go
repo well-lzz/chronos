@@ -8,6 +8,7 @@ package blackboard
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/well-lzz/chronos/internal/durable"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -109,6 +110,7 @@ type Blackboard struct {
 	MissionID string
 	Path      string
 
+	storageErr   error
 	mu           sync.Mutex
 	seq          int
 	revision     uint64
@@ -583,7 +585,14 @@ type diskModel struct {
 }
 
 // persist assumes the caller holds the lock.
-func (b *Blackboard) persist() error {
+func (b *Blackboard) StorageError() error { b.mu.Lock(); defer b.mu.Unlock(); return b.storageErr }
+
+func (b *Blackboard) persist() (err error) {
+	defer func() {
+		if err != nil && b.storageErr == nil {
+			b.storageErr = err
+		}
+	}()
 	if b.Path == "" {
 		return nil
 	}
@@ -618,15 +627,7 @@ func (b *Blackboard) persist() error {
 	if err := os.MkdirAll(filepath.Dir(b.Path), 0o700); err != nil {
 		return err
 	}
-	tmp := b.Path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, b.Path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return durable.WriteFile(b.Path, data)
 }
 
 // LoadOrNew loads a mission's blackboard from state_dir, or starts a fresh one.

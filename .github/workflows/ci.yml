@@ -17,10 +17,16 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
-      - run: go test -race ./...
+      - run: mkdir -p dist
+      - run: go test -race ./... -coverprofile=dist/coverage.out
+      - run: python3 scripts/check_core_coverage.py dist/coverage.out
       - run: go install honnef.co/go/tools/cmd/staticcheck@latest
       - run: staticcheck ./...
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -41,6 +47,29 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm audit --omit=dev --audit-level=high
+
+  python-sandbox:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Dedicated ephemeral runner: permit bwrap's unprivileged namespaces.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: go test -v ./internal/pythonexec ./internal/missionproc ./cmd/chronos -count=1
+        env:
+          CHRONOS_REQUIRE_SANDBOX_TESTS: '1'
 
   tsecbench-image:
     runs-on: ubuntu-latest

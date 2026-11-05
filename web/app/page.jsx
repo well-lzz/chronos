@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { apiFetch, consoleSession } from "./api";
+import { composeTextMessage, MAX_FILES, readTextAttachment, TEXT_FILE_ACCEPT, validateAttachments } from "./text-attachments.mjs";
 import EvidenceGraph from "./EvidenceGraph";
 import s from "./page.module.css";
 
@@ -13,6 +15,7 @@ const VERIFICATION_LABEL = { verified: "已复现", reproduced: "已复现", ref
 const STATUS_LABEL = {
   running: "运行中", pausing: "暂停中", paused: "已暂停", stopped: "已停止", done: "已完成",
   finished: "已完成", cancelled: "已取消", interrupted: "已中断", flag_found: "已提交结果",
+  budget_exhausted: "预算已用尽", storage_error: "存储故障", waiting_event: "等待任务事件", needs_reconciliation: "待核对执行状态",
   "needs-config": "待配置", "waiting-provider": "模型重试中", failed: "失败", pending: "等待中",
 };
 const PRESETS = [
@@ -190,7 +193,7 @@ function ChildStream({ challenge, agentId, depth = 1 }) {
     const tick = async () => {
       try {
         const url = `/api/activity?challenge=${encodeURIComponent(challenge)}&model=${encodeURIComponent(agentId)}&after=${afterRef.current}`;
-        const response = await fetch(url, { signal: controller.signal });
+        const response = await apiFetch(url, { signal: controller.signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         const next = data.events || [];
@@ -228,11 +231,15 @@ function ChildStream({ challenge, agentId, depth = 1 }) {
   </div>;
 }
 
-export default function Console() {
+function Console() {
   const [state, setState] = useState(EMPTY);
   const [watch, setWatch] = useState({ c: null, m: null });
   const [events, setEvents] = useState([]);
   const [msg, setMsg] = useState("");
+  const [attachments, setAttachments] = useState([]);
+  const [readingFiles, setReadingFiles] = useState(false);
+  const [attachmentError, setAttachmentError] = useState("");
+  const fileInputRef = useRef(null);
   const [connected, setConnected] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [llm, setLlm] = useState(null);
@@ -264,7 +271,7 @@ export default function Console() {
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch("/api/state", { signal: controller.signal })
+    apiFetch("/api/state", { signal: controller.signal })
       .then((response) => { if (!response.ok) throw new Error("state unavailable"); return response.json(); })
       .then((data) => { setState(data); setConnected(true); setLoaded(true); })
       .catch((error) => { if (error.name !== "AbortError") { setConnected(false); setLoaded(true); } });
@@ -278,13 +285,13 @@ export default function Console() {
   }, []);
 
   const loadLlm = useCallback(() => {
-    fetch("/api/llm").then((response) => response.json()).then(setLlm).catch(() => {});
+    apiFetch("/api/llm").then((response) => response.json()).then(setLlm).catch(() => {});
   }, []);
   useEffect(() => { loadLlm(); }, [loadLlm]);
 
   const loadApprovals = useCallback(async () => {
     try {
-      const response = await fetch("/api/approvals");
+      const response = await apiFetch("/api/approvals");
       if (response.status === 404) { setApprovalsSupported(false); return; }
       if (!response.ok) throw new Error(`审批数据加载失败 (${response.status})`);
       const data = await response.json();
@@ -331,7 +338,7 @@ export default function Console() {
       const current = watchRef.current;
       if (alive && current.c && current.m) {
         try {
-          const response = await fetch(`/api/activity?challenge=${encodeURIComponent(current.c)}&model=${encodeURIComponent(current.m)}&after=${afterRef.current}`, { signal: controller.signal });
+          const response = await apiFetch(`/api/activity?challenge=${encodeURIComponent(current.c)}&model=${encodeURIComponent(current.m)}&after=${afterRef.current}`, { signal: controller.signal });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const data = await response.json();
           const next = data.events || [];
@@ -360,7 +367,7 @@ export default function Console() {
     if (!current.c) return false;
     setBusyAction(action);
     try {
-      const response = await fetch("/api/command", {
+      const response = await apiFetch("/api/command", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action, challenge: current.c, model: current.m, ...(extra || {}) }),
       });
@@ -382,9 +389,27 @@ export default function Console() {
     afterRef.current = 0; followRef.current = true;
   };
   const send = async () => {
-    const text = msg.trim();
-    if (!text || !watch.c || busyAction) return;
-    if (await cmd("chat", { message: text })) setMsg("");
+    if ((!msg.trim() && !attachments.length) || !watch.c || busyAction || readingFiles) return;
+    try {
+      const text = composeTextMessage(msg, attachments);
+      setAttachmentError("");
+      if (await cmd("chat", { message: text })) { setMsg(""); setAttachments([]); }
+    } catch (error) { setAttachmentError(error.message); }
+  };
+  const addTextFiles = async (event) => {
+    const selected = Array.from(event.target.files || []);
+    event.target.value = "";
+    if (!selected.length) return;
+    setReadingFiles(true); setAttachmentError("");
+    try {
+      if (attachments.length + selected.length > MAX_FILES) throw new Error("每条消息最多添加 5 个文本文件");
+      const incoming = await Promise.all(selected.map(readTextAttachment));
+      const next = [...attachments, ...incoming];
+      validateAttachments(next);
+      setAttachments(next);
+      setComposerHeight((height) => Math.max(height, 220));
+    } catch (error) { setAttachmentError(error.message || "读取文件失败，请重试"); }
+    finally { setReadingFiles(false); }
   };
   const requestKill = () => {
     if (window.confirm(`确定停止 ${watch.c} / ${watch.m} 吗？该执行器的自主任务将被终止。`)) cmd("kill");
@@ -474,12 +499,15 @@ export default function Console() {
 
     <div className={s.notices}>
       {needsConfig && !showSettings && <button type="button" className={`${s.banner} ${s.bannerWarning}`} onClick={() => { loadLlm(); setShowSettings(true); }}><Icon name="alert" /><span><strong>模型需要配置</strong>密钥未配置或已失效，点击打开模型设置。</span><Icon name="chevron" /></button>}
+      {agents.some((agent) => agent.status === "storage_error") && <div className={`${s.banner} ${s.bannerError}`} role="alert"><Icon name="alert" /><span><strong>执行记录保存失败</strong>相关执行器已停止新动作。请检查状态目录的可用空间、权限及完整性，修复后重启恢复。</span></div>}
+      {state.isolation?.state === "failed" && <div className={`${s.banner} ${s.bannerError}`} role="alert"><Icon name="alert" /><span><strong>任务隔离进程已退出</strong>控制台仍可使用。请查看任务运行记录与日志，核对未完成动作；保存授权范围可启动新的隔离任务。</span></div>}
+      {state.isolation?.state === "completed" && <div className={s.banner} role="status"><Icon name="check" /><span><strong>本次隔离任务已结束</strong>证据和报告已保留，可在授权范围设置中保存并启动下一次任务。</span></div>}
       {uiError && <div className={`${s.banner} ${s.bannerError}`} role="alert"><Icon name="alert" /><span>{uiError}</span><button type="button" className={s.iconButton} onClick={() => setUiError("")} aria-label="关闭错误"><Icon name="close" /></button></div>}
     </div>
 
     {notice && <div className={`${s.toast} ${notice.kind === "success" ? s.toastSuccess : ""}`} role="status"><Icon name="check" />{notice.text}</div>}
     {showSettings && <SettingsModal initial={llm} onClose={closeSettings} onSaved={loadLlm} />}
-    {showScope && <ScopeModal challenge={watch.c} initial={state.engagement?.targets || state.swarms?.[watch.c]?.targets || []} onClose={closeScope} onSaved={() => fetch("/api/state").then((response) => response.json()).then(setState).catch(() => {})} />}
+    {showScope && <ScopeModal challenge={watch.c} initial={state.engagement?.targets || state.swarms?.[watch.c]?.targets || []} onClose={closeScope} onSaved={() => apiFetch("/api/state").then((response) => response.json()).then(setState).catch(() => {})} />}
     {showRecords && <RecordsModal onClose={closeRecords} />}
 	{showHistory && <HistoryModal onClose={closeHistory} />}
     {showApprovals && <ApprovalsModal data={approvals} error={approvalsError} onRefresh={loadApprovals} onClose={closeApprovals} />}
@@ -516,10 +544,11 @@ export default function Console() {
         </section>
 
         <section className={s.panel}>
-          <div className={s.panelHead}><div><span className={s.panelIndex}>02</span><h2>工具行为</h2></div><span className={s.panelMeta}>{behavior.total} 次</span></div>
-          {behavior.toolRows.length === 0 ? <EmptyState compact icon="terminal" title="暂无工具活动" /> : <div className={s.behaviorList}>
+          <div className={s.panelHead}><div><span className={s.panelIndex}>02</span><h2>工具行为</h2></div><span className={s.panelMeta}>{behavior.total} 次调用</span></div>
+          {behavior.toolRows.length === 0 ? <EmptyState compact icon="terminal" title="尚未发起工具调用" detail="仅生成回复时不会增加；发起调用后会在此累计显示" /> : <div className={s.behaviorList}>
             {behavior.toolRows.map(([tool, count]) => <div key={tool} className={s.behaviorRow}><div><code>{tool}</code><span>{count}</span></div><div className={s.behaviorTrack}><i style={{ width: `${(count / behavior.max) * 100}%` }} /></div></div>)}
           </div>}
+          {behavior.total > 0 && <p className={s.fieldHint}>当前执行器累计发起的调用，包含被拒绝或取消的调用。执行结果可在右侧「工具」中查看。</p>}
         </section>
 
         {(claims.length > 0 || orchestration.length > 0) && <details className={`${s.panel} ${s.orchestration}`}>
@@ -597,8 +626,11 @@ export default function Console() {
               const maxHeight = Math.max(180, window.innerHeight * 0.65);
               setComposerHeight((height) => Math.min(maxHeight, Math.max(96, height + delta)));
             }}><span /></div>
-          <div className={s.composerBox}><textarea rows={2} aria-label="发送给 Agent 的消息" placeholder={watch.c ? (cur?.paused ? "执行已暂停；消息会在继续后由同一会话处理…" : "向 Agent 提问或下达指令…") : "暂无可对话的执行器"} value={msg} disabled={!watch.c} onChange={(event) => setMsg(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); } }} />
-            <div className={s.composerFoot}><span>Enter 发送 · Shift + Enter 换行</span><button type="button" className={s.sendButton} onClick={send} disabled={!watch.c || !msg.trim() || busyAction === "chat"}>{busyAction === "chat" ? <span className={s.spinner} /> : <Icon name="send" size={15} />}{busyAction === "chat" ? "发送中" : "发送"}</button></div>
+          <div className={s.composerBox}>
+            {attachments.length > 0 && <div className={s.textAttachments} aria-label="待发送的文本附件">{attachments.map((file, index) => <div key={index} className={s.textAttachment}><span title={file.name}>{file.name}</span><small>{Math.ceil(file.size / 1024)} KiB</small><button type="button" aria-label={`移除附件 ${file.name}`} disabled={busyAction === "chat" || readingFiles} onClick={() => setAttachments((previous) => previous.filter((_, i) => i !== index))}><Icon name="close" size={12} /></button></div>)}</div>}
+            <textarea rows={2} aria-label="发送给 Agent 的消息" placeholder={watch.c ? (attachments.length ? "补充希望 Agent 如何分析这些文本（可选）…" : cur?.paused ? "执行已暂停；消息会在继续后由同一会话处理…" : "向 Agent 提问、下达指令，或添加文本文件…") : "暂无可对话的执行器"} value={msg} disabled={!watch.c || busyAction === "chat"} onChange={(event) => setMsg(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} />
+            {attachmentError && <p className={s.attachmentError} role="alert">{attachmentError}</p>}
+            <div className={s.composerFoot}><input ref={fileInputRef} className={s.fileInput} type="file" accept={TEXT_FILE_ACCEPT} multiple aria-label="选择文本附件" onChange={addTextFiles} disabled={!watch.c || readingFiles || !!busyAction} /><button type="button" className={s.attachButton} onClick={() => fileInputRef.current?.click()} disabled={!watch.c || readingFiles || !!busyAction} title="TXT、Markdown、JSON、CSV 等；单个 64 KiB，合计 96 KiB"><Icon name="layers" size={14} />{readingFiles ? "读取中…" : "添加文本"}</button><span>Enter 发送 · Shift + Enter 换行</span><button type="button" className={s.sendButton} onClick={send} disabled={!watch.c || (!msg.trim() && !attachments.length) || readingFiles || !!busyAction}>{busyAction === "chat" ? <span className={s.spinner} /> : <Icon name="send" size={15} />}{busyAction === "chat" ? "发送中" : "发送"}</button></div>
           </div>
         </div>
       </main>
@@ -646,6 +678,7 @@ function FindingsModal({ findings, initial, onClose, onOpenGraph }) {
   const selected = filtered.find((finding) => finding.id === selectedId) || filtered[0] || null;
 
   return <Modal title="发现详情" eyebrow="FINDING EXPLORER" onClose={onClose} className={s.findingsModal}>
+    <p role="note">“已确认”表示满足当前程序的证据规则，不等于绝对正确。模型仍参与选择证据和解读观察，请复核引用证据与复现结果；证据图用于追溯，不替代人工复核。</p>
     <div className={s.findingsToolbar}>
       <div className={s.filterTabs}>{[["all", "全部"], ["confirmed", "已确认"], ["suspected", "待验证"], ["failed", "已排除"]].map(([id, label]) => <button type="button" key={id} className={filter === id ? s.active : ""} onClick={() => setFilter(id)}>{label}<span>{id === "all" ? findings.length : findings.filter((finding) => finding.verdict === id).length}</span></button>)}</div>
       <label className={s.searchBox}><Icon name="search" size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索发现" aria-label="在发现详情中搜索" /></label>
@@ -716,7 +749,7 @@ function HistoryModal({ onClose }) {
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch("/api/runs", { signal: controller.signal })
+    apiFetch("/api/runs", { signal: controller.signal })
       .then((response) => { if (!response.ok) throw new Error(`任务历史加载失败 (${response.status})`); return response.json(); })
       .then((data) => {
         const next = data.runs || [];
@@ -735,7 +768,7 @@ function HistoryModal({ onClose }) {
     setDetail(null); setDetailLoading(true); setTab("findings"); setFindingId(""); setGraphNodeId("");
     setModel("all"); setActivityKind("all"); setActivityQuery(""); setTrafficQuery(""); setTrafficId("");
     setTrafficDetail(null); setTrafficLoading(false);
-    fetch(`/api/runs/detail?id=${encodeURIComponent(selectedId)}`, { signal: controller.signal })
+    apiFetch(`/api/runs/detail?id=${encodeURIComponent(selectedId)}`, { signal: controller.signal })
       .then((response) => { if (!response.ok) throw new Error(`任务详情加载失败 (${response.status})`); return response.json(); })
       .then((data) => { setDetail(data); setDetailLoading(false); setError(""); })
       .catch((err) => { if (err.name !== "AbortError") { setError(err.message || String(err)); setDetailLoading(false); } });
@@ -774,7 +807,7 @@ function HistoryModal({ onClose }) {
     const request = ++trafficRequestRef.current;
     setTrafficId(id); setTrafficDetail(null); setTrafficLoading(true);
     try {
-      const response = await fetch(`/api/runs/traffic?id=${encodeURIComponent(selectedId)}&traffic=${encodeURIComponent(id)}`);
+      const response = await apiFetch(`/api/runs/traffic?id=${encodeURIComponent(selectedId)}&traffic=${encodeURIComponent(id)}`);
       if (!response.ok) throw new Error(`流量详情加载失败 (${response.status})`);
       const data = await response.json();
       if (request === trafficRequestRef.current) { setTrafficDetail(data); setError(""); }
@@ -865,7 +898,7 @@ function RecordsModal({ onClose }) {
   const [busyTrace, setBusyTrace] = useState("");
   const load = useCallback(async () => {
     try {
-      const response = await fetch("/api/llm/records");
+      const response = await apiFetch("/api/llm/records");
       if (!response.ok) throw new Error(response.status === 404 ? "当前后端不支持 LLM 记录，请重启到最新版本" : `调用记录加载失败 (${response.status})`);
       const data = await response.json();
       setRows([...(data.records || [])].reverse()); setError("");
@@ -881,7 +914,7 @@ function RecordsModal({ onClose }) {
   const openTrace = async (row) => {
     setTrace(null); setBusyTrace(row.id);
     try {
-      const response = await fetch(`/api/llm/records/trace?mission=${encodeURIComponent(row.mission)}&id=${encodeURIComponent(row.id)}`);
+      const response = await apiFetch(`/api/llm/records/trace?mission=${encodeURIComponent(row.mission)}&id=${encodeURIComponent(row.id)}`);
       if (!response.ok) throw new Error(response.status === 404 ? "完整记录未开启或当前调用没有保存 trace；可通过 LLM_RECORD=1 开启后续调用录制。" : `Trace 加载失败 (${response.status})`);
       setTrace(await response.json()); setError("");
     } catch (err) { setError(err.message || String(err)); }
@@ -911,7 +944,7 @@ function ApprovalsModal({ data, error, onRefresh, onClose }) {
   const decide = async (id, approve) => {
     setBusy(id); setLocalError("");
     try {
-      const response = await fetch("/api/approvals/decision", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, approve }) });
+      const response = await apiFetch("/api/approvals/decision", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, approve }) });
       const body = await response.json().catch(() => ({}));
       if (!response.ok || !body.ok) throw new Error(body.error || "审批失败");
       await onRefresh();
@@ -952,7 +985,7 @@ function ScopeModal({ challenge, initial, onClose, onSaved }) {
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`/api/scope?challenge=${encodeURIComponent(challenge || "")}`, { signal: controller.signal })
+    apiFetch(`/api/scope?challenge=${encodeURIComponent(challenge || "")}`, { signal: controller.signal })
       .then((response) => response.json())
       .then((data) => {
         if (data.editable) setValue((data.targets || []).join("\n"));
@@ -966,7 +999,7 @@ function ScopeModal({ challenge, initial, onClose, onSaved }) {
     const targets = value.split(/[\n,]+/).map((item) => item.trim()).filter(Boolean);
     setBusy(true); setResult(null);
     try {
-      const response = await fetch("/api/scope", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ challenge, targets }) });
+      const response = await apiFetch("/api/scope", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ challenge, targets }) });
       const body = await response.json().catch(() => ({}));
       if (!response.ok || body.ok === false) throw new Error(body.error || `请求失败 (${response.status})`);
       setResult({ ok: true, text: `授权范围已更新：${body.description}` });
@@ -1008,7 +1041,7 @@ function SettingsModal({ initial, onClose, onSaved }) {
   const save = async () => {
     setBusy("save"); setTest(null);
     try {
-      const response = await fetch("/api/llm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
+      const response = await apiFetch("/api/llm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || data.ok === false) throw new Error(data.error || `请求失败 (${response.status})`);
       setApiKey(""); onSaved?.(); onClose();
@@ -1018,7 +1051,7 @@ function SettingsModal({ initial, onClose, onSaved }) {
   const doTest = async () => {
     setBusy("test"); setTest(null);
     try {
-      const response = await fetch("/api/llm/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
+      const response = await apiFetch("/api/llm/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body()) });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
       setTest(data);
@@ -1050,4 +1083,47 @@ function SettingsModal({ initial, onClose, onSaved }) {
     {test && <div className={`${s.formResult} ${test.ok ? s.resultOk : s.resultBad}`}><Icon name={test.ok ? "check" : "alert"} />{test.ok ? "连接成功，密钥与模型可用" : test.error}</div>}
     <div className={s.modalActions}><button type="button" onClick={doTest} disabled={!!busy || !baseURL.trim() || !model.trim()}>{busy === "test" ? "测试中…" : "测试连接"}</button><span className={s.spacer} /><button type="button" onClick={onClose} disabled={!!busy}>取消</button><button type="button" className={s.primaryButton} onClick={save} disabled={!!busy || !baseURL.trim() || !model.trim() || (!apiKey && !hasKey)}>{busy === "save" ? "保存中…" : "保存设置"}</button></div>
   </Modal>;
+}
+
+export default function ConsolePage() {
+  const [ready, setReady] = useState(false);
+  const [accessToken, setAccessToken] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    let active = true;
+    consoleSession().then(() => { if (active) setReady(true); }).catch((error) => { if (active) setError(error.message); });
+    const expired = () => {
+      setReady(false);
+      setError("控制台会话已失效，请使用本次启动的访问链接。");
+    };
+    window.addEventListener("chronos-auth-required", expired);
+    return () => {
+      active = false;
+      window.removeEventListener("chronos-auth-required", expired);
+    };
+  }, []);
+  if (ready) return <Console />;
+  const unlock = async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await consoleSession(accessToken.trim());
+      setAccessToken("");
+      setReady(true);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <main className={s.authGate}><form onSubmit={unlock} className={s.authCard}>
+    <h1>连接 Chronos 控制台</h1>
+    <p>使用本次启动时终端显示的访问链接，或输入访问令牌。</p>
+    <label htmlFor="console-token">访问令牌</label>
+    <input id="console-token" type="password" value={accessToken} onChange={(event) => setAccessToken(event.target.value)} autoComplete="off" spellCheck={false} required />
+    {error && <p role="alert">{error}</p>}
+    <button type="submit" disabled={busy}>{busy ? "连接中…" : "连接"}</button>
+  </form></main>;
 }

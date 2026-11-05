@@ -11,6 +11,9 @@ import (
 )
 
 type Settings struct {
+	ModelCallTimeoutS   int
+	AsyncDelegate       bool
+	MaxRunToolSteps     int
 	StateDir            string
 	ChallengeTimeLimitS int
 	MaxBumps            int
@@ -116,6 +119,9 @@ func Load() Settings {
 		deepSeekKey = deepSeekKeys[0]
 	}
 	settings := Settings{
+		ModelCallTimeoutS:   getenvInt("MODEL_CALL_TIMEOUT_SECONDS", 180),
+		AsyncDelegate:       getenvBool("CHRONOS_ASYNC_DELEGATE", false),
+		MaxRunToolSteps:     getenvInt("MAX_RUN_TOOL_STEPS", 0),
 		StateDir:            getenv("CHRONOS_STATE_DIR", getenv("STATE_DIR", ".chronos-state")),
 		ChallengeTimeLimitS: getenvInt("CHALLENGE_TIME_LIMIT_SECONDS", 1800),
 		MaxBumps:            getenvInt("MAX_BUMPS", 20),
@@ -155,6 +161,9 @@ func Load() Settings {
 		MaxChallengeAttempts: getenvInt("MAX_CHALLENGE_ATTEMPTS", 3),
 		DeferRetryCooldownS:  getenvInt("DEFER_RETRY_COOLDOWN_SECONDS", 120),
 		AutoResumeIdleS:      getenvInt("AUTO_RESUME_IDLE_SECONDS", 240),
+	}
+	if settings.ModelCallTimeoutS < 1 {
+		settings.ModelCallTimeoutS = 180
 	}
 	if hosted {
 		settings.DeepSeekBaseURL = TSecBenchGatewayURL(settings.DeepSeekBaseURL)

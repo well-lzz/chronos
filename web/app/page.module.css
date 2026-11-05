@@ -195,6 +195,14 @@
 .composer textarea:focus { box-shadow: none; }
 .composerFoot { min-height: 2.3rem; display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .25rem .4rem .4rem .7rem; }
 .composerFoot > span { color: var(--faint); font-size: .55rem; }
+.fileInput { display: none; }
+.attachButton { display: inline-flex; align-items: center; gap: .3rem; padding: .3rem .45rem; font-size: .65rem; color: var(--fg-soft); background: transparent; }
+.textAttachments { display: flex; flex: none; flex-wrap: wrap; gap: .3rem; max-height: 5rem; overflow: auto; padding: .45rem .6rem 0; }
+.textAttachment { display: flex; align-items: center; gap: .35rem; min-width: 0; max-width: 100%; padding: .25rem .35rem; border: 1px solid var(--bd); border-radius: 5px; background: var(--bg-elevated); font-size: .65rem; }
+.textAttachment > span { max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.textAttachment small { color: var(--mut); white-space: nowrap; }
+.textAttachment button { display: grid; place-items: center; padding: .1rem; background: transparent; border: 0; }
+.attachmentError { flex: none; margin: .2rem .7rem; color: var(--danger); font-size: .65rem; }
 .sendButton, .primaryButton { display: inline-flex; align-items: center; justify-content: center; gap: .35rem; color: var(--accent-ink); background: var(--accent); border-color: var(--accent); font-weight: 600; }
 .sendButton { min-width: 4.5rem; padding: .3rem .55rem; font-size: .65rem; }
 .sendButton:hover:not(:disabled), .primaryButton:hover:not(:disabled) { color: var(--accent-ink); background: var(--accent-strong); border-color: var(--accent-strong); }
@@ -624,3 +632,10 @@
   .filterTabs button { padding-inline: .35rem; }
   .eventCount { display: none; }
 }
+
+.authGate { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.authCard { width: min(100%, 440px); display: grid; gap: 16px; padding: 32px; border: 1px solid var(--bd); border-radius: 16px; background: var(--panel); }
+.authCard h1 { font-size: 22px; margin: 0; }
+.authCard p { line-height: 1.6; margin: 0; }
+.authCard input, .authCard button { min-height: 44px; padding: 10px 12px; border: 1px solid var(--bd); border-radius: 8px; font: inherit; }
+.authCard button { cursor: pointer; }

@@ -12,6 +12,38 @@ import (
 
 const contextBudgetChars = 140_000 // fixture for compaction algorithm tests
 
+func TestUnreadOperatorTextIsNotClippedOrEvictedBeforeAnalysis(t *testing.T) {
+	first := "[Operator instruction]\n{\"text_attachments\":" + strings.Repeat("客户资料甲", 1000) + "FIRST-END}"
+	second := "[Operator instruction]\n{\"text_attachments\":" + strings.Repeat("客户资料乙", 1000) + "SECOND-END}"
+	msgs := buildConvo(2, 8000)
+	msgs = append(msgs, openai.ChatCompletionMessage{Role: "user", Content: first},
+		openai.ChatCompletionMessage{Role: "user", Content: second},
+		openai.ChatCompletionMessage{Role: "user", Content: "continue current cycle"})
+	for _, compact := range []func([]openai.ChatCompletionMessage) []openai.ChatCompletionMessage{
+		func(m []openai.ChatCompletionMessage) []openai.ChatCompletionMessage {
+			out, _ := compactWindow(m, 1, 4096)
+			return out
+		},
+		func(m []openai.ChatCompletionMessage) []openai.ChatCompletionMessage {
+			out, _ := clipOld(m, 4096)
+			return out
+		},
+	} {
+		out := compact(msgs)
+		found := map[string]bool{}
+		for _, message := range out {
+			found[message.Content] = true
+		}
+		if !found[first] || !found[second] {
+			t.Fatal("new reference text was removed or clipped before a model turn could read it")
+		}
+	}
+	msgs = append(msgs, openai.ChatCompletionMessage{Role: "assistant", Content: "materials analyzed"})
+	if unreadReferenceStart(msgs) != -1 {
+		t.Fatal("already-consumed reference text should follow ordinary compaction rules")
+	}
+}
+
 // buildConvo makes a system prompt plus n cycles, each: a user prompt, an
 // assistant message with one tool call, and the matching tool result. big pads
 // each tool result so the transcript is large.

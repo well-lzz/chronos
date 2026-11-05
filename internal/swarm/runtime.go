@@ -2,6 +2,8 @@ package swarm
 
 import (
 	"encoding/json"
+	"fmt"
+	"github.com/well-lzz/chronos/internal/durable"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,20 +33,29 @@ func (s *Swarm) runtimePath(spec string) string {
 	return strings.TrimSuffix(path, ".jsonl") + ".state.json"
 }
 
-func (s *Swarm) loadRuntime(spec string) executorRuntime {
+func (s *Swarm) loadRuntime(spec string) (executorRuntime, error) {
 	path := s.runtimePath(spec)
 	if path == "" {
-		return executorRuntime{}
+		return executorRuntime{}, nil
 	}
 	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return executorRuntime{}, nil
+	}
 	if err != nil {
-		return executorRuntime{}
+		return executorRuntime{}, err
 	}
 	var state executorRuntime
-	if json.Unmarshal(data, &state) != nil || state.Version != 1 || state.Status == "finished" || state.Status == "cancelled" || state.Status == "flag_found" {
-		return executorRuntime{}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return executorRuntime{}, fmt.Errorf("decode executor checkpoint: %w", err)
 	}
-	return state
+	if state.Version != 1 {
+		return executorRuntime{}, fmt.Errorf("unsupported executor checkpoint version %d", state.Version)
+	}
+	if state.Status == "finished" || state.Status == "cancelled" || state.Status == "flag_found" {
+		return executorRuntime{}, nil
+	}
+	return state, nil
 }
 
 func (s *Swarm) saveRuntime(spec string, state executorRuntime) error {
@@ -61,13 +72,5 @@ func (s *Swarm) saveRuntime(spec string, state executorRuntime) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return durable.WriteFile(path, data)
 }

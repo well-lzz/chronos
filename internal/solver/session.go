@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/well-lzz/chronos/internal/durable"
 	"os"
 	"path/filepath"
 
@@ -13,6 +14,9 @@ import (
 // sessionEvent is an append-only audit record. Compact events replace only the
 // active model window; earlier message events remain available in the journal.
 type sessionEvent struct {
+	Version  int                            `json:"version,omitempty"`
+	InputID  string                         `json:"input_id,omitempty"`
+	Source   string                         `json:"source,omitempty"`
 	Type     string                         `json:"type"`
 	Message  *openai.ChatCompletionMessage  `json:"message,omitempty"`
 	Messages []openai.ChatCompletionMessage `json:"messages,omitempty"`
@@ -22,6 +26,7 @@ type sessionEvent struct {
 }
 
 type sessionState struct {
+	inputIDs map[string]bool
 	messages []openai.ChatCompletionMessage
 	pending  []openai.ChatCompletionMessage
 	step     int
@@ -29,6 +34,7 @@ type sessionState struct {
 }
 
 func appendSessionEvent(path string, event sessionEvent) error {
+	event.Version = 1
 	if path == "" {
 		return nil
 	}
@@ -43,11 +49,14 @@ func appendSessionEvent(path string, event sessionEvent) error {
 	if err := json.NewEncoder(f).Encode(event); err != nil {
 		return err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return durable.SyncDir(filepath.Dir(path))
 }
 
 func loadSession(path string) (sessionState, error) {
-	var state sessionState
+	state := sessionState{inputIDs: map[string]bool{}}
 	if path == "" {
 		return state, nil
 	}
@@ -75,12 +84,21 @@ func loadSession(path string) (sessionState, error) {
 		if err := json.Unmarshal(line, &event); err != nil {
 			return sessionState{}, fmt.Errorf("invalid session journal: %w", err)
 		}
+		if event.Version < 0 || event.Version > 1 {
+			return sessionState{}, fmt.Errorf("unsupported session version %d", event.Version)
+		}
 		switch event.Type {
 		case "message":
 			if event.Message != nil {
 				state.messages = append(state.messages, *event.Message)
 			}
 		case "queue":
+			if event.InputID != "" && state.inputIDs[event.InputID] {
+				continue
+			}
+			if event.InputID != "" {
+				state.inputIDs[event.InputID] = true
+			}
 			if event.Message != nil {
 				state.pending = append(state.pending, *event.Message)
 			}

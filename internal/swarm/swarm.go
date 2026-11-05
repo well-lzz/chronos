@@ -33,6 +33,7 @@ import (
 	"github.com/well-lzz/chronos/internal/platform"
 	"github.com/well-lzz/chronos/internal/scope"
 	"github.com/well-lzz/chronos/internal/solver"
+	"github.com/well-lzz/chronos/internal/taskruntime"
 	"github.com/well-lzz/chronos/internal/termination"
 	"github.com/well-lzz/chronos/internal/traffic"
 )
@@ -175,6 +176,21 @@ func (s *Swarm) init() {
 func (s *Swarm) Run(ctx context.Context) {
 	s.ModelSpecs = distinctSpecs(s.ModelSpecs)
 	s.init()
+	budgetPath := ""
+	if s.subagentRoot() != "" {
+		budgetPath = filepath.Join(s.subagentRoot(), "budget.jsonl")
+	}
+	budget, err := taskruntime.OpenBudget(budgetPath, s.BB.MissionID, s.Settings.MaxRunToolSteps)
+	if err == nil {
+		err = budget.ReturnOrphans()
+	}
+	if err != nil {
+		for _, spec := range s.ModelSpecs {
+			s.emitErrorOnce(spec, 0, err.Error())
+			s.setStatus(spec, solver.StatusStorageError)
+		}
+		return
+	}
 	s.mu.Lock()
 	s.runCtx = ctx
 	s.mu.Unlock()
@@ -183,6 +199,11 @@ func (s *Swarm) Run(ctx context.Context) {
 	go func() { defer close(digestDone); s.digestLoop(digestCtx) }()
 	deadline, _ := ctx.Deadline()
 	var wg sync.WaitGroup
+	type launch struct {
+		spec   string
+		solver *solver.Solver
+	}
+	var launches []launch
 
 	for _, spec := range s.ModelSpecs {
 		sp := spec
@@ -220,9 +241,15 @@ func (s *Swarm) Run(ctx context.Context) {
 		if s.Platform != nil {
 			submitFn = func(fl string) (string, bool, bool) { return s.trySubmit(fl, sp) }
 		}
-		previous := s.loadRuntime(spec)
+		previous, recoveryErr := s.loadRuntime(spec)
+		if recoveryErr != nil {
+			s.emitErrorOnce(spec, 0, "storage_error: "+recoveryErr.Error())
+			s.setStatus(spec, solver.StatusStorageError)
+			continue
+		}
 		generation := previous.HandoffGeneration
 		sv := solver.New(solver.Options{
+			ModelCallTimeout: time.Duration(s.Settings.ModelCallTimeoutS) * time.Second, AsyncDelegate: s.Settings.AsyncDelegate, MissionContext: ctx, Budget: budget,
 			ModelSpec: spec, Meta: s.Meta, Scope: s.Scope,
 			BB: s.BB, TL: s.TL, AllowExec: s.Settings.AllowLocalExec, PlaywrightMCP: s.Settings.PlaywrightMCP, InsecureTLS: s.Settings.TargetInsecureTLS, Deadline: deadline,
 			Tokens: &s.Tokens, LLMRecorder: llmrec.Shared(s.Settings.StateDir, s.Settings.LLMRecord), Guard: guard.Shared(s.Settings.StateDir, s.Settings.ToolRulesFile), Notify: func(m string) { log.Printf("[%s/%s] %s", s.Meta.Name, sp, m) },
@@ -242,19 +269,29 @@ func (s *Swarm) Run(ctx context.Context) {
 		s.loopRecorder(spec)(solver.LoopEvent{Kind: "session_init", MessageType: "system", Subtype: "init",
 			Text: "Executor session ready: " + spec})
 		if previous.Version == 1 {
-			sv.Guide("This executor resumed after a process restart. Revalidate target state before relying on prior actions or traffic; continue from the shared blackboard and preserved transcript.")
+			sv.RuntimeGuide("This executor resumed after a process restart. Revalidate target state before relying on prior actions or traffic; continue from the shared blackboard and preserved transcript.")
 			s.emit(spec, previous.Steps, "resume", "process_restart", "Restored executor session and cycle counters")
 		}
-		wg.Add(1)
-		go func(spec string, sv *solver.Solver) {
-			defer wg.Done()
-			s.runExecutor(ctx, sv, spec)
-		}(spec, sv)
+		launches = append(launches, launch{spec: spec, solver: sv})
 	}
+	// Publish every neutral executor before the first one can assign a finding.
+	for _, item := range launches {
+		wg.Add(1)
+		go func(spec string, sv *solver.Solver) { defer wg.Done(); s.runExecutor(ctx, sv, spec) }(item.spec, item.solver)
+	}
+
 	wg.Wait()
 	stopDigest()
 	<-digestDone
-	if ctx.Err() == nil && s.Settings.WebhookURL != "" && s.BB != nil {
+	s.mu.Lock()
+	healthy := true
+	for _, status := range s.status {
+		if status == solver.StatusStorageError || status == "budget_exhausted" {
+			healthy = false
+		}
+	}
+	s.mu.Unlock()
+	if healthy && ctx.Err() == nil && s.Settings.WebhookURL != "" && s.BB != nil {
 		n, _ := notify.Shared(s.Settings.StateDir, s.Settings.WebhookURL)
 		if err := n.NotifyOnce(ctx, "complete:"+s.BB.MissionID, notify.Event{Kind: "mission_complete", Mission: s.BB.MissionID}); err != nil {
 			log.Printf("completion webhook failed for %s: %v", s.BB.MissionID, err)
@@ -348,6 +385,7 @@ func (s *Swarm) resolveModel(spec string) (*openai.Client, string, error) {
 
 func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string) {
 	defer func() {
+		sv.CloseJobs()
 		sv.CloseBrowser()
 		if err := s.BB.ReleaseOwner(spec); err != nil {
 			log.Printf("[%s/%s] release claims: %v", s.Meta.Name, spec, err)
@@ -368,13 +406,27 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 		maxBumps = 20
 	}
 	retry := time.Duration(s.Settings.SolverRetryDelayS * float64(time.Second))
-	previous := s.loadRuntime(spec)
-	s.mu.Lock()
-	s.toolCalls[spec] = previous.ToolCalls
-	s.toolByName[spec] = map[string]int{}
-	for name, count := range previous.Tools {
-		s.toolByName[spec][name] = count
+	previous, recoveryErr := s.loadRuntime(spec)
+	if recoveryErr != nil {
+		s.emitErrorOnce(spec, 0, "storage_error: "+recoveryErr.Error())
+		s.setStatus(spec, solver.StatusStorageError)
+		return
 	}
+	s.mu.Lock()
+	// The activity journal can be newer than the last cycle checkpoint (or
+	// predate the typed-event accounting fix). Never overwrite its recovered
+	// totals with stale checkpoint counts. Merge cumulative values, not sums.
+	if s.toolByName[spec] == nil {
+		s.toolByName[spec] = map[string]int{}
+	}
+	for name, count := range previous.Tools {
+		s.toolByName[spec][name] = max(s.toolByName[spec][name], count)
+	}
+	total := 0
+	for _, count := range s.toolByName[spec] {
+		total += count
+	}
+	s.toolCalls[spec] = max(s.toolCalls[spec], previous.ToolCalls, total)
 	s.mu.Unlock()
 	started := previous.StartedAt
 	if started.IsZero() {
@@ -385,18 +437,28 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 	providerFailures := previous.ProviderFails
 	lastSteps := previous.Steps
 	handoffGeneration := previous.HandoffGeneration
+	var checkpointErr error
 	checkpointRuntime := func(status string) {
+		if checkpointErr != nil {
+			return
+		}
 		s.mu.Lock()
 		toolCalls, tools := s.toolStatsLocked(spec)
 		s.mu.Unlock()
 		if err := s.saveRuntime(spec, executorRuntime{Status: status, StartedAt: started, Cycles: cycles,
 			Bumps: bumps, QuietCycles: quietCycles, ProviderFails: providerFailures, Steps: lastSteps,
 			ToolCalls: toolCalls, Tools: tools, HandoffGeneration: handoffGeneration}); err != nil {
-			log.Printf("[%s/%s] executor checkpoint failed: %v", s.Meta.Name, spec, err)
+			checkpointErr = err
+			s.emitErrorOnce(spec, lastSteps, "storage_error: "+err.Error())
+			s.setStatus(spec, solver.StatusStorageError)
 		}
 	}
 	finalStatus := "interrupted"
 	defer func() { checkpointRuntime(finalStatus) }()
+	checkpointRuntime("running")
+	if checkpointErr != nil {
+		return
+	}
 	if s.Paused() {
 		s.setStatus(spec, "paused")
 	} else {
@@ -413,6 +475,9 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 		}
 		if err := s.waitIfPaused(ctx, spec); err != nil {
 			s.setStatus(spec, "cancelled")
+			return
+		}
+		if checkpointErr != nil {
 			return
 		}
 		markerBefore := s.BB.ProgressMarker()
@@ -436,6 +501,9 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 		cycles++
 		lastSteps = res.StepCount
 		checkpointRuntime("running")
+		if checkpointErr != nil {
+			return
+		}
 		if s.Platform == nil && res.Status == solver.StatusGaveUp && sv.Saturated() && handoffGeneration < min(2, s.Settings.MaxHandoffs) && len(s.BB.OpenSubgoals()) > 0 && (sv.Deadline().IsZero() || time.Until(sv.Deadline()) > 2*time.Minute) {
 			if err := s.BB.ReleaseOwner(spec); err != nil {
 				log.Printf("[%s/%s] handoff claim release failed: %v", s.Meta.Name, spec, err)
@@ -453,6 +521,27 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 		}
 
 		switch res.Status {
+		case solver.StatusStepBudget:
+			finalStatus = "budget_exhausted"
+			s.setStatus(spec, finalStatus)
+			s.emit(spec, res.StepCount, "terminate", "budget", "Run tool-step budget exhausted; no new actions started.")
+			return
+		case solver.StatusWaitingEvent:
+			if sv.NeedsReconciliation() {
+				s.setStatus(spec, "needs_reconciliation")
+			} else {
+				s.setStatus(spec, solver.StatusWaitingEvent)
+			}
+			if err := sv.WaitEvent(ctx); err != nil {
+				s.setStatus(spec, "cancelled")
+				return
+			}
+			continue
+		case solver.StatusStorageError:
+			finalStatus = solver.StatusStorageError
+			s.emitErrorOnce(spec, res.StepCount, res.Findings)
+			s.setStatus(spec, solver.StatusStorageError)
+			return
 		case solver.StatusFlagFound:
 			finalStatus = "flag_found"
 			log.Printf("[%s/%s] flag found: %s", s.Meta.Name, spec, res.Flag)
@@ -488,6 +577,18 @@ func (s *Swarm) runExecutor(ctx context.Context, sv *solver.Solver, spec string)
 				s.setStatus(spec, "cancelled")
 				return
 			case <-time.After(providerBackoff(providerFailures)):
+			}
+			continue
+		}
+		if sv.HasJobs() {
+			if sv.NeedsReconciliation() {
+				s.setStatus(spec, "needs_reconciliation")
+			} else {
+				s.setStatus(spec, solver.StatusWaitingEvent)
+			}
+			if err := sv.WaitEvent(ctx); err != nil {
+				s.setStatus(spec, "cancelled")
+				return
 			}
 			continue
 		}
@@ -587,14 +688,14 @@ func (s *Swarm) routeVerification(origin, findingID string) string {
 			continue
 		}
 		status := s.status[spec]
-		if status != "finished" && status != "cancelled" && status != "flag_found" {
+		if !terminalStatus(status) {
 			chosen = spec
 			break
 		}
 	}
 	if chosen == "" {
 		for _, spec := range s.ModelSpecs {
-			if s.status[spec] != "finished" && s.status[spec] != "cancelled" {
+			if !terminalStatus(s.status[spec]) {
 				chosen = spec
 				break
 			}
@@ -603,7 +704,7 @@ func (s *Swarm) routeVerification(origin, findingID string) string {
 	peer := s.solvers[chosen]
 	s.mu.Unlock()
 	if peer != nil && chosen != origin {
-		peer.Guide("Independently assess candidate finding " + findingID + ". Read its evidence and original traffic, perform your own check, then call verify_finding with fresh traffic evidence_refs. The verification goal is assigned to you.")
+		peer.RuntimeGuide("Independently assess candidate finding " + findingID + ". Read its evidence and original traffic, perform your own check, then call verify_finding with fresh traffic evidence_refs. The verification goal is assigned to you.")
 		s.emit(chosen, 0, "verify_task", findingID, "Independent verification assigned: "+findingID)
 	}
 	return chosen
@@ -755,16 +856,6 @@ func (s *Swarm) emit(spec string, step int, kind, tool, text string) {
 	}
 	seq := atomic.AddInt64(&s.evSeq, 1)
 	s.mu.Lock()
-	if kind == "tool_call" && tool != "" {
-		if s.toolCalls == nil {
-			s.toolCalls = map[string]int{}
-		}
-		if s.toolByName[spec] == nil {
-			s.toolByName[spec] = map[string]int{}
-		}
-		s.toolCalls[spec]++
-		s.toolByName[spec][tool]++
-	}
 	messageType := "system"
 	if kind == "operator" {
 		messageType = "user"
@@ -829,13 +920,21 @@ func (s *Swarm) Status() map[string]any {
 			st = "pending"
 		}
 		toolCalls, tools := s.toolStatsLocked(spec)
-		agents[spec] = map[string]any{"spec": spec, "status": st, "steps": len(s.activity[spec]), "tool_calls": toolCalls, "tools": tools}
+		health := map[string]any{}
+		if sv := s.solvers[spec]; sv != nil {
+			health = sv.Health()
+		}
+		agents[spec] = map[string]any{"health": health, "spec": spec, "status": st, "steps": len(s.activity[spec]), "tool_calls": toolCalls, "tools": tools}
 	}
 	runID := ""
 	if s.BB != nil {
 		runID = s.BB.MissionID
 	}
-	return map[string]any{"challenge": s.Meta.Name, "run_id": runID, "paused": s.paused.Load(),
+	metrics := blackboard.ProgressMetrics{}
+	if s.BB != nil {
+		metrics = s.BB.Metrics()
+	}
+	return map[string]any{"progress_metrics": metrics, "challenge": s.Meta.Name, "run_id": runID, "paused": s.paused.Load(),
 		"scope": s.Scope.Describe(), "targets": s.Scope.Entries(), "agents": agents}
 }
 
@@ -868,30 +967,40 @@ func (s *Swarm) CurrentScope() scope.Scope {
 
 // Chat records a human turn in the executor's own session. The next model turn
 // reads it alongside the same tool history and working record it uses to act.
-func (s *Swarm) Chat(spec, message string) bool {
+const MaxOperatorMessageBytes = 128 * 1024
+
+func (s *Swarm) Chat(spec, message string) bool { return s.ChatChecked(spec, message) == nil }
+
+func (s *Swarm) ChatChecked(spec, message string) error {
 	message = strings.TrimSpace(message)
 	if message == "" {
-		return false
+		return fmt.Errorf("message is empty")
 	}
-	if len(message) > 4000 {
-		message = message[:4000]
+	if len(message) > MaxOperatorMessageBytes {
+		return fmt.Errorf("消息与附件合计不能超过 128 KiB；请减少内容后重试")
 	}
 	s.mu.Lock()
 	sv := s.solvers[spec]
 	status := s.status[spec]
 	ctx := s.runCtx
 	s.mu.Unlock()
-	if sv == nil || ctx == nil || ctx.Err() != nil || status == "finished" || status == "cancelled" || status == "flag_found" {
-		return false
+	if sv == nil || ctx == nil || ctx.Err() != nil || status == "finished" || status == "cancelled" || status == "flag_found" || status == solver.StatusStorageError {
+		return fmt.Errorf("selected executor is unavailable; choose a running executor")
+	}
+	if err := sv.Guide(message); err != nil {
+		if sv.StorageError() != nil {
+			s.emitErrorOnce(spec, 0, "storage_error: "+err.Error())
+			s.setStatus(spec, solver.StatusStorageError)
+		}
+		return err
 	}
 	s.emit(spec, 0, "operator", "", message)
-	sv.Guide(message)
 	if s.paused.Load() {
 		s.emit(spec, 0, "status", "", "消息已进入执行器会话；恢复执行后，Agent 会在下一轮处理。")
 	} else {
 		s.emit(spec, 0, "status", "", "消息已进入执行器会话；Agent 会在下一轮回应并继续执行。")
 	}
-	return true
+	return nil
 }
 
 // Bump injects operator guidance into one running executor and records it in the
@@ -910,3 +1019,16 @@ func (s *Swarm) Bump(spec, message string) bool {
 
 // TotalTokens returns the mission-wide token count.
 func (s *Swarm) TotalTokens() int { return int(atomic.LoadInt64(&s.Tokens)) }
+
+// Failure distinguishes an infrastructure or budget stop from natural completion.
+// Callers preserve runtime identities for reconciliation instead of clearing them.
+func (s *Swarm) Failure() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for spec, status := range s.status {
+		if status == solver.StatusStorageError || status == "budget_exhausted" {
+			return fmt.Errorf("%s/%s: %s: %s", s.Meta.Name, spec, status, s.lastErr[spec])
+		}
+	}
+	return nil
+}
